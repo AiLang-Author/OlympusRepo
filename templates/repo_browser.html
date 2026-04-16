@@ -1,6 +1,17 @@
 {% extends "base.html" %}
 {% block title %}{{ repo.name }} &mdash; OlympusRepo{% endblock %}
 
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            url('/static/{% if tab == "mana" %}chat-room{% elif tab == "commits" %}commit-room{% elif tab == "staging" %}offering-room{% else %}repo-room{% endif %}.png')
+            center center / cover no-repeat fixed;
+    }
+</style>
+{% endblock %}
+
 {% block content %}
 <div class="container">
 
@@ -11,11 +22,19 @@
             {% if repo.description %}
                 <p style="color:#8b949e; margin:0;">{{ repo.description }}</p>
             {% endif %}
+            {% if fork_source %}
+            <p style="color:#8b949e; font-size:0.85em; margin:0;">
+                Forked from <a href="/repo/{{ fork_source }}">{{ fork_source }}</a>
+            </p>
+            {% endif %}
         </div>
         <div class="row">
             <span class="badge badge-{{ repo.visibility }}">{{ repo.visibility }}</span>
             {% if user %}
                 <a href="/api/repos/{{ repo.name }}/clone" class="btn">Clone</a>
+                {% if user.user_id != repo.owner_id %}
+                <button id="fork-btn" class="btn">Fork</button>
+                {% endif %}
             {% endif %}
         </div>
     </div>
@@ -55,6 +74,22 @@
             Staging
         </a>
         {% endif %}
+        {% if user and user.role == 'zeus' %}
+        <a href="/repo/{{ repo.name }}/settings"
+           class="btn" style="border:none; border-bottom:2px solid transparent; border-radius:0;">
+            Settings
+        </a>
+        {% endif %}
+        <form action="/repo/{{ repo.name }}/search" method="get"
+              style="margin-left:auto; display:flex; gap:6px; align-items:center;">
+            <input type="text" name="q" placeholder="Search..."
+                   style="width:180px; padding:4px 8px; font-size:0.85em;">
+            <select name="kind" style="padding:4px 6px; font-size:0.85em; width:auto;">
+                <option value="commits">Commits</option>
+                <option value="files">Files</option>
+            </select>
+            <button type="submit" class="btn" style="padding:4px 10px; font-size:0.85em;">Go</button>
+        </form>
     </div>
 
     <!-- COMMITS TAB -->
@@ -104,8 +139,9 @@
         </div>
         {% endif %}
 
-        {% if messages %}
-            {% for m in messages %}
+        <div id="mana-messages">
+            {% if messages %}
+                {% for m in messages %}
             <div class="card" style="padding:12px;">
                 <div class="row-between" style="margin-bottom:4px;">
                     <span style="font-weight:600; color:#f0f6fc;">{{ m.username }}</span>
@@ -121,9 +157,10 @@
                 {% endif %}
             </div>
             {% endfor %}
-        {% else %}
-            <div class="empty-state"><p>No mana yet. Start a discussion.</p></div>
-        {% endif %}
+            {% else %}
+                <div class="empty-state"><p>No mana yet. Start a discussion.</p></div>
+            {% endif %}
+        </div>
 
     <!-- STAGING TAB -->
     {% elif tab == 'staging' %}
@@ -160,6 +197,39 @@
     <!-- FILES TAB (default) -->
     {% else %}
         <h2>Files</h2>
+
+        {% if user %}
+        <div style="margin-bottom: 16px;">
+            <button id="show-upload-btn" class="btn btn-primary">Upload Files</button>
+        </div>
+
+        <!-- Upload Modal -->
+        <div id="upload-modal" class="card" style="display:none; margin-bottom: 24px;">
+            <h3 style="margin-top:0;">Upload Files</h3>
+            <div id="upload-error" class="flash flash-error" style="display:none;"></div>
+            
+            <div id="upload-drop-zone" style="border: 2px dashed #30363d; padding: 32px; text-align: center; border-radius: 6px; cursor: pointer; margin-bottom: 16px;">
+                <span style="color: #8b949e;">Drag &amp; drop files here, or click to browse</span>
+                <input type="file" id="upload-file-input" multiple style="display: none;">
+            </div>
+            
+            <div id="upload-selected-files" style="margin-bottom: 16px; font-size: 0.9em; color: #8b949e;"></div>
+
+            <div class="form-group">
+                <label for="upload-message">Commit Message <span style="color:#8b949e;">*</span></label>
+                <input type="text" id="upload-message" placeholder="Add files via web upload">
+            </div>
+
+            <div class="row" style="align-items: center;">
+                <button id="upload-submit-btn" class="btn btn-primary">Upload &amp; Commit</button>
+                <button id="upload-cancel-btn" class="btn">Cancel</button>
+                <span id="upload-progress" style="display:none; color:#8b949e; margin-left:8px;">
+                    Uploading...
+                </span>
+            </div>
+        </div>
+        {% endif %}
+
         {% if files %}
             <table>
                 <thead>
@@ -197,35 +267,81 @@ olympusrepo commit -m "Initial commit"</pre>
 (function() {
     var repoName = {{ repo.name | tojson }};
 
-    // Mana send
+    // Mana WebSocket
+    var manaChannel = 'repo-' + repoName;
+    var ws = null;
+
+    function connectManaWS() {
+        var proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(proto + '//' + window.location.host + '/ws/mana/' + encodeURIComponent(manaChannel));
+
+        ws.onmessage = function(event) {
+            var msg = JSON.parse(event.data);
+            var container = document.getElementById('mana-messages');
+            if (!container) return;
+            var div = document.createElement('div');
+            div.className = 'card';
+            div.style.padding = '12px';
+            div.innerHTML =
+                '<div class="row-between" style="margin-bottom:4px;">' +
+                '<span style="font-weight:600;color:#f0f6fc;">' + escapeHtml(msg.username) + '</span>' +
+                '<span class="card-meta">' + escapeHtml(msg.created_at) + '</span>' +
+                '</div>' +
+                '<p style="margin:0;white-space:pre-wrap;">' + escapeHtml(msg.content) + '</p>';
+            container.insertBefore(div, container.firstChild);
+        };
+
+        ws.onclose = function() {
+            // Reconnect after 3 seconds
+            setTimeout(connectManaWS, 3000);
+        };
+
+        // Ping every 30 seconds to keep alive
+        setInterval(function() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('ping');
+            }
+        }, 30000);
+    }
+
+    function escapeHtml(str) {
+        return String(str)
+            .replace(/&/g,'&amp;')
+            .replace(/</g,'&lt;')
+            .replace(/>/g,'&gt;')
+            .replace(/"/g,'&quot;');
+    }
+
+    // Only connect on mana tab
+    {% if tab == 'mana' %}
+    connectManaWS();
+    {% endif %}
+
+    // Mana send - no longer reloads page
     var manaBtn = document.getElementById('mana-send-btn');
     if (manaBtn) {
         manaBtn.addEventListener('click', async function() {
             var contentEl = document.getElementById('mana-content');
             var errEl = document.getElementById('mana-error');
             errEl.style.display = 'none';
-
             var content = contentEl.value.trim();
             if (!content) {
                 errEl.textContent = 'Message cannot be empty.';
                 errEl.style.display = 'block';
                 return;
             }
-
             manaBtn.disabled = true;
             try {
                 var form = new FormData();
                 form.append('content', content);
                 form.append('context_type', document.getElementById('mana-context-type').value);
                 form.append('context_id', document.getElementById('mana-context-id').value);
-
                 var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/mana', {
                     method: 'POST',
                     body: form
                 });
-
                 if (res.ok) {
-                    window.location.reload();
+                    contentEl.value = '';
                 } else {
                     var data = {};
                     try { data = await res.json(); } catch (e) {}
@@ -237,6 +353,104 @@ olympusrepo commit -m "Initial commit"</pre>
                 errEl.style.display = 'block';
             } finally {
                 manaBtn.disabled = false;
+            }
+        });
+    }
+
+    // Web Upload
+    var showUploadBtn = document.getElementById('show-upload-btn');
+    if (showUploadBtn) {
+        var uploadModal = document.getElementById('upload-modal');
+        var cancelBtn = document.getElementById('upload-cancel-btn');
+        var dropZone = document.getElementById('upload-drop-zone');
+        var fileInput = document.getElementById('upload-file-input');
+        var selectedFilesDiv = document.getElementById('upload-selected-files');
+        var submitBtn = document.getElementById('upload-submit-btn');
+        var errEl = document.getElementById('upload-error');
+        var progressEl = document.getElementById('upload-progress');
+        var selectedFiles = [];
+
+        showUploadBtn.addEventListener('click', function() {
+            uploadModal.style.display = 'block';
+            showUploadBtn.style.display = 'none';
+        });
+
+        cancelBtn.addEventListener('click', function() {
+            uploadModal.style.display = 'none';
+            showUploadBtn.style.display = 'inline-block';
+            fileInput.value = '';
+            selectedFiles = [];
+            selectedFilesDiv.textContent = '';
+            errEl.style.display = 'none';
+            document.getElementById('upload-message').value = '';
+        });
+
+        dropZone.addEventListener('click', function() { fileInput.click(); });
+        
+        dropZone.addEventListener('dragover', function(e) {
+            e.preventDefault();
+            dropZone.style.borderColor = '#58a6ff';
+        });
+        dropZone.addEventListener('dragleave', function(e) {
+            e.preventDefault();
+            dropZone.style.borderColor = '#30363d';
+        });
+        dropZone.addEventListener('drop', function(e) {
+            e.preventDefault();
+            dropZone.style.borderColor = '#30363d';
+            if (e.dataTransfer.files.length > 0) handleFiles(e.dataTransfer.files);
+        });
+        fileInput.addEventListener('change', function() {
+            if (this.files.length > 0) handleFiles(this.files);
+        });
+
+        function handleFiles(files) {
+            selectedFiles = Array.from(files);
+            selectedFilesDiv.textContent = selectedFiles.length + ' file(s) selected: ' + 
+                selectedFiles.map(function(f){return f.name;}).join(', ');
+        }
+
+        submitBtn.addEventListener('click', async function() {
+            if (selectedFiles.length === 0) {
+                errEl.textContent = 'Please select at least one file.';
+                errEl.style.display = 'block';
+                return;
+            }
+            var msg = document.getElementById('upload-message').value.trim();
+            if (!msg) {
+                errEl.textContent = 'Commit message is required.';
+                errEl.style.display = 'block';
+                return;
+            }
+
+            errEl.style.display = 'none';
+            submitBtn.disabled = true;
+            progressEl.style.display = 'inline-block';
+
+            var form = new FormData();
+            form.append('message', msg);
+            selectedFiles.forEach(function(f) { form.append('files', f); });
+
+            try {
+                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/upload', {
+                    method: 'POST',
+                    body: form
+                });
+                if (res.ok) {
+                    window.location.reload();
+                } else {
+                    var data = {};
+                    try { data = await res.json(); } catch(e){}
+                    errEl.textContent = data.detail || 'Upload failed.';
+                    errEl.style.display = 'block';
+                    submitBtn.disabled = false;
+                    progressEl.style.display = 'none';
+                }
+            } catch(e) {
+                errEl.textContent = 'Network error.';
+                errEl.style.display = 'block';
+                submitBtn.disabled = false;
+                progressEl.style.display = 'none';
             }
         });
     }
@@ -271,6 +485,30 @@ olympusrepo commit -m "Initial commit"</pre>
             }
         });
     });
+
+    var forkBtn = document.getElementById('fork-btn');
+    if (forkBtn) {
+        forkBtn.addEventListener('click', async function() {
+            forkBtn.disabled = true;
+            forkBtn.textContent = 'Forking...';
+            try {
+                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/fork',
+                                      {method: 'POST'});
+                var data = await res.json();
+                if (res.ok) {
+                    window.location = '/repo/' + encodeURIComponent(data.name);
+                } else {
+                    alert(data.detail || 'Fork failed.');
+                    forkBtn.disabled = false;
+                    forkBtn.textContent = 'Fork';
+                }
+            } catch(e) {
+                alert('Network error.');
+                forkBtn.disabled = false;
+                forkBtn.textContent = 'Fork';
+            }
+        });
+    }
 })();
 </script>
 {% endblock %}

@@ -247,6 +247,134 @@ def commit(conn, repo_id: int, user_id: int, message: str,
     }
 
 
+def commit_files(conn, repo_id: int, user_id: int, message: str,
+                 files: list[tuple[str, bytes]], objects_dir: str) -> dict | None:
+    """
+    Create a commit from raw file bytes (used by web upload).
+    files is a list of (filepath, content_bytes) tuples.
+    """
+    user = db.get_user(conn, user_id)
+    if not user:
+        return None
+    if not files:
+        return None
+
+    # Store blobs
+    for filepath, content in files:
+        objects.store_blob(content, objects_dir)
+
+    # Get current tree from latest commit on default branch
+    branch = db.query_one(conn,
+        "SELECT default_branch FROM repo_repositories WHERE repo_id = %s",
+        (repo_id,))
+    default_branch = branch["default_branch"] if branch else "main"
+    ref_name = f"refs/heads/{default_branch}"
+
+    # Replay existing tree
+    existing = db.query(conn, """
+        SELECT cs.path, cs.blob_after, cs.change_type
+          FROM repo_changesets cs
+          JOIN repo_commits c ON c.commit_hash = cs.commit_hash
+         WHERE c.repo_id = %s
+         ORDER BY c.rev ASC, cs.path ASC
+    """, (repo_id,))
+
+    tree = {}
+    for row in existing:
+        if row["change_type"] in ("add", "modify"):
+            tree[row["path"]] = row["blob_after"]
+        elif row["change_type"] == "delete":
+            tree.pop(row["path"], None)
+
+    # Apply new files
+    new_hashes = {}
+    for filepath, content in files:
+        h = objects.hash_content(content)
+        tree[filepath] = h
+        new_hashes[filepath] = h
+
+    # Build tree hash
+    tree_content = json.dumps(
+        {k: v for k, v in sorted(tree.items())},
+        sort_keys=True
+    ).encode()
+    tree_hash = objects.hash_content(tree_content)
+    objects.store_blob(tree_content, objects_dir)
+
+    # Get parent commit
+    parent_row = db.query_one(conn,
+        "SELECT commit_hash FROM repo_refs WHERE repo_id = %s AND ref_name = %s",
+        (repo_id, ref_name))
+    parent_hash = parent_row["commit_hash"] if parent_row else None
+    parent_hashes = [parent_hash] if parent_hash else None
+
+    # Build commit hash
+    ts = str(time.time())
+    commit_content = f"{tree_hash}\n{parent_hash or 'none'}\n{user['username']}\n{ts}\n{message}"
+    commit_hash = objects.hash_content(commit_content.encode())
+
+    try:
+        db.execute(conn, """
+            INSERT INTO repo_commits
+                (commit_hash, repo_id, tree_hash, author_id, author_name,
+                 committer_id, committer_name, message, parent_hashes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (commit_hash, repo_id, tree_hash, user_id, user["username"],
+              user_id, user["username"], message, parent_hashes), commit=False)
+
+        for filepath, content in files:
+            h = new_hashes[filepath]
+            change_type = "modify" if filepath in (tree.keys() - {f for f, _ in files}) else "add"
+            db.execute(conn, """
+                INSERT INTO repo_changesets
+                    (commit_hash, path, change_type, blob_after)
+                VALUES (%s, %s, %s, %s)
+            """, (commit_hash, filepath, change_type, h), commit=False)
+
+            # Record in repo_objects
+            try:
+                db.execute(conn, """
+                    INSERT INTO repo_objects
+                        (object_hash, repo_id, byte_offset, size_bytes, obj_type)
+                    VALUES (%s, %s, 0, %s, 'blob')
+                    ON CONFLICT (object_hash) DO NOTHING
+                """, (h, repo_id, len(content)), commit=False)
+            except Exception:
+                pass
+
+        # Update ref
+        db.execute(conn, """
+            UPDATE repo_refs
+               SET commit_hash = %s, updated_at = NOW(), updated_by = %s
+             WHERE repo_id = %s AND ref_name = %s
+        """, (commit_hash, user_id, repo_id, ref_name), commit=False)
+
+        db.audit_log(conn, "commit_upload", user_id=user_id, repo_id=repo_id,
+                     target_type="commit", target_id=commit_hash,
+                     details={"message": message, "files": len(files)},
+                     commit=False)
+
+        db.execute(conn,
+            "UPDATE repo_repositories SET updated_at = NOW() WHERE repo_id = %s",
+            (repo_id,), commit=False)
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    rev = db.query_scalar(conn,
+        "SELECT rev FROM repo_commits WHERE commit_hash = %s", (commit_hash,))
+
+    return {
+        "commit_hash": commit_hash,
+        "rev": rev,
+        "files_uploaded": len(files),
+        "message": message,
+    }
+
+
 def get_log(conn, repo_id: int, limit: int = 20, path: str = None) -> list[dict]:
     """Get commit history."""
     if path:

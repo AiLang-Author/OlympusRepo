@@ -1,0 +1,294 @@
+{% extends "base.html" %}
+{% block title %}Manage Users &mdash; OlympusRepo{% endblock %}
+
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            url('/static/user-screen.png') center center / cover no-repeat fixed;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container-wide">
+
+    <div class="row-between" style="margin-bottom:24px;">
+        <h1 style="margin-bottom:0;">Manage Users</h1>
+        <button class="btn btn-primary" id="show-create-btn">New User</button>
+    </div>
+
+    <!-- CREATE USER PANEL -->
+    <div id="create-panel" class="card" style="display:none; margin-bottom:24px;">
+        <h2 style="margin-top:0;">Create User</h2>
+        <div id="create-error" class="flash flash-error" style="display:none;"></div>
+        <div id="create-success" class="flash flash-success" style="display:none;"></div>
+
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+            <div class="form-group" style="margin-bottom:0;">
+                <label for="new-username">Username <span style="color:#8b949e;">*</span></label>
+                <input type="text" id="new-username" autocomplete="off">
+            </div>
+            <div class="form-group" style="margin-bottom:0;">
+                <label for="new-password">Password <span style="color:#8b949e;">(8 chars min) *</span></label>
+                <input type="password" id="new-password" autocomplete="new-password">
+            </div>
+            <div class="form-group" style="margin-bottom:0;">
+                <label for="new-fullname">Full Name</label>
+                <input type="text" id="new-fullname">
+            </div>
+            <div class="form-group" style="margin-bottom:0;">
+                <label for="new-email">Email</label>
+                <input type="email" id="new-email">
+            </div>
+            <div class="form-group" style="margin-bottom:0;">
+                <label for="new-role">Role</label>
+                <select id="new-role">
+                    <option value="mortal">Mortal</option>
+                    <option value="prometheus">Prometheus</option>
+                    <option value="hermes">Hermes</option>
+                    <option value="titan" selected>Titan</option>
+                    <option value="olympian">Olympian</option>
+                    <option value="zeus">Zeus</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="row" style="margin-top:16px;">
+            <button class="btn btn-primary" id="create-user-btn">Create User</button>
+            <button class="btn" id="cancel-create-btn">Cancel</button>
+        </div>
+    </div>
+
+    <!-- USERS TABLE -->
+    {% if users %}
+    <table>
+        <thead>
+            <tr>
+                <th>Username</th>
+                <th>Full Name</th>
+                <th>Email</th>
+                <th>Role</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>Last Login</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody id="users-table-body">
+            {% for u in users %}
+            <tr id="user-row-{{ u.user_id }}">
+                <td style="font-weight:600;">{{ u.username }}</td>
+                <td style="color:#8b949e;">{{ u.full_name or '—' }}</td>
+                <td style="color:#8b949e;">{{ u.email or '—' }}</td>
+                <td>
+                    <span class="role-tag role-{{ u.role }}">{{ u.role }}</span>
+                </td>
+                <td>
+                    {% if u.is_active %}
+                        <span class="badge badge-public">active</span>
+                    {% else %}
+                        <span class="badge badge-private">inactive</span>
+                    {% endif %}
+                </td>
+                <td class="card-meta">
+                    {% if u.created_at %}{{ u.created_at.strftime('%b %d, %Y') }}{% else %}—{% endif %}
+                </td>
+                <td class="card-meta">
+                    {% if u.last_login %}{{ u.last_login.strftime('%b %d %H:%M') }}{% else %}never{% endif %}
+                </td>
+                <td>
+                    <div class="row" style="gap:6px; flex-wrap:nowrap;">
+                        <!-- Role selector -->
+                        <select class="role-select"
+                                data-user-id="{{ u.user_id }}"
+                                data-username="{{ u.username }}"
+                                style="width:auto; padding:3px 6px; font-size:0.8em;">
+                            {% for role in ['mortal','prometheus','hermes','titan','olympian','zeus'] %}
+                                <option value="{{ role }}" {% if role == u.role %}selected{% endif %}>
+                                    {{ role }}
+                                </option>
+                            {% endfor %}
+                        </select>
+                        <button class="btn role-save-btn"
+                                data-user-id="{{ u.user_id }}"
+                                style="padding:3px 8px; font-size:0.8em;">
+                            Save
+                        </button>
+                        {% if u.is_active %}
+                            <button class="btn btn-danger toggle-active-btn"
+                                    data-user-id="{{ u.user_id }}"
+                                    data-active="true"
+                                    style="padding:3px 8px; font-size:0.8em;">
+                                Disable
+                            </button>
+                        {% else %}
+                            <button class="btn btn-primary toggle-active-btn"
+                                    data-user-id="{{ u.user_id }}"
+                                    data-active="false"
+                                    style="padding:3px 8px; font-size:0.8em;">
+                                Enable
+                            </button>
+                        {% endif %}
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+        <div class="empty-state"><p>No users yet.</p></div>
+    {% endif %}
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    // Toggle create panel
+    document.getElementById('show-create-btn').addEventListener('click', function() {
+        document.getElementById('create-panel').style.display = 'block';
+        document.getElementById('new-username').focus();
+    });
+    document.getElementById('cancel-create-btn').addEventListener('click', function() {
+        document.getElementById('create-panel').style.display = 'none';
+        clearCreateForm();
+    });
+
+    function clearCreateForm() {
+        ['new-username','new-password','new-fullname','new-email'].forEach(function(id) {
+            document.getElementById(id).value = '';
+        });
+        document.getElementById('new-role').value = 'titan';
+        document.getElementById('create-error').style.display = 'none';
+        document.getElementById('create-success').style.display = 'none';
+    }
+
+    // Create user
+    document.getElementById('create-user-btn').addEventListener('click', async function() {
+        var btn = this;
+        var errEl = document.getElementById('create-error');
+        var okEl  = document.getElementById('create-success');
+        errEl.style.display = 'none';
+        okEl.style.display = 'none';
+
+        var username = document.getElementById('new-username').value.trim();
+        var password = document.getElementById('new-password').value;
+        var fullname = document.getElementById('new-fullname').value.trim();
+        var email    = document.getElementById('new-email').value.trim();
+        var role     = document.getElementById('new-role').value;
+
+        if (!username) {
+            errEl.textContent = 'Username is required.';
+            errEl.style.display = 'block';
+            return;
+        }
+        if (password.length < 8) {
+            errEl.textContent = 'Password must be at least 8 characters.';
+            errEl.style.display = 'block';
+            return;
+        }
+
+        btn.disabled = true;
+        var form = new FormData();
+        form.append('username', username);
+        form.append('password', password);
+        form.append('full_name', fullname);
+        form.append('email', email);
+        form.append('role', role);
+
+        try {
+            var res = await fetch('/api/admin/users', { method: 'POST', body: form });
+            var data = {};
+            try { data = await res.json(); } catch(e) {}
+
+            if (res.ok) {
+                okEl.textContent = 'User ' + username + ' created successfully.';
+                okEl.style.display = 'block';
+                clearCreateForm();
+                // Reload the page to show the new user in the table
+                setTimeout(function() { window.location.reload(); }, 1200);
+            } else {
+                errEl.textContent = data.detail || 'Could not create user.';
+                errEl.style.display = 'block';
+            }
+        } catch(err) {
+            errEl.textContent = 'Network error.';
+            errEl.style.display = 'block';
+        } finally {
+            btn.disabled = false;
+        }
+    });
+
+    // Save role changes
+    document.querySelectorAll('.role-save-btn').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+            var userId = btn.getAttribute('data-user-id');
+            var select = document.querySelector('.role-select[data-user-id="' + userId + '"]');
+            var newRole = select.value;
+
+            btn.disabled = true;
+            try {
+                var form = new FormData();
+                form.append('role', newRole);
+                var res = await fetch('/api/admin/users/' + userId, {
+                    method: 'PATCH',
+                    body: form
+                });
+                if (res.ok) {
+                    // Update the role badge in the row
+                    var row = document.getElementById('user-row-' + userId);
+                    var badge = row.querySelector('.role-tag');
+                    badge.className = 'role-tag role-' + newRole;
+                    badge.textContent = newRole;
+                    btn.textContent = '✓';
+                    setTimeout(function() { btn.textContent = 'Save'; }, 1500);
+                } else {
+                    var data = {};
+                    try { data = await res.json(); } catch(e) {}
+                    alert(data.detail || 'Could not update role.');
+                }
+            } catch(err) {
+                alert('Network error.');
+            } finally {
+                btn.disabled = false;
+            }
+        });
+    });
+
+    // Toggle active/inactive
+    document.querySelectorAll('.toggle-active-btn').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+            var userId = btn.getAttribute('data-user-id');
+            var isActive = btn.getAttribute('data-active') === 'true';
+            var action = isActive ? 'disable' : 'enable';
+
+            if (!confirm((isActive ? 'Disable' : 'Enable') + ' this user?')) return;
+
+            btn.disabled = true;
+            try {
+                var form = new FormData();
+                form.append('is_active', isActive ? 'false' : 'true');
+                var res = await fetch('/api/admin/users/' + userId, {
+                    method: 'PATCH',
+                    body: form
+                });
+                if (res.ok) {
+                    window.location.reload();
+                } else {
+                    var data = {};
+                    try { data = await res.json(); } catch(e) {}
+                    alert(data.detail || 'Could not update user.');
+                    btn.disabled = false;
+                }
+            } catch(err) {
+                alert('Network error.');
+                btn.disabled = false;
+            }
+        });
+    });
+})();
+</script>
+{% endblock %}

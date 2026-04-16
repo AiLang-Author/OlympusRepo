@@ -270,7 +270,26 @@
                     {{ user.username }}
                     <span class="role-tag role-{{ user.role }}">{{ user.role }}</span>
                 </span>
-                <a href="#" id="logout-link">Logout</a>
+                <div id="notif-wrapper" style="position:relative;">
+                    <button id="notif-btn" class="btn"
+                            style="padding:6px 10px; position:relative; background:none; border:none;">
+                        &#x1F514;
+                        <span id="notif-badge" style="display:none; position:absolute; top:2px; right:2px;
+                              background:#f85149; color:#fff; border-radius:8px; font-size:0.65em;
+                              padding:1px 5px; font-weight:700;"></span>
+                    </button>
+                    <div id="notif-dropdown" style="display:none; position:absolute; right:0; top:38px;
+                         width:320px; background:#161b22; border:1px solid #30363d; border-radius:6px;
+                         z-index:100; max-height:400px; overflow-y:auto;">
+                        <div style="padding:10px 14px; border-bottom:1px solid #30363d;
+                                    display:flex; justify-content:space-between; align-items:center;">
+                            <strong>Notifications</strong>
+                            <a href="#" id="mark-all-read" style="font-size:0.8em;">Mark all read</a>
+                        </div>
+                        <div id="notif-list" style="padding:8px 0;"></div>
+                    </div>
+                </div>
+                <a href="/logout" id="logout-link">Logout</a>
             {% else %}
                 <a href="/login">Login</a>
             {% endif %}
@@ -289,19 +308,68 @@
     </footer>
 
     <script>
-        // Logout handler (attached via JS so it works without forms)
-        document.addEventListener('DOMContentLoaded', function() {
-            var logoutLink = document.getElementById('logout-link');
-            if (logoutLink) {
-                logoutLink.addEventListener('click', async function(e) {
-                    e.preventDefault();
-                    try {
-                        await fetch('/api/auth/logout', { method: 'POST' });
-                    } catch (err) { /* ignore */ }
-                    window.location = '/';
-                });
+        (function() {
+            var btn = document.getElementById('notif-btn');
+            var dropdown = document.getElementById('notif-dropdown');
+            var badge = document.getElementById('notif-badge');
+            var list = document.getElementById('notif-list');
+            if (!btn) return;
+
+            async function loadNotifications() {
+                try {
+                    var res = await fetch('/api/notifications');
+                    if (!res.ok) return;
+                    var data = await res.json();
+                    if (data.unread > 0) {
+                        badge.textContent = data.unread;
+                        badge.style.display = 'inline';
+                    } else {
+                        badge.style.display = 'none';
+                    }
+                    list.innerHTML = '';
+                    if (data.notifications.length === 0) {
+                        list.innerHTML = '<div style="padding:12px 14px; color:#8b949e; font-size:0.9em;">No notifications.</div>';
+                        return;
+                    }
+                    data.notifications.forEach(function(n) {
+                        var div = document.createElement('div');
+                        div.style.cssText = 'padding:10px 14px; border-bottom:1px solid #21262d; cursor:pointer;' +
+                            (n.is_read ? 'opacity:0.6;' : 'background:#0d1117;');
+                        div.innerHTML =
+                            '<div style="font-size:0.85em; color:#c9d1d9;">' + n.message + '</div>' +
+                            '<div style="font-size:0.75em; color:#8b949e; margin-top:2px;">' +
+                            new Date(n.created_at).toLocaleDateString() + '</div>';
+                        div.addEventListener('click', async function() {
+                            await fetch('/api/notifications/' + n.notif_id + '/read', {method:'POST'});
+                            if (n.link) window.location = n.link;
+                            else loadNotifications();
+                        });
+                        list.appendChild(div);
+                    });
+                } catch(e) {}
             }
-        });
+
+            btn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var isOpen = dropdown.style.display !== 'none';
+                dropdown.style.display = isOpen ? 'none' : 'block';
+                if (!isOpen) loadNotifications();
+            });
+
+            document.addEventListener('click', function() {
+                dropdown.style.display = 'none';
+            });
+
+            document.getElementById('mark-all-read').addEventListener('click', async function(e) {
+                e.preventDefault();
+                await fetch('/api/notifications/read-all', {method:'POST'});
+                loadNotifications();
+            });
+
+            // Poll every 60 seconds for new notifications
+            loadNotifications();
+            setInterval(loadNotifications, 60000);
+        })();
     </script>
 
     {% block extra_js %}{% endblock %}

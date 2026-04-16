@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+{% block title %}Permissions &mdash; {{ repo.name }}{% endblock %}
+
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            url('/static/gates-of-olympus.png') center center / cover no-repeat fixed;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container" style="max-width:800px;">
+    <div class="row-between" style="margin-bottom:24px;">
+        <h1 style="margin-bottom:0;">Repository Permissions</h1>
+        <a href="/repo/{{ repo.name }}/settings" class="btn">Back to Settings</a>
+    </div>
+
+    <div class="card" style="margin-bottom:32px;">
+        <h2 style="margin-top:0;">Grant Permission</h2>
+        <div class="row" style="margin-bottom:12px;">
+            <label><input type="radio" name="grant-type" value="user" checked> User</label>
+            <label><input type="radio" name="grant-type" value="role"> Role</label>
+        </div>
+
+        <div id="grant-user-select" class="row">
+            <select id="grant-user" style="flex:1;">
+                <option value="">-- Select User --</option>
+                {% for u in all_users %}
+                    <option value="{{ u.user_id }}">{{ u.username }} ({{ u.role }})</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div id="grant-role-select" class="row" style="display:none;">
+            <select id="grant-role" style="flex:1;">
+                <option value="olympian">Olympian</option>
+                <option value="titan">Titan</option>
+                <option value="prometheus">Prometheus</option>
+                <option value="hermes">Hermes</option>
+                <option value="mortal">Mortal</option>
+            </select>
+        </div>
+
+        <div class="row" style="margin-top:12px;">
+            <select id="grant-action" style="flex:1;">
+                <option value="promote">promote</option>
+                <option value="branch_create">branch_create</option>
+                <option value="branch_delete">branch_delete</option>
+                <option value="force_push">force_push</option>
+                <option value="admin">admin</option>
+            </select>
+            <input type="text" id="grant-scope" value="*" style="flex:1;">
+            <button id="grant-btn" class="btn btn-primary">Grant</button>
+        </div>
+        <div id="action-help" class="card-meta" style="margin-top:8px;">
+            Can promote staging to canonical.
+        </div>
+    </div>
+
+    <h2 style="margin-bottom:12px;">Current Permissions</h2>
+    {% if perms %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Grantee</th>
+                    <th>Action</th>
+                    <th>Scope</th>
+                    <th>Granted</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for p in perms %}
+                <tr>
+                    <td style="font-weight:600;">
+                        {% if p.user_id %}
+                            {{ p.username }} <span class="role-tag role-{{ p.user_role }}">{{ p.user_role }}</span>
+                        {% elif p.role_grant %}
+                            Role: <span class="role-tag role-{{ p.role_grant }}">{{ p.role_grant }}</span>
+                        {% endif %}
+                    </td>
+                    <td><span class="badge" style="background:#6e40c9; color:#fff;">{{ p.action }}</span></td>
+                    <td class="mono">{{ p.scope }}</td>
+                    <td class="card-meta">{% if p.granted_at %}{{ p.granted_at.strftime('%b %d, %Y') }}{% endif %}</td>
+                    <td>
+                        <button class="btn btn-danger revoke-btn" data-id="{{ p.perm_id }}" style="padding:2px 8px; font-size:0.8em;">Revoke</button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% else %}
+        <div class="empty-state"><p>No special permissions granted. Only Zeus has full power.</p></div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    var repoName = {{ repo.name | tojson }};
+
+    // Grant form logic
+    document.querySelectorAll('input[name="grant-type"]').forEach(function(radio) {
+        radio.addEventListener('change', function() {
+            document.getElementById('grant-user-select').style.display = (this.value === 'user') ? 'flex' : 'none';
+            document.getElementById('grant-role-select').style.display = (this.value === 'role') ? 'flex' : 'none';
+        });
+    });
+
+    var actionHelp = {
+        promote: 'Can promote staging to canonical.',
+        branch_create: 'Can create new branches.',
+        branch_delete: 'Can delete branches.',
+        force_push: 'Can overwrite history.',
+        admin: 'Full repo admin.'
+    };
+    document.getElementById('grant-action').addEventListener('change', function() {
+        document.getElementById('action-help').textContent = actionHelp[this.value] || '';
+    });
+
+    document.getElementById('grant-btn').addEventListener('click', async function() {
+        var btn = this;
+        btn.disabled = true;
+
+        var form = new FormData();
+        var grantType = document.querySelector('input[name="grant-type"]:checked').value;
+        if (grantType === 'user') {
+            var userId = document.getElementById('grant-user').value;
+            if (!userId) { alert('Please select a user.'); btn.disabled = false; return; }
+            form.append('user_id', userId);
+        } else {
+            form.append('role', document.getElementById('grant-role').value);
+        }
+        form.append('action', document.getElementById('grant-action').value);
+        form.append('scope', document.getElementById('grant-scope').value);
+
+        try {
+            var res = await fetch('/api/repos/' + repoName + '/permissions', { method: 'POST', body: form });
+            if (res.ok) {
+                window.location.reload();
+            } else {
+                var data = {}; try { data = await res.json(); } catch(e) {}
+                alert(data.detail || 'Could not grant permission.');
+                btn.disabled = false;
+            }
+        } catch (err) {
+            alert('Network error.');
+            btn.disabled = false;
+        }
+    });
+
+    // Revoke buttons
+    document.querySelectorAll('.revoke-btn').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+            if (!confirm('Revoke this permission?')) return;
+            var permId = btn.getAttribute('data-id');
+            btn.disabled = true;
+
+            try {
+                var res = await fetch('/api/repos/' + repoName + '/permissions/' + permId, { method: 'DELETE' });
+                if (res.ok) {
+                    window.location.reload();
+                } else {
+                    var data = {}; try { data = await res.json(); } catch(e) {}
+                    alert(data.detail || 'Could not revoke permission.');
+                    btn.disabled = false;
+                }
+            } catch (err) {
+                alert('Network error.');
+                btn.disabled = false;
+            }
+        });
+    });
+})();
+</script>
+{% endblock %}

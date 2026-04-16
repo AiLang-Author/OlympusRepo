@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}{{ path }} &mdash; {{ repo.name }}{% endblock %}
+
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            url('/static/repo-room.png') center center / cover no-repeat fixed;
+    }
+    .code-block {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 16px 0;
+        overflow-x: auto;
+        font-size: 0.9em;
+        line-height: 1.5;
+        counter-reset: line;
+    }
+    .code-block .line {
+        display: block;
+        counter-increment: line;
+        padding: 0 16px;
+    }
+    .code-block .line:hover {
+        background: #30363d;
+    }
+    .code-block .line::before {
+        content: counter(line);
+        display: inline-block;
+        width: 3em;
+        padding-right: 1em;
+        text-align: right;
+        color: #8b949e;
+        user-select: none;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="row-between" style="margin-bottom:16px;">
+        <div class="row" style="gap:8px;">
+            <a href="/repo/{{ repo.name }}" style="font-weight:600; font-size:1.2em;">{{ repo.name }}</a>
+            <span style="color:#8b949e; font-size:1.2em;">/</span>
+            <span style="font-size:1.2em;">
+                {% set segments = path.split('/') %}
+                {% for seg in segments %}
+                    {% if not loop.last %}
+                        <a href="/repo/{{ repo.name }}" style="color:#8b949e;">{{ seg }}</a> /
+                    {% else %}
+                        <strong>{{ seg }}</strong>
+                    {% endif %}
+                {% endfor %}
+            </span>
+        </div>
+        <div class="row">
+            <a href="/repo/{{ repo.name }}" class="btn">Back to Files</a>
+            <a href="/api/repos/{{ repo.name }}/raw/{{ branch }}/{{ path }}" class="btn btn-primary" target="_blank">Raw</a>
+        </div>
+    </div>
+
+    <!-- Branch selector -->
+    {% if branches %}
+    <div class="row" style="margin-bottom:16px;">
+        <span style="color:#8b949e; font-size:0.9em;">Branch:</span>
+        <span class="btn btn-primary" style="padding:4px 10px; font-size:0.85em; cursor:default;">
+            {{ current_branch }}
+        </span>
+    </div>
+    {% endif %}
+
+    {% if is_binary %}
+        <div class="empty-state" style="background:#161b22; border:1px solid #30363d; border-radius:6px;">
+            <p>Binary file &mdash; cannot display contents</p>
+        </div>
+    {% else %}
+        <pre class="code-block mono"><code>{% for line in content.split('\n') %}<span class="line">{{ line }}</span>{% endfor %}</code></pre>
+    {% endif %}
+</div>
+{% endblock %}

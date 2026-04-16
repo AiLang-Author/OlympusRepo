@@ -1,6 +1,16 @@
 {% extends "base.html" %}
 {% block title %}The Throne &mdash; OlympusRepo{% endblock %}
 
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            url('/static/throne-room.png') center center / cover no-repeat fixed;
+    }
+</style>
+{% endblock %}
+
 {% block content %}
 <div class="container-wide">
 
@@ -8,6 +18,25 @@
     <p style="color:#8b949e; margin-bottom:24px;">
         Welcome, {{ user.username }}. You see all.
     </p>
+
+    <!-- Stats row -->
+    <div style="display:grid; grid-template-columns:repeat(6,1fr); gap:12px; margin-bottom:32px;">
+        {% for label, key in [
+            ('Repositories', 'total_repos'),
+            ('Active Users', 'total_users'),
+            ('Total Commits', 'total_commits'),
+            ('Promotions', 'total_promotions'),
+            ('Active Staging', 'active_staging'),
+            ('Commits Today', 'commits_today')
+        ] %}
+        <div class="card" style="text-align:center; padding:16px;">
+            <div style="font-size:1.8em; font-weight:700; color:#f0f6fc;">
+                {{ stats[key] }}
+            </div>
+            <div class="card-meta" style="margin-top:4px;">{{ label }}</div>
+        </div>
+        {% endfor %}
+    </div>
 
     <!-- ACTIVE STAGING REALMS -->
     <h2>Active Offerings</h2>
@@ -103,6 +132,7 @@
         <a href="/zeus/users" class="btn">Manage Users</a>
         <a href="/zeus/config" class="btn">Server Config</a>
         <a href="/new" class="btn btn-primary">Create Repository</a>
+        <a href="/zeus/audit" class="btn">Full Audit Log</a>
     </div>
 
 </div>
