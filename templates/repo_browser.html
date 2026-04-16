@@ -1,0 +1,276 @@
+{% extends "base.html" %}
+{% block title %}{{ repo.name }} &mdash; OlympusRepo{% endblock %}
+
+{% block content %}
+<div class="container">
+
+    <!-- Repo header -->
+    <div class="row-between" style="margin-bottom:24px;">
+        <div>
+            <h1 style="margin-bottom:4px;">{{ repo.name }}</h1>
+            {% if repo.description %}
+                <p style="color:#8b949e; margin:0;">{{ repo.description }}</p>
+            {% endif %}
+        </div>
+        <div class="row">
+            <span class="badge badge-{{ repo.visibility }}">{{ repo.visibility }}</span>
+            {% if user %}
+                <a href="/api/repos/{{ repo.name }}/clone" class="btn">Clone</a>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Branch selector -->
+    {% if branches %}
+    <div class="row" style="margin-bottom:16px;">
+        <span style="color:#8b949e; font-size:0.9em;">Branch:</span>
+        {% for b in branches %}
+            {% set bname = b.ref_name.replace('refs/heads/', '') %}
+            <a href="/repo/{{ repo.name }}?branch={{ bname }}"
+               class="btn {% if bname == current_branch %}btn-primary{% endif %}"
+               style="padding:4px 10px; font-size:0.85em;">
+                {{ bname }}
+            </a>
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    <!-- Tabs -->
+    <div style="display:flex; gap:4px; border-bottom:1px solid #30363d; margin-bottom:24px; flex-wrap:wrap;">
+        <a href="/repo/{{ repo.name }}"
+           class="btn" style="border:none; border-bottom:2px solid {% if tab == 'files' %}#58a6ff{% else %}transparent{% endif %}; border-radius:0;">
+            Files
+        </a>
+        <a href="/repo/{{ repo.name }}/commits"
+           class="btn" style="border:none; border-bottom:2px solid {% if tab == 'commits' %}#58a6ff{% else %}transparent{% endif %}; border-radius:0;">
+            Commits
+        </a>
+        <a href="/repo/{{ repo.name }}/mana"
+           class="btn" style="border:none; border-bottom:2px solid {% if tab == 'mana' %}#58a6ff{% else %}transparent{% endif %}; border-radius:0;">
+            Mana
+        </a>
+        {% if user and user.role in ('zeus', 'olympian') %}
+        <a href="/repo/{{ repo.name }}/staging"
+           class="btn" style="border:none; border-bottom:2px solid {% if tab == 'staging' %}#58a6ff{% else %}transparent{% endif %}; border-radius:0;">
+            Staging
+        </a>
+        {% endif %}
+    </div>
+
+    <!-- COMMITS TAB -->
+    {% if tab == 'commits' %}
+        <h2>Commit History</h2>
+        {% if commits %}
+            {% for c in commits %}
+            <div class="card">
+                <div class="card-header">
+                    <span>
+                        <span style="color:#f0f6fc; font-weight:600;">rev {{ c.rev }}</span>
+                        <span class="hash" style="margin-left:8px;">{{ c.commit_hash[:12] }}</span>
+                    </span>
+                    <span class="card-meta">
+                        {% if c.committed_at %}{{ c.committed_at.strftime('%b %d, %Y %H:%M') }}{% endif %}
+                    </span>
+                </div>
+                <p style="margin:4px 0;">{{ c.message }}</p>
+                <div class="card-meta">{{ c.author_name }}</div>
+            </div>
+            {% endfor %}
+        {% else %}
+            <div class="empty-state"><p>No commits yet.</p></div>
+        {% endif %}
+
+    <!-- MANA TAB -->
+    {% elif tab == 'mana' %}
+        <h2>Mana &mdash; Design Discussion</h2>
+
+        {% if user %}
+        <div class="card" style="margin-bottom:24px;">
+            <h3>Send Mana</h3>
+            <div id="mana-error" class="flash flash-error" style="display:none;"></div>
+            <div class="form-group">
+                <textarea id="mana-content" placeholder="Share your thoughts, design rationale, or feedback..."></textarea>
+            </div>
+            <div class="row">
+                <select id="mana-context-type" style="width:auto; flex:0 0 auto;">
+                    <option value="general">General</option>
+                    <option value="file">File</option>
+                    <option value="commit">Commit</option>
+                    <option value="staging">Staging</option>
+                </select>
+                <input type="text" id="mana-context-id" placeholder="Context (file path, commit hash, etc.)" style="flex:1; min-width:200px;">
+                <button id="mana-send-btn" class="btn btn-primary">Send</button>
+            </div>
+        </div>
+        {% endif %}
+
+        {% if messages %}
+            {% for m in messages %}
+            <div class="card" style="padding:12px;">
+                <div class="row-between" style="margin-bottom:4px;">
+                    <span style="font-weight:600; color:#f0f6fc;">{{ m.username }}</span>
+                    <span class="card-meta">
+                        {% if m.created_at %}{{ m.created_at.strftime('%b %d %H:%M') }}{% endif %}
+                    </span>
+                </div>
+                <p style="margin:0; white-space:pre-wrap;">{{ m.content }}</p>
+                {% if m.context_type and m.context_type != 'general' %}
+                    <div class="card-meta" style="margin-top:4px;">
+                        {{ m.context_type }}: <code>{{ m.context_id }}</code>
+                    </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        {% else %}
+            <div class="empty-state"><p>No mana yet. Start a discussion.</p></div>
+        {% endif %}
+
+    <!-- STAGING TAB -->
+    {% elif tab == 'staging' %}
+        <h2>Staging Realms</h2>
+        {% if staging_realms %}
+            {% for s in staging_realms %}
+            <div class="card">
+                <div class="card-header">
+                    <span>
+                        <span style="font-weight:600; color:#f0f6fc;">{{ s.username }}</span>
+                        <span class="role-tag role-{{ s.role }}">{{ s.role }}</span>
+                        <span style="margin-left:8px; color:#8b949e;"><code>{{ s.branch_name }}</code></span>
+                    </span>
+                    <span class="row">
+                        <span class="badge" style="background:#1f6feb; color:#fff;">{{ s.change_count }} changes</span>
+                        {% if user and user.role in ('zeus', 'olympian') %}
+                            <button class="btn btn-gold promote-btn"
+                                    data-staging-id="{{ s.staging_id }}"
+                                    style="padding:4px 10px; font-size:0.8em;">
+                                Promote
+                            </button>
+                        {% endif %}
+                    </span>
+                </div>
+                <div class="card-meta">
+                    {% if s.updated_at %}Updated {{ s.updated_at.strftime('%b %d, %Y %H:%M') }}{% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        {% else %}
+            <div class="empty-state"><p>No active staging realms.</p></div>
+        {% endif %}
+
+    <!-- FILES TAB (default) -->
+    {% else %}
+        <h2>Files</h2>
+        {% if files %}
+            <table>
+                <thead>
+                    <tr><th>Name</th><th>Type</th><th>Size</th></tr>
+                </thead>
+                <tbody>
+                    {% for f in files %}
+                    <tr>
+                        <td><a href="/repo/{{ repo.name }}/blob/{{ current_branch }}/{{ f.path }}">{{ f.path }}</a></td>
+                        <td style="color:#8b949e;">{{ f.type }}</td>
+                        <td style="color:#8b949e;">{{ f.size }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <div class="empty-state">
+                <p>No files yet.</p>
+                <p style="margin-top:8px; font-size:0.9em; color:#8b949e;">
+                    Clone this repo and start committing.
+                </p>
+                <pre style="margin-top:16px; text-align:left; display:inline-block; background:#161b22; padding:12px 16px; border-radius:6px; font-size:0.85em;">cd {{ repo.name }}
+echo "# {{ repo.name }}" &gt; README.md
+olympusrepo add .
+olympusrepo commit -m "Initial commit"</pre>
+            </div>
+        {% endif %}
+    {% endif %}
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    var repoName = {{ repo.name | tojson }};
+
+    // Mana send
+    var manaBtn = document.getElementById('mana-send-btn');
+    if (manaBtn) {
+        manaBtn.addEventListener('click', async function() {
+            var contentEl = document.getElementById('mana-content');
+            var errEl = document.getElementById('mana-error');
+            errEl.style.display = 'none';
+
+            var content = contentEl.value.trim();
+            if (!content) {
+                errEl.textContent = 'Message cannot be empty.';
+                errEl.style.display = 'block';
+                return;
+            }
+
+            manaBtn.disabled = true;
+            try {
+                var form = new FormData();
+                form.append('content', content);
+                form.append('context_type', document.getElementById('mana-context-type').value);
+                form.append('context_id', document.getElementById('mana-context-id').value);
+
+                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/mana', {
+                    method: 'POST',
+                    body: form
+                });
+
+                if (res.ok) {
+                    window.location.reload();
+                } else {
+                    var data = {};
+                    try { data = await res.json(); } catch (e) {}
+                    errEl.textContent = data.detail || 'Could not send mana.';
+                    errEl.style.display = 'block';
+                }
+            } catch (err) {
+                errEl.textContent = 'Network error.';
+                errEl.style.display = 'block';
+            } finally {
+                manaBtn.disabled = false;
+            }
+        });
+    }
+
+    // Promote buttons
+    document.querySelectorAll('.promote-btn').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+            var stagingId = btn.getAttribute('data-staging-id');
+            var notes = prompt('Promotion notes (optional):');
+            if (notes === null) return;  // cancelled
+
+            btn.disabled = true;
+            try {
+                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/promote/' + stagingId, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ notes: notes })
+                });
+
+                if (res.ok) {
+                    alert('Promoted to canonical tree.');
+                    window.location.reload();
+                } else {
+                    var data = {};
+                    try { data = await res.json(); } catch (e) {}
+                    alert(data.detail || 'Promotion failed.');
+                    btn.disabled = false;
+                }
+            } catch (err) {
+                alert('Network error.');
+                btn.disabled = false;
+            }
+        });
+    });
+})();
+</script>
+{% endblock %}

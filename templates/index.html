@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}OlympusRepo &mdash; Repositories{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="row-between" style="margin-bottom:24px;">
+        <h1 style="margin-bottom:0;">Repositories</h1>
+        {% if user and user.role == 'zeus' %}
+            <a href="/new" class="btn btn-primary">New Repository</a>
+        {% endif %}
+    </div>
+
+    {% if repos %}
+        {% for r in repos %}
+        <a href="/repo/{{ r.name }}" style="display:block; text-decoration:none; color:inherit;">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">{{ r.name }}</span>
+                    <span class="badge badge-{{ r.visibility }}">{{ r.visibility }}</span>
+                </div>
+                {% if r.description %}
+                    <p style="color:#8b949e; font-size:0.9em; margin:0;">{{ r.description }}</p>
+                {% endif %}
+                <div class="card-meta" style="margin-top:8px;">
+                    {% if r.updated_at %}
+                        Updated {{ r.updated_at.strftime('%b %d, %Y') }}
+                    {% else %}
+                        Never updated
+                    {% endif %}
+                </div>
+            </div>
+        </a>
+        {% endfor %}
+    {% else %}
+        <div class="empty-state">
+            <p>No repositories yet.</p>
+            {% if not user %}
+                <p style="margin-top:12px;">
+                    <a href="/login">Login</a> to see private repositories or create new ones.
+                </p>
+            {% elif user.role == 'zeus' %}
+                <p style="margin-top:12px;">
+                    <a href="/new">Create your first repository</a> to get started.
+                </p>
+            {% endif %}
+        </div>
+    {% endif %}
+</div>
+{% endblock %}
