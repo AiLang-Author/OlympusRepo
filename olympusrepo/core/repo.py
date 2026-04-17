@@ -530,6 +530,72 @@ def get_branches(conn, repo_id: int) -> list[dict]:
     """, (repo_id,))
 
 
+
+def get_branch_tree(conn, repo_id: int, branch: str) -> dict:
+    """Build file tree at HEAD of branch by walking parent chain."""
+    ref_name = f"refs/heads/{branch}"
+    ref_row = db.query_one(conn,
+        "SELECT commit_hash FROM repo_refs WHERE repo_id=%s AND ref_name=%s",
+        (repo_id, ref_name))
+    if not ref_row or not ref_row["commit_hash"]:
+        return {}
+    visited, to_visit, hashes = set(), [ref_row["commit_hash"]], []
+    while to_visit:
+        h = to_visit.pop()
+        if h in visited: continue
+        visited.add(h); hashes.append(h)
+        row = db.query_one(conn,
+            "SELECT parent_hashes FROM repo_commits WHERE commit_hash=%s", (h,))
+        if row and row["parent_hashes"]:
+            for p in row["parent_hashes"]:
+                if p and p not in visited:
+                    to_visit.append(p)
+    rows = db.query(conn, """
+        SELECT commit_hash FROM repo_commits
+         WHERE commit_hash = ANY(%s)
+         ORDER BY COALESCE(rev, 999999) ASC, committed_at ASC
+    """, (hashes,))
+    tree = {}
+    for h in [r["commit_hash"] for r in rows]:
+        for cs in db.query(conn,
+            "SELECT path, change_type, blob_after FROM repo_changesets WHERE commit_hash=%s",
+            (h,)):
+            if cs["change_type"] in ("add", "modify"):
+                tree[cs["path"]] = cs["blob_after"]
+            elif cs["change_type"] == "delete":
+                tree.pop(cs["path"], None)
+    return tree
+
+
+def get_branch_log(conn, repo_id: int, branch: str, limit: int = 20) -> list:
+    """Commit history for a branch via parent chain walk, newest first."""
+    ref_name = f"refs/heads/{branch}"
+    ref_row = db.query_one(conn,
+        "SELECT commit_hash FROM repo_refs WHERE repo_id=%s AND ref_name=%s",
+        (repo_id, ref_name))
+    if not ref_row or not ref_row["commit_hash"]:
+        return []
+    visited, to_visit, commits = set(), [ref_row["commit_hash"]], []
+    while to_visit and len(commits) < limit:
+        h = to_visit.pop(0)
+        if h in visited: continue
+        visited.add(h)
+        row = db.query_one(conn, """
+            SELECT rev, commit_hash, author_name, message,
+                   committed_at, parent_hashes
+              FROM repo_commits WHERE commit_hash=%s
+        """, (h,))
+        if row:
+            commits.append(dict(row))
+            if row["parent_hashes"]:
+                for p in row["parent_hashes"]:
+                    if p and p not in visited:
+                        to_visit.append(p)
+    return sorted(commits,
+        key=lambda c: (c["rev"] or 999999, str(c["committed_at"])),
+        reverse=True)
+
+
 def create_branch(conn, repo_id: int, user_id: int, branch_name: str,
                   from_branch: str = None) -> dict:
     """

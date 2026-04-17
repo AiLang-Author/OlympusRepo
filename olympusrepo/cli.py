@@ -194,8 +194,12 @@ def cmd_log(args):
     config = worktree.load_config(repo_root)
     conn = db.connect()
     try:
-        commits = repo.get_log(conn, config["repo_id"],
-                               limit=args.limit, path=args.path)
+        branch = worktree.get_current_branch(repo_root)
+        commits = repo.get_branch_log(conn, config["repo_id"],
+                                      branch, limit=args.limit or 20)
+        if not commits:
+            commits = repo.get_log(conn, config["repo_id"],
+                                   limit=args.limit, path=args.path)
 
         if not commits:
             print("No commits yet.")
@@ -318,6 +322,42 @@ def cmd_switch(args):
         conn.close()
 
     worktree.set_current_branch(repo_root, args.branch)
+
+    # Restore working tree from branch HEAD
+    conn2 = db.connect()
+    try:
+        ref = f"refs/heads/{args.branch}"
+        ref_row = db.query_one(conn2,
+            "SELECT commit_hash FROM repo_refs WHERE repo_id = %s AND ref_name = %s",
+            (config["repo_id"], ref))
+        if ref_row and ref_row["commit_hash"]:
+            from .core import objects as obj_store
+            objects_dir = os.environ.get(
+                "OLYMPUSREPO_OBJECTS_DIR",
+                os.path.join(repo_root, ".olympusrepo", "objects")
+            )
+            # Replay changesets to build file tree for this branch
+            tree = repo.get_branch_tree(conn2, config["repo_id"], args.branch)
+            # Remove files not in target branch
+            for f in worktree.scan_working_tree(repo_root):
+                if f not in tree:
+                    try: os.remove(os.path.join(repo_root, f))
+                    except OSError: pass
+            # Write files
+            for fpath, blob_hash in tree.items():
+                if not blob_hash:
+                    continue
+                full = os.path.join(repo_root, fpath)
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                obj_store.retrieve_to_file(blob_hash, full, objects_dir)
+            # Update both indexes
+            index = {p: {"hash": h, "mtime": 0, "size": 0}
+                     for p, h in tree.items() if h}
+            worktree.save_index(repo_root, index)
+            worktree.save_committed_index(repo_root, index)
+    finally:
+        conn2.close()
+
     print(f"Switched to: {args.branch}")
     return 0
 
@@ -828,7 +868,6 @@ def cmd_delete_repo(args):
 
         try:
             # Delete in correct order respecting FK constraints
-            conn.autocommit = False
             cur = conn.cursor()
             repo_id = r["repo_id"]
             cur.execute("DELETE FROM repo_audit_log WHERE repo_id = %s", (repo_id,))
