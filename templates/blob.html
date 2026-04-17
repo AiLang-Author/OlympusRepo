@@ -71,6 +71,54 @@
     </div>
     {% endif %}
 
+    {% if version_label %}
+    <div class="row-between" style="margin-bottom:12px; padding:8px 12px;
+         background:#161b22; border:1px solid #30363d; border-radius:6px;">
+        <div class="row" style="gap:12px;">
+            <span style="color:#ffd700; font-size:0.9em; font-family:monospace;">
+                {{ path }}
+            </span>
+            <span style="color:#8b949e; font-size:0.85em;">
+                @ {{ version_label }}
+            </span>
+            {% if is_historical %}
+                <span class="badge" style="background:#9e6a03; color:#ffd700;">
+                    Historical version
+                </span>
+                <a href="/repo/{{ repo.name }}/blob/{{ branch }}/{{ path }}"
+                   class="btn" style="padding:2px 8px; font-size:0.8em;">
+                    &rarr; Latest
+                </a>
+            {% endif %}
+        </div>
+        <div class="row" style="gap:8px;">
+            <!-- Prev/Next from history list -->
+            {% if history %}
+                {% for i in range(history|length) %}
+                    {% if history[i].committed_at.strftime('%Y-%m-%dT%H:%M:%S') == viewing_at %}
+                        {% if i + 1 < history|length %}
+                            <a href="/repo/{{ repo.name }}/blob/{{ branch }}/{{ path }}?at={{ history[i+1].committed_at.strftime('%Y-%m-%dT%H:%M:%S') }}"
+                               class="btn" style="padding:3px 8px; font-size:0.8em;">
+                                &larr; Older
+                            </a>
+                        {% endif %}
+                        {% if i > 0 %}
+                            <a href="/repo/{{ repo.name }}/blob/{{ branch }}/{{ path }}?at={{ history[i-1].committed_at.strftime('%Y-%m-%dT%H:%M:%S') }}"
+                               class="btn" style="padding:3px 8px; font-size:0.8em;">
+                                Newer &rarr;
+                            </a>
+                        {% endif %}
+                    {% endif %}
+                {% endfor %}
+            {% endif %}
+            <a href="/repo/{{ repo.name }}/file/{{ path }}"
+               class="btn" style="padding:3px 8px; font-size:0.8em;">
+                {{ history|length }} version{% if history|length != 1 %}s{% endif %}
+            </a>
+        </div>
+    </div>
+    {% endif %}
+
     {% if is_binary %}
         <div class="empty-state" style="background:#161b22; border:1px solid #30363d; border-radius:6px;">
             <p>Binary file &mdash; cannot display contents</p>
@@ -79,4 +127,140 @@
         <pre class="code-block mono"><code>{% for line in content.split('\n') %}<span class="line">{{ line }}</span>{% endfor %}</code></pre>
     {% endif %}
 </div>
+
+<script>
+// Inline comments for blob.html
+(function() {
+    var repoName = {{ repo.name | tojson }};
+    var filePath = {{ path | tojson }};
+    var isLoggedIn = {{ 'true' if user else 'false' }};
+
+    // Load existing comments
+    async function loadComments() {
+        try {
+            var res = await fetch(
+                '/api/repos/' + encodeURIComponent(repoName) +
+                '/comments/' + filePath
+            );
+            if (!res.ok) return;
+            var comments = await res.json();
+
+            comments.forEach(function(c) {
+                insertCommentBubble(c.line_num, c);
+            });
+        } catch(e) {}
+    }
+
+    function insertCommentBubble(lineNum, comment) {
+        var lines = document.querySelectorAll('.line');
+        if (!lines[lineNum - 1]) return;
+
+        var bubble = document.createElement('div');
+        bubble.style.cssText = [
+            'background:#161b22',
+            'border:1px solid #30363d',
+            'border-left:3px solid #ffd700',
+            'border-radius:0 4px 4px 0',
+            'padding:8px 12px',
+            'margin:2px 0 2px 3em',
+            'font-size:0.85em',
+            'font-family:inherit'
+        ].join(';');
+
+        bubble.innerHTML =
+            '<span style="color:#ffd700;font-weight:600;">' +
+            escapeHtml(comment.username) + '</span>' +
+            '<span style="color:#484f58;margin:0 8px;">·</span>' +
+            '<span style="color:#8b949e;">' +
+            new Date(comment.created_at).toLocaleString() + '</span>' +
+            (comment.reply_count > 0
+                ? '<span style="color:#58a6ff;margin-left:8px;">' +
+                  comment.reply_count + ' repl' +
+                  (comment.reply_count === 1 ? 'y' : 'ies') + '</span>'
+                : '') +
+            '<div style="color:#c9d1d9;margin-top:4px;white-space:pre-wrap;">' +
+            escapeHtml(comment.content) + '</div>';
+
+        lines[lineNum - 1].insertAdjacentElement('afterend', bubble);
+    }
+
+    function escapeHtml(str) {
+        return String(str || '')
+            .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+            .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    // Click line number to comment
+    if (isLoggedIn) {
+        document.querySelectorAll('.line').forEach(function(line, idx) {
+            line.style.cursor = 'pointer';
+            line.addEventListener('click', function(e) {
+                // Remove any existing comment boxes
+                var existing = document.querySelector('.comment-box');
+                if (existing) existing.remove();
+                if (existing && existing.dataset.line == (idx + 1)) return;
+
+                var box = document.createElement('div');
+                box.className = 'comment-box';
+                box.dataset.line = idx + 1;
+                box.style.cssText = [
+                    'background:#161b22',
+                    'border:1px solid #58a6ff',
+                    'border-radius:6px',
+                    'padding:12px',
+                    'margin:4px 0 4px 3em'
+                ].join(';');
+
+                box.innerHTML =
+                    '<div style="font-size:0.8em;color:#8b949e;margin-bottom:6px;">' +
+                    'Comment on line ' + (idx + 1) + '</div>' +
+                    '<textarea class="comment-input" style="width:100%;' +
+                    'background:#0d1117;border:1px solid #30363d;' +
+                    'border-radius:4px;color:#c9d1d9;padding:6px;' +
+                    'font-family:inherit;font-size:0.9em;min-height:60px;' +
+                    'resize:vertical;" placeholder="Leave a comment..."></textarea>' +
+                    '<div style="margin-top:6px;display:flex;gap:8px;">' +
+                    '<button class="comment-submit btn btn-primary" ' +
+                    'style="padding:4px 12px;font-size:0.85em;">Comment</button>' +
+                    '<button class="comment-cancel btn" ' +
+                    'style="padding:4px 12px;font-size:0.85em;">Cancel</button>' +
+                    '</div>';
+
+                line.insertAdjacentElement('afterend', box);
+                box.querySelector('.comment-input').focus();
+
+                box.querySelector('.comment-cancel').addEventListener('click',
+                    function() { box.remove(); });
+
+                box.querySelector('.comment-submit').addEventListener('click',
+                    async function() {
+                        var content = box.querySelector('.comment-input').value.trim();
+                        if (!content) return;
+
+                        var form = new FormData();
+                        form.append('path', filePath);
+                        form.append('line_num', idx + 1);
+                        form.append('content', content);
+
+                        try {
+                            var res = await fetch(
+                                '/api/repos/' + encodeURIComponent(repoName) + '/comments',
+                                { method: 'POST', body: form }
+                            );
+                            if (res.ok) {
+                                box.remove();
+                                // Re-load comments to show the new one
+                                document.querySelectorAll('.comment-bubble')
+                                    .forEach(function(b) { b.remove(); });
+                                loadComments();
+                            }
+                        } catch(err) {}
+                    });
+            });
+        });
+    }
+
+    loadComments();
+})();
+</script>
 {% endblock %}

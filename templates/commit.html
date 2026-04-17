@@ -77,5 +77,99 @@
             </tbody>
         </table>
     </div>
+
+    <!-- Commit Comments -->
+    <div style="margin-top:32px;">
+        <h2>Discussion</h2>
+
+        <div id="commit-comments-list">
+            <div style="color:#8b949e; font-size:0.9em;">Loading...</div>
+        </div>
+
+        {% if user %}
+        <div class="card" style="margin-top:16px;">
+            <div class="form-group">
+                <textarea id="commit-comment-input"
+                          placeholder="Leave a comment on this commit..."
+                          style="min-height:80px;"></textarea>
+            </div>
+            <button id="commit-comment-btn" class="btn btn-primary">Comment</button>
+        </div>
+        {% endif %}
+    </div>
 </div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    var repoName = {{ repo.name | tojson }};
+    var commitHash = {{ commit.commit_hash | tojson }};
+    var isLoggedIn = {{ 'true' if user else 'false' }};
+
+    function escapeHtml(str) {
+        return String(str || '')
+            .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+            .replace(/>/g,'&gt;');
+    }
+
+    async function loadComments() {
+        var list = document.getElementById('commit-comments-list');
+        try {
+            var res = await fetch(
+                '/api/repos/' + encodeURIComponent(repoName) +
+                '/commit/' + commitHash + '/comments'
+            );
+            var comments = await res.json();
+
+            if (comments.length === 0) {
+                list.innerHTML = '<div class="empty-state" style="padding:24px;">' +
+                    '<p>No comments yet.</p></div>';
+                return;
+            }
+
+            list.innerHTML = comments.map(function(c) {
+                return '<div class="card" style="padding:12px;">' +
+                    '<div class="row-between" style="margin-bottom:6px;">' +
+                    '<span style="font-weight:600;color:#f0f6fc;">' +
+                    escapeHtml(c.username) + '</span>' +
+                    '<span class="card-meta">' +
+                    new Date(c.created_at).toLocaleString() + '</span>' +
+                    '</div>' +
+                    '<p style="margin:0;white-space:pre-wrap;">' +
+                    escapeHtml(c.content) + '</p>' +
+                    '</div>';
+            }).join('');
+        } catch(e) {
+            list.innerHTML = '<div style="color:#f85149;">Could not load comments.</div>';
+        }
+    }
+
+    if (isLoggedIn) {
+        document.getElementById('commit-comment-btn')
+            .addEventListener('click', async function() {
+                var btn = this;
+                var content = document.getElementById('commit-comment-input').value.trim();
+                if (!content) return;
+                btn.disabled = true;
+                try {
+                    var form = new FormData();
+                    form.append('content', content);
+                    var res = await fetch(
+                        '/api/repos/' + encodeURIComponent(repoName) +
+                        '/commit/' + commitHash + '/comments',
+                        { method: 'POST', body: form }
+                    );
+                    if (res.ok) {
+                        document.getElementById('commit-comment-input').value = '';
+                        loadComments();
+                    }
+                } catch(e) {}
+                finally { btn.disabled = false; }
+            });
+    }
+
+    loadComments();
+})();
+</script>
 {% endblock %}

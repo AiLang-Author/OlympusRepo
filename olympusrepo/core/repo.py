@@ -64,6 +64,37 @@ def list_repos(conn, user_id: int = None) -> list[dict]:
 # COMMIT
 # =========================================================================
 
+def _bump_file_revs(conn, repo_id: int, commit_hash: str,
+                    global_rev: int, changes: dict,
+                    author_name: str = None, message: str = None):
+    """
+    Record a file revision entry for every changed file.
+    Uses committed_at timestamp as the version identifier.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+
+    all_changes = (
+        [(path, new_hash, 'add')
+         for path, new_hash in changes.get('added', [])] +
+        [(path, new_hash, 'modify')
+         for path, old_hash, new_hash in changes.get('modified', [])] +
+        [(path, None, 'delete')
+         for path, old_hash in changes.get('deleted', [])]
+    )
+
+    for path, blob_hash, change_type in all_changes:
+        db.execute(conn, """
+            INSERT INTO repo_file_revisions
+                (repo_id, path, blob_hash, commit_hash, global_rev,
+                 change_type, committed_at, author_name, message)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (repo_id, path, blob_hash or '',
+              commit_hash, global_rev, change_type,
+              now, author_name, message), commit=False)
+
+
 def commit(conn, repo_id: int, user_id: int, message: str,
            repo_root: str, objects_dir: str) -> dict | None:
     """
@@ -238,6 +269,13 @@ def commit(conn, repo_id: int, user_id: int, message: str,
     rev = db.query_scalar(conn,
         "SELECT rev FROM repo_commits WHERE commit_hash = %s", (commit_hash,))
 
+    # Bump file-level revision counters
+    try:
+        _bump_file_revs(conn, repo_id, commit_hash, rev, changes, user["username"], message)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
     return {
         "commit_hash": commit_hash,
         "rev": rev,
@@ -366,6 +404,18 @@ def commit_files(conn, repo_id: int, user_id: int, message: str,
 
     rev = db.query_scalar(conn,
         "SELECT rev FROM repo_commits WHERE commit_hash = %s", (commit_hash,))
+
+    # Build changes dict format for _bump_file_revs
+    file_changes = {
+        'added': [(path, h) for path, h in new_hashes.items()],
+        'modified': [],
+        'deleted': []
+    }
+    try:
+        _bump_file_revs(conn, repo_id, commit_hash, rev, file_changes, user["username"], message)
+        conn.commit()
+    except Exception:
+        conn.rollback()
 
     return {
         "commit_hash": commit_hash,

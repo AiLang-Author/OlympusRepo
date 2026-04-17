@@ -1,0 +1,207 @@
+{% extends "base.html" %}
+{% block title %}Messages &mdash; OlympusRepo{% endblock %}
+
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            url('/static/hermes-messenger.png') center center / cover no-repeat fixed;
+    }
+    .msg-row { cursor: pointer; }
+    .msg-row:hover td { background: #161b22; }
+    .unread-dot {
+        display: inline-block;
+        width: 8px; height: 8px;
+        background: #ffd700;
+        border-radius: 50%;
+        margin-right: 6px;
+        vertical-align: middle;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+
+    <div class="row-between" style="margin-bottom:24px;">
+        <div class="row">
+            <h1 style="margin-bottom:0;">Messages</h1>
+            {% if unread > 0 %}
+            <span class="badge" style="background:#ffd700; color:#000;">
+                {{ unread }} unread
+            </span>
+            {% endif %}
+        </div>
+        <button id="compose-toggle" class="btn btn-primary">Compose</button>
+    </div>
+
+    <!-- COMPOSE PANEL -->
+    <div id="compose-panel" class="card" style="display:none; margin-bottom:24px;">
+        <h2 style="margin-top:0;">New Message</h2>
+        <div id="compose-error" class="flash flash-error" style="display:none;"></div>
+        <div id="compose-success" class="flash flash-success" style="display:none;"></div>
+
+        <div class="form-group">
+            <label for="recipient-select">To</label>
+            <select id="recipient-select">
+                <option value="">Select recipient...</option>
+                {% for u in all_users %}
+                <option value="{{ u.user_id }}">
+                    {{ u.username }} ({{ u.role }})
+                </option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="form-group">
+            <label for="compose-content">Message</label>
+            <textarea id="compose-content"
+                      placeholder="Write your message..."
+                      style="min-height:120px;"></textarea>
+        </div>
+        <div class="row">
+            <button id="compose-send-btn" class="btn btn-primary">Send Message</button>
+            <button id="compose-cancel-btn" class="btn">Cancel</button>
+        </div>
+    </div>
+
+    <!-- MESSAGES LIST -->
+    {% if messages %}
+    <table>
+        <thead>
+            <tr>
+                <th style="width:24px;"></th>
+                <th>From / To</th>
+                <th>Preview</th>
+                <th style="width:140px;">Date</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for m in messages %}
+            <tr class="msg-row"
+                onclick="window.location='/messages/{{ m.message_id }}'">
+                <td>
+                    {% if not m.is_read and m.sender_id != user.user_id %}
+                    <span class="unread-dot"></span>
+                    {% endif %}
+                </td>
+                <td>
+                    {% if m.sender_id == user.user_id %}
+                        <span style="color:#8b949e; font-size:0.85em;">To:</span>
+                        <strong>{{ m.recipient_name or '—' }}</strong>
+                    {% else %}
+                        <span style="color:#8b949e; font-size:0.85em;">From:</span>
+                        <strong style="color:#ffd700;">{{ m.sender_name or '—' }}</strong>
+                    {% endif %}
+                </td>
+                <td style="color:#8b949e;">
+                    {{ m.content[:80] }}{% if m.content|length > 80 %}...{% endif %}
+                </td>
+                <td class="card-meta">
+                    {% if m.created_at %}
+                        {{ m.created_at.strftime('%b %d %H:%M') }}
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">
+        <p>No messages. The realm is silent.</p>
+        <p style="margin-top:8px; font-size:0.9em; color:#8b949e;">
+            Use Compose to send a message to another user.
+        </p>
+    </div>
+    {% endif %}
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    var composePanel  = document.getElementById('compose-panel');
+    var composeToggle = document.getElementById('compose-toggle');
+    var cancelBtn     = document.getElementById('compose-cancel-btn');
+    var sendBtn       = document.getElementById('compose-send-btn');
+    var errEl         = document.getElementById('compose-error');
+    var okEl          = document.getElementById('compose-success');
+
+    composeToggle.addEventListener('click', function() {
+        var open = composePanel.style.display !== 'none';
+        composePanel.style.display = open ? 'none' : 'block';
+        composeToggle.textContent  = open ? 'Compose' : 'Cancel';
+        if (!open) document.getElementById('compose-content').focus();
+    });
+
+    cancelBtn.addEventListener('click', function() {
+        composePanel.style.display = 'none';
+        composeToggle.textContent  = 'Compose';
+    });
+
+    sendBtn.addEventListener('click', async function() {
+        errEl.style.display = 'none';
+        okEl.style.display  = 'none';
+
+        var recipientId = document.getElementById('recipient-select').value;
+        var content     = document.getElementById('compose-content').value.trim();
+
+        if (!recipientId) {
+            errEl.textContent = 'Please select a recipient.';
+            errEl.style.display = 'block';
+            return;
+        }
+        if (!content) {
+            errEl.textContent = 'Message cannot be empty.';
+            errEl.style.display = 'block';
+            return;
+        }
+
+        sendBtn.disabled = true;
+        sendBtn.textContent = 'Sending...';
+
+        try {
+            var form = new FormData();
+            form.append('recipient_id', recipientId);
+            form.append('content', content);
+
+            var res = await fetch('/api/messages', {
+                method: 'POST', body: form
+            });
+
+            if (res.ok) {
+                var data = await res.json();
+                okEl.textContent = 'Message sent.';
+                okEl.style.display = 'block';
+                document.getElementById('compose-content').value = '';
+                document.getElementById('recipient-select').value = '';
+                setTimeout(function() {
+                    window.location = '/messages/' + data.message_id;
+                }, 800);
+            } else {
+                var data = {};
+                try { data = await res.json(); } catch(e) {}
+                errEl.textContent = data.detail || 'Could not send message.';
+                errEl.style.display = 'block';
+            }
+        } catch(err) {
+            errEl.textContent = 'Network error.';
+            errEl.style.display = 'block';
+        } finally {
+            sendBtn.disabled = false;
+            sendBtn.textContent = 'Send Message';
+        }
+    });
+
+    // Enter to send (Shift+Enter for newline)
+    document.getElementById('compose-content')
+        .addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendBtn.click();
+            }
+        });
+})();
+</script>
+{% endblock %}

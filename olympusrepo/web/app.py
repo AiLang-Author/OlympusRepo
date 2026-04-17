@@ -22,7 +22,8 @@ from ..core import db, repo
 app = FastAPI(title="OlympusRepo", version="0.2")
 
 from fastapi.staticfiles import StaticFiles
-app.mount("/static", StaticFiles(directory="static"), name="static")
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "templates")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
@@ -381,9 +382,23 @@ def zeus_dashboard(request: Request, conn=Depends(get_db)):
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, conn=Depends(get_db)):
     user = get_current_user(request, conn)
-    user_id = user["user_id"] if user else None
-    repos = repo.list_repos(conn, user_id)
+    if not user:
+        return RedirectResponse(url="/login", status_code=302)
+    repos = repo.list_repos(conn, user["user_id"])
+    return templates.TemplateResponse(request, "index.html", {
+        "user": user, "repos": repos,
+    })
 
+
+@app.get("/browse", response_class=HTMLResponse)
+def browse(request: Request, conn=Depends(get_db)):
+    """Public repo listing — no login required."""
+    user = get_current_user(request, conn)
+    repos = db.query(conn, """
+        SELECT * FROM repo_repositories
+         WHERE visibility = 'public'
+         ORDER BY updated_at DESC
+    """)
     return templates.TemplateResponse(request, "index.html", {
         "user": user, "repos": repos,
     })
@@ -486,10 +501,17 @@ def _load_file_tree(conn, repo_id: int, branch: str) -> list[dict]:
     # Build display list sorted by path
     files = []
     for path, blob_hash in sorted(tree.items()):
+        committed_at = db.query_scalar(conn, """
+            SELECT committed_at FROM repo_file_revisions
+             WHERE repo_id = %s AND path = %s AND change_type != 'delete'
+             ORDER BY committed_at DESC LIMIT 1
+        """, (repo_id, path))
+
         files.append({
             "path": path,
             "type": "file",
             "size": _format_size(blob_hash, conn, repo_id),
+            "committed_at": committed_at.strftime('%Y-%m-%d %H:%M') if committed_at else None,
         })
 
     return files
@@ -673,7 +695,10 @@ async def upload_files(name: str, request: Request,
         raise HTTPException(400, "No valid files to commit.")
 
     # Determine objects directory (adjust according to your config setup)
-    objects_dir = os.environ.get("OLYMPUSREPO_OBJECTS_DIR", "/var/lib/olympusrepo/objects")
+    objects_dir = os.environ.get(
+    "OLYMPUSREPO_OBJECTS_DIR",
+    os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+)
 
     return repo.commit_files(conn, r["repo_id"], user["user_id"], message, file_data, objects_dir)
 
@@ -904,32 +929,206 @@ def update_repo_settings(name: str, request: Request,
 
 
 # =========================================================================
-@app.get("/repo/{name}/blob/{branch}/{path:path}", response_class=HTMLResponse)
-def blob_page(name: str, branch: str, path: str, request: Request, conn=Depends(get_db)):
+@app.get("/repo/{name}/prune", response_class=HTMLResponse)
+def prune_page(name: str, request: Request, conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user or user["role"] != "zeus":
+        raise HTTPException(403)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    stats = {
+        "total_file_revs": db.query_scalar(conn,
+            "SELECT COUNT(*) FROM repo_file_revisions WHERE repo_id = %s",
+            (r["repo_id"],)) or 0,
+        "unique_files": db.query_scalar(conn,
+            "SELECT COUNT(DISTINCT path) FROM repo_file_revisions WHERE repo_id = %s",
+            (r["repo_id"],)) or 0,
+        "total_commits": db.query_scalar(conn,
+            "SELECT COUNT(*) FROM repo_commits WHERE repo_id = %s",
+            (r["repo_id"],)) or 0,
+        "archive_log": db.query(conn, """
+            SELECT a.*, u.username FROM repo_archive_log a
+              LEFT JOIN repo_users u ON u.user_id = a.pruned_by
+             WHERE a.repo_id = %s ORDER BY a.pruned_at DESC LIMIT 10
+        """, (r["repo_id"],))
+    }
+
+    return templates.TemplateResponse(request, "repo_prune.html", {
+        "user": user, "repo": r, "stats": stats,
+    })
+
+
+@app.post("/api/repos/{name}/prune")
+def prune_repo(name: str, request: Request,
+               strategy: str = Form(...),
+               keep_n: int = Form(10),
+               older_than_days: int = Form(90),
+               conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user or user["role"] != "zeus":
+        raise HTTPException(403)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    pruned = 0
+    try:
+        if strategy == "keep_last_n":
+            # Keep only the last N revisions per file, delete the rest
+            result = db.query(conn, """
+                DELETE FROM repo_file_revisions
+                 WHERE frev_id IN (
+                     SELECT frev_id FROM (
+                         SELECT frev_id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY repo_id, path
+                                    ORDER BY committed_at DESC
+                                ) as rn
+                           FROM repo_file_revisions
+                          WHERE repo_id = %s
+                     ) ranked WHERE rn > %s
+                 )
+                 RETURNING frev_id
+            """, (r["repo_id"], keep_n))
+            pruned = len(result) if result else 0
+
+        elif strategy == "older_than_days":
+            # Delete file revisions older than N days
+            # But always keep the most recent rev of each file
+            result = db.query(conn, """
+                DELETE FROM repo_file_revisions
+                 WHERE frev_id IN (
+                     SELECT fr.frev_id FROM repo_file_revisions fr
+                      WHERE fr.repo_id = %s
+                        AND fr.committed_at < NOW() - (%s || ' days')::INTERVAL
+                        AND fr.committed_at < (
+                            SELECT MAX(fr2.committed_at)
+                              FROM repo_file_revisions fr2
+                             WHERE fr2.repo_id = fr.repo_id
+                               AND fr2.path = fr.path
+                        )
+                 )
+                 RETURNING frev_id
+            """, (r["repo_id"], older_than_days))
+            pruned = len(result) if result else 0
+
+        conn.commit()
+
+        # Log the prune
+        db.execute(conn, """
+            INSERT INTO repo_archive_log
+                (repo_id, pruned_by, strategy, revs_pruned, notes)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (r["repo_id"], user["user_id"], strategy, pruned,
+              f"keep_n={keep_n}" if strategy == "keep_last_n"
+              else f"older_than={older_than_days}d"))
+        conn.commit()
+
+        return {"status": "pruned", "revs_pruned": pruned}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+
+
+# =========================================================================
+@app.get("/repo/{name}/file/{path:path}", response_class=HTMLResponse)
+def file_history_page(name: str, path: str, request: Request,
+                      conn=Depends(get_db)):
+    """Show full revision history for a specific file."""
     user = get_current_user(request, conn)
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
-    if not repo.check_visibility(conn, r["repo_id"], user["user_id"] if user else None):
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 user["user_id"] if user else None):
         raise HTTPException(403)
 
-    # Get the blob hash for this path on this branch
-    ref_name = f"refs/heads/{branch}"
-    row = db.query_one(conn, """
-        SELECT cs.blob_after FROM repo_changesets cs
-          JOIN repo_commits c ON c.commit_hash = cs.commit_hash
-          JOIN repo_refs rf ON rf.commit_hash = c.commit_hash
-         WHERE c.repo_id = %s AND rf.ref_name = %s AND cs.path = %s
-           AND cs.change_type != 'delete'
-         ORDER BY c.rev DESC LIMIT 1
-    """, (r["repo_id"], ref_name, path))
+    revisions = db.query(conn, """
+        SELECT fr.blob_hash, fr.global_rev, fr.change_type,
+               fr.committed_at, fr.author_name, fr.message,
+               c.commit_hash
+          FROM repo_file_revisions fr
+          JOIN repo_commits c ON c.commit_hash = fr.commit_hash
+         WHERE fr.repo_id = %s AND fr.path = %s
+         ORDER BY fr.committed_at DESC
+    """, (r["repo_id"], path))
 
-    if not row or not row["blob_after"]:
-        raise HTTPException(404, "File not found.")
+    if not revisions:
+        raise HTTPException(404, f"No revision history for {path}")
+
+    return templates.TemplateResponse(request, "file_history.html", {
+        "user": user, "repo": r, "path": path,
+        "revisions": revisions,
+        "current_rev": revisions[0]["committed_at"] if revisions else None,
+    })
+
+
+@app.get("/repo/{name}/blob/{branch}/{path:path}", response_class=HTMLResponse)
+def blob_page(name: str, branch: str, path: str, request: Request,
+              at: str = None, conn=Depends(get_db)):
+    """
+    View file contents. Optional ?at=timestamp shows a specific file revision.
+    Without at, shows current version on branch.
+    """
+    user = get_current_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 user["user_id"] if user else None):
+        raise HTTPException(403)
+
+    if at:
+        # Load version at specific timestamp
+        row = db.query_one(conn, """
+            SELECT fr.blob_hash, fr.committed_at, fr.global_rev,
+                   fr.change_type, fr.author_name, fr.message,
+                   c.commit_hash
+              FROM repo_file_revisions fr
+              JOIN repo_commits c ON c.commit_hash = fr.commit_hash
+             WHERE fr.repo_id = %s AND fr.path = %s
+               AND fr.committed_at <= %s::timestamptz
+               AND fr.change_type != 'delete'
+             ORDER BY fr.committed_at DESC LIMIT 1
+        """, (r["repo_id"], path, at))
+        if not row:
+            raise HTTPException(404, f"{path} not found at {at}")
+        blob_hash = row["blob_hash"]
+        version_label = row["committed_at"].strftime("%Y-%m-%d %H:%M")
+        is_historical = True
+    else:
+        # Current version
+        ref_name = f"refs/heads/{branch}"
+        row = db.query_one(conn, """
+            SELECT cs.blob_after, fr.committed_at
+              FROM repo_changesets cs
+              JOIN repo_commits c ON c.commit_hash = cs.commit_hash
+              JOIN repo_refs rf ON rf.commit_hash = c.commit_hash
+              LEFT JOIN repo_file_revisions fr
+                ON fr.commit_hash = cs.commit_hash AND fr.path = cs.path
+             WHERE c.repo_id = %s AND rf.ref_name = %s
+               AND cs.path = %s AND cs.change_type != 'delete'
+             ORDER BY c.rev DESC LIMIT 1
+        """, (r["repo_id"], ref_name, path))
+        if not row:
+            raise HTTPException(404, "File not found.")
+        blob_hash = row["blob_after"]
+        version_label = row["committed_at"].strftime("%Y-%m-%d %H:%M") if row["committed_at"] else "current"
+        is_historical = False
+
+    # Get full history for prev/next navigation
+    history = db.query(conn, """
+        SELECT committed_at, global_rev, change_type, author_name, message
+          FROM repo_file_revisions
+         WHERE repo_id = %s AND path = %s
+         ORDER BY committed_at DESC
+    """, (r["repo_id"], path))
 
     objects_dir = os.path.join(os.path.dirname(__file__), "..", "..", "objects")
     from ..core import objects as obj_store
-    content_bytes = obj_store.retrieve_blob(row["blob_after"], objects_dir)
+    content_bytes = obj_store.retrieve_blob(blob_hash, objects_dir)
     if content_bytes is None:
         raise HTTPException(404, "Blob not found in object store.")
 
@@ -946,6 +1145,10 @@ def blob_page(name: str, branch: str, path: str, request: Request, conn=Depends(
         "user": user, "repo": r, "branch": branch, "path": path,
         "content": content, "is_binary": is_binary,
         "branches": branches, "current_branch": branch,
+        "version_label": version_label,
+        "is_historical": is_historical,
+        "history": history,
+        "viewing_at": at,
     })
 
 
@@ -1104,6 +1307,368 @@ def fork_repo(name: str, request: Request, conn=Depends(get_db)):
     except Exception as e:
         conn.rollback()
         raise HTTPException(500, f"Fork failed: {e}")
+
+
+@app.get("/zeus/audit", response_class=HTMLResponse)
+def audit_log_page(request: Request,
+                   action: str = "",
+                   username: str = "",
+                   repo_name: str = "",
+                   limit: int = 100,
+                   conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user or user["role"] not in ("zeus", "olympian"):
+        raise HTTPException(403)
+
+    filters = ["1=1"]
+    params = []
+
+    if action:
+        filters.append("a.action ILIKE %s")
+        params.append(f"%{action}%")
+    if username:
+        filters.append("u.username ILIKE %s")
+        params.append(f"%{username}%")
+    if repo_name:
+        filters.append("r.name ILIKE %s")
+        params.append(f"%{repo_name}%")
+
+    params.append(limit)
+    where = " AND ".join(filters)
+
+    logs = db.query(conn, f"""
+        SELECT a.log_id, a.action, a.target_type, a.target_id,
+               a.details, a.ip_address, a.performed_at,
+               u.username, r.name as repo_name
+          FROM repo_audit_log a
+          LEFT JOIN repo_users u ON u.user_id = a.user_id
+          LEFT JOIN repo_repositories r ON r.repo_id = a.repo_id
+         WHERE {where}
+         ORDER BY a.performed_at DESC
+         LIMIT %s
+    """, params)
+
+    all_actions = db.query(conn,
+        "SELECT DISTINCT action FROM repo_audit_log ORDER BY action")
+    all_repos = db.query(conn,
+        "SELECT name FROM repo_repositories ORDER BY name")
+
+    return templates.TemplateResponse(request, "audit_log.html", {
+        "user": user, "logs": logs,
+        "filter_action": action,
+        "filter_username": username,
+        "filter_repo": repo_name,
+        "all_actions": [r["action"] for r in all_actions],
+        "all_repos": [r["name"] for r in all_repos],
+        "limit": limit,
+    })
+
+
+# =========================================================================
+# DIRECT MESSAGING (Inbox)
+# =========================================================================
+
+@app.get("/messages", response_class=HTMLResponse)
+def inbox_page(request: Request, conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        return RedirectResponse(url="/login", status_code=302)
+
+    # Get all DMs for this user
+    messages = db.query(conn, """
+        SELECT m.*, u.username as sender_name,
+               r.username as recipient_name,
+               EXISTS(
+                   SELECT 1 FROM repo_message_reads mr
+                    WHERE mr.message_id = m.message_id
+                      AND mr.user_id = %s
+               ) as is_read
+          FROM repo_messages m
+          LEFT JOIN repo_users u ON u.user_id = m.sender_id
+          LEFT JOIN repo_users r ON r.user_id = m.recipient_id
+         WHERE m.is_private = TRUE
+           AND (m.sender_id = %s OR m.recipient_id = %s)
+           AND m.parent_id IS NULL
+         ORDER BY m.created_at DESC
+         LIMIT 50
+    """, (user["user_id"], user["user_id"], user["user_id"]))
+
+    # Get list of users to message
+    all_users = db.query(conn, """
+        SELECT user_id, username, role FROM repo_users
+         WHERE is_active = TRUE AND user_id != %s
+         ORDER BY username
+    """, (user["user_id"],))
+
+    unread = sum(1 for m in messages
+                 if not m["is_read"] and m["sender_id"] != user["user_id"])
+
+    return templates.TemplateResponse(request, "inbox.html", {
+        "user": user, "messages": messages,
+        "all_users": all_users, "unread": unread,
+    })
+
+
+@app.get("/messages/{message_id}", response_class=HTMLResponse)
+def message_thread_page(message_id: int, request: Request,
+                        conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        return RedirectResponse(url="/login", status_code=302)
+
+    # Get the root message
+    root = db.query_one(conn, """
+        SELECT m.*, u.username as sender_name,
+               r.username as recipient_name
+          FROM repo_messages m
+          LEFT JOIN repo_users u ON u.user_id = m.sender_id
+          LEFT JOIN repo_users r ON r.user_id = m.recipient_id
+         WHERE m.message_id = %s
+           AND m.is_private = TRUE
+           AND (m.sender_id = %s OR m.recipient_id = %s)
+    """, (message_id, user["user_id"], user["user_id"]))
+
+    if not root:
+        raise HTTPException(404)
+
+    # Get thread replies
+    replies = db.query(conn, """
+        SELECT m.*, u.username as sender_name
+          FROM repo_messages m
+          LEFT JOIN repo_users u ON u.user_id = m.sender_id
+         WHERE m.thread_id = %s OR m.parent_id = %s
+         ORDER BY m.created_at ASC
+    """, (message_id, message_id))
+
+    # Mark as read
+    db.execute(conn, """
+        INSERT INTO repo_message_reads (user_id, message_id)
+        VALUES (%s, %s)
+        ON CONFLICT DO NOTHING
+    """, (user["user_id"], message_id))
+
+    return templates.TemplateResponse(request, "message_thread.html", {
+        "user": user, "root": root, "replies": replies,
+    })
+
+
+@app.post("/api/messages")
+def send_direct_message(request: Request,
+                        recipient_id: int = Form(...),
+                        content: str = Form(...),
+                        subject: str = Form(""),
+                        parent_id: int = Form(None),
+                        thread_id: int = Form(None),
+                        conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+
+    if not content.strip():
+        raise HTTPException(400, "Message cannot be empty.")
+
+    recipient = db.get_user(conn, recipient_id)
+    if not recipient:
+        raise HTTPException(404, "Recipient not found.")
+
+    try:
+        msg_id = db.query_scalar(conn, """
+            INSERT INTO repo_messages
+                (channel, username, sender_id, recipient_id,
+                 content, context_type, is_private,
+                 parent_id, thread_id)
+            VALUES ('dm', %s, %s, %s, %s, 'direct', TRUE, %s, %s)
+            RETURNING message_id
+        """, (user["username"], user["user_id"], recipient_id,
+              content.strip(), parent_id, thread_id or parent_id))
+
+        # Update reply count on parent
+        if parent_id:
+            db.execute(conn, """
+                UPDATE repo_messages
+                   SET reply_count = reply_count + 1
+                 WHERE message_id = %s
+            """, (parent_id,), commit=False)
+
+        # Create notification for recipient
+        db.create_notification(
+            conn,
+            user_id=recipient_id,
+            notif_type="direct_message",
+            message=f"{user['username']} sent you a message.",
+            link=f"/messages/{thread_id or msg_id}",
+            commit=False
+        )
+
+        conn.commit()
+        return {"status": "sent", "message_id": msg_id}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/messages/unread-count")
+def unread_count(request: Request, conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        return {"unread": 0}
+    count = db.query_scalar(conn, """
+        SELECT COUNT(*) FROM repo_messages m
+         WHERE m.recipient_id = %s
+           AND m.is_private = TRUE
+           AND NOT EXISTS (
+               SELECT 1 FROM repo_message_reads mr
+                WHERE mr.message_id = m.message_id
+                  AND mr.user_id = %s
+           )
+    """, (user["user_id"], user["user_id"])) or 0
+    return {"unread": count}
+
+
+# =========================================================================
+# INLINE CODE COMMENTS
+# =========================================================================
+
+@app.get("/api/repos/{name}/comments/{path:path}")
+def get_file_comments(name: str, path: str, request: Request,
+                      conn=Depends(get_db)):
+    """Get all inline comments for a file."""
+    user = get_current_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 user["user_id"] if user else None):
+        raise HTTPException(403)
+
+    comments = db.query(conn, """
+        SELECT m.message_id, m.content, m.context_id,
+               m.created_at, m.reply_count, m.parent_id,
+               u.username, u.role
+          FROM repo_messages m
+          LEFT JOIN repo_users u ON u.user_id = m.sender_id
+         WHERE m.repo_id = %s
+           AND m.context_type = 'file'
+           AND m.context_id LIKE %s
+           AND m.is_private = FALSE
+           AND m.parent_id IS NULL
+         ORDER BY m.created_at ASC
+    """, (r["repo_id"], f"{path}:%"))
+
+    # Parse line numbers from context_id "filepath:linenum"
+    result = []
+    for c in comments:
+        parts = c["context_id"].split(":")
+        line_num = int(parts[-1]) if len(parts) > 1 and parts[-1].isdigit() else 0
+        result.append({**dict(c), "line_num": line_num})
+
+    return result
+
+
+@app.post("/api/repos/{name}/comments")
+def post_inline_comment(name: str, request: Request,
+                        path: str = Form(...),
+                        line_num: int = Form(...),
+                        content: str = Form(...),
+                        parent_id: int = Form(None),
+                        conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_visibility(conn, r["repo_id"], user["user_id"]):
+        raise HTTPException(403)
+
+    context_id = f"{path}:{line_num}"
+
+    try:
+        msg_id = db.query_scalar(conn, """
+            INSERT INTO repo_messages
+                (repo_id, channel, username, sender_id, content,
+                 context_type, context_id, is_private,
+                 parent_id, thread_id)
+            VALUES (%s, %s, %s, %s, %s, 'file', %s, FALSE, %s, %s)
+            RETURNING message_id
+        """, (r["repo_id"], f"repo-{name}", user["username"],
+              user["user_id"], content.strip(),
+              context_id, parent_id, parent_id))
+
+        if parent_id:
+            db.execute(conn, """
+                UPDATE repo_messages SET reply_count = reply_count + 1
+                 WHERE message_id = %s
+            """, (parent_id,), commit=False)
+
+        conn.commit()
+        return {"status": "posted", "message_id": msg_id, "line_num": line_num}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/repos/{name}/commit/{commit_hash}/comments")
+def post_commit_comment(name: str, commit_hash: str,
+                        request: Request,
+                        content: str = Form(...),
+                        parent_id: int = Form(None),
+                        conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    try:
+        msg_id = db.query_scalar(conn, """
+            INSERT INTO repo_messages
+                (repo_id, channel, username, sender_id, content,
+                 context_type, context_id, is_private,
+                 parent_id, thread_id)
+            VALUES (%s, %s, %s, %s, %s, 'commit', %s, FALSE, %s, %s)
+            RETURNING message_id
+        """, (r["repo_id"], f"repo-{name}", user["username"],
+              user["user_id"], content.strip(),
+              commit_hash, parent_id, parent_id))
+
+        if parent_id:
+            db.execute(conn, """
+                UPDATE repo_messages SET reply_count = reply_count + 1
+                 WHERE message_id = %s
+            """, (parent_id,), commit=False)
+
+        conn.commit()
+        return {"status": "posted", "message_id": msg_id}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/repos/{name}/commit/{commit_hash}/comments")
+def get_commit_comments(name: str, commit_hash: str,
+                        request: Request, conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    return db.query(conn, """
+        SELECT m.message_id, m.content, m.created_at,
+               m.reply_count, m.parent_id,
+               u.username, u.role
+          FROM repo_messages m
+          LEFT JOIN repo_users u ON u.user_id = m.sender_id
+         WHERE m.repo_id = %s
+           AND m.context_type = 'commit'
+           AND m.context_id = %s
+           AND m.is_private = FALSE
+           AND m.parent_id IS NULL
+         ORDER BY m.created_at ASC
+    """, (r["repo_id"], commit_hash))
 
 
 # =========================================================================

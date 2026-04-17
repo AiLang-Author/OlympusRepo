@@ -1,6 +1,17 @@
 {% extends "base.html" %}
 {% block title %}OlympusRepo &mdash; Repositories{% endblock %}
 
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.7), rgba(13,17,23,0.9)),
+            url('/static/repo-room.png') center center / cover no-repeat fixed;
+    }
+</style>
+{% endblock %}
+
+
 {% block content %}
 <div class="container">
     <div class="row-between" style="margin-bottom:24px;">
@@ -18,7 +29,7 @@
                     <span class="card-title">{{ r.name }}</span>
                     <span class="badge badge-{{ r.visibility }}">{{ r.visibility }}</span>
                 </div>
-                {% if r.description %}
+                {% if r.description and r.description != r.name %}
                     <p style="color:#8b949e; font-size:0.9em; margin:0;">{{ r.description }}</p>
                 {% endif %}
                 <div class="card-meta" style="margin-top:8px;">

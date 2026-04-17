@@ -223,7 +223,7 @@ CREATE TABLE repo_messages (
 
 CREATE TABLE repo_audit_log (
     log_id          BIGSERIAL PRIMARY KEY,
-    repo_id         BIGINT REFERENCES repo_repositories(repo_id),
+    repo_id         BIGINT REFERENCES repo_repositories(repo_id) ON DELETE SET NULL,
     user_id         BIGINT REFERENCES repo_users(user_id),
     action          TEXT NOT NULL,
     target_type     TEXT,

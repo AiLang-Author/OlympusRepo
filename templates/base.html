@@ -259,13 +259,21 @@
 </head>
 <body>
     <nav>
-        <a href="/" class="logo"><span>Olympus</span>Repo</a>
+        <a href="/login" class="logo"><span>Olympus</span>Repo</a>
         <div class="nav-links">
             <a href="/">Repositories</a>
             {% if user %}
                 {% if user.role in ('zeus', 'olympian') %}
                     <a href="/zeus">The Throne</a>
                 {% endif %}
+                <a href="/messages" class="nav-links" id="messages-nav-link"
+                   style="color:#8b949e; font-size:0.9em; padding:6px 12px; position:relative;">
+                    Messages
+                    <span id="msg-unread-badge" style="display:none; position:absolute;
+                          top:2px; right:2px; background:#ffd700; color:#000;
+                          border-radius:8px; font-size:0.65em; padding:1px 5px;
+                          font-weight:700; min-width:16px; text-align:center;"></span>
+                </a>
                 <span class="user-badge">
                     {{ user.username }}
                     <span class="role-tag role-{{ user.role }}">{{ user.role }}</span>
@@ -369,6 +377,26 @@
             // Poll every 60 seconds for new notifications
             loadNotifications();
             setInterval(loadNotifications, 60000);
+
+            // Poll for unread messages
+            var msgBadge = document.getElementById('msg-unread-badge');
+            if (msgBadge) {
+                async function loadUnreadMessages() {
+                    try {
+                        var res = await fetch('/api/messages/unread-count');
+                        if (!res.ok) return;
+                        var data = await res.json();
+                        if (data.unread > 0) {
+                            msgBadge.textContent = data.unread;
+                            msgBadge.style.display = 'inline-block';
+                        } else {
+                            msgBadge.style.display = 'none';
+                        }
+                    } catch(e) {}
+                }
+                loadUnreadMessages();
+                setInterval(loadUnreadMessages, 60000);
+            }
         })();
     </script>
 

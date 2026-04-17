@@ -1,108 +1,281 @@
 {% extends "base.html" %}
-{% block title %}Login &mdash; OlympusRepo{% endblock %}
+{% block title %}OlympusRepo &mdash; Enter the Realm{% endblock %}
+
+{% block extra_css %}
+<style>
+    body { overflow-x: hidden; }
+    nav { position: relative; z-index: 10; }
+    footer { position: relative; z-index: 10; }
+
+    .hero-bg {
+        position: fixed;
+        inset: 0;
+        z-index: 0;
+        background: url('/static/zeus-hero.png') center center / cover no-repeat;
+    }
+    .hero-bg::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(to bottom, rgba(0,0,0,0.3) 0%, rgba(13,17,23,0.85) 60%, #0d1117 100%);
+    }
+
+    .login-wrapper {
+        position: relative;
+        z-index: 1;
+        min-height: calc(100vh - 120px);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 32px 16px;
+    }
+
+    .login-inner {
+        width: 100%;
+        max-width: 420px;
+    }
+
+    .login-title {
+        text-align: center;
+        font-size: 2.4em;
+        font-weight: 700;
+        color: #ffd700;
+        text-shadow: 0 2px 16px rgba(0,0,0,0.9);
+        margin-bottom: 8px;
+        letter-spacing: 1px;
+    }
+
+    .login-subtitle {
+        text-align: center;
+        font-size: 1em;
+        color: #c9d1d9;
+        text-shadow: 0 1px 8px rgba(0,0,0,0.9);
+        margin-bottom: 32px;
+        opacity: 0.85;
+    }
+
+    .fate-divider {
+        border: none;
+        border-top: 1px solid rgba(255,215,0,0.3);
+        margin: 0 0 28px 0;
+    }
+
+    .fate-buttons {
+        display: flex;
+        gap: 16px;
+        justify-content: center;
+        flex-wrap: wrap;
+    }
+
+    .fate-btn-enter {
+        padding: 14px 36px;
+        font-size: 1.05em;
+        font-weight: 700;
+        background: #238636;
+        border: 1px solid #238636;
+        color: #fff;
+        border-radius: 6px;
+        cursor: pointer;
+        font-family: inherit;
+        transition: background 0.15s;
+    }
+    .fate-btn-enter:hover { background: #2ea043; }
+
+    .fate-btn-browse {
+        padding: 14px 36px;
+        font-size: 1.05em;
+        font-weight: 700;
+        background: transparent;
+        border: 1px solid #ffd700;
+        color: #ffd700;
+        border-radius: 6px;
+        cursor: pointer;
+        font-family: inherit;
+        transition: background 0.15s;
+    }
+    .fate-btn-browse:hover { background: rgba(255,215,0,0.08); }
+
+    .fate-tagline {
+        text-align: center;
+        margin-top: 28px;
+        color: #484f58;
+        font-size: 0.8em;
+        text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+    }
+
+    .auth-card {
+        background: rgba(22,27,34,0.95);
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 24px;
+        backdrop-filter: blur(8px);
+    }
+</style>
+{% endblock %}
 
 {% block content %}
-<div class="container" style="max-width:400px;">
+<div class="hero-bg"></div>
 
-    <div id="login-form">
-        <h1>Login</h1>
-        <div id="login-error" class="flash flash-error" style="display:none;"></div>
+<div class="login-wrapper">
+    <div class="login-inner">
 
-        <div class="form-group">
-            <label for="login-user">Username</label>
-            <input type="text" id="login-user" autocomplete="username" autofocus>
+        <div class="login-title">OlympusRepo</div>
+        <div class="login-subtitle">Sovereign Version Control</div>
+
+        <!-- FATE SCREEN -->
+        <div id="fate-screen">
+            <hr class="fate-divider">
+            <p style="text-align:center; color:#ffd700; font-size:1.15em; font-weight:600; margin-bottom:24px; text-shadow:0 2px 8px rgba(0,0,0,0.8);">
+                Choose Your Fate
+            </p>
+            <div class="fate-buttons">
+                <button class="fate-btn-enter" id="enter-realm-btn">Enter the Realm</button>
+                <button class="fate-btn-browse" id="browse-btn">Browse the Archives</button>
+            </div>
+            <p class="fate-tagline">The Thunderer watches all.</p>
         </div>
-        <div class="form-group">
-            <label for="login-pass">Password</label>
-            <input type="password" id="login-pass" autocomplete="current-password">
+
+        <!-- LOGIN FORM -->
+        <div id="login-form" style="display:none;">
+            <div class="auth-card">
+                <h2 style="margin-top:0;">Login</h2>
+                <div id="login-error" class="flash flash-error" style="display:none;"></div>
+                <div class="form-group">
+                    <label for="login-user">Username</label>
+                    <input type="text" id="login-user" autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label for="login-pass">Password</label>
+                    <input type="password" id="login-pass" autocomplete="current-password">
+                </div>
+                <button id="login-btn" class="btn btn-primary" style="width:100%;">Login</button>
+                <p style="margin-top:12px; text-align:center; color:#8b949e; font-size:0.9em;">
+                    No account? <a href="#" id="show-signup">Sign up</a>
+                    &nbsp;&middot;&nbsp;
+                    <a href="#" id="show-reset">Forgot password?</a>
+                </p>
+                <p style="margin-top:8px; text-align:center;">
+                    <a href="#" id="back-to-fate" style="color:#484f58; font-size:0.8em;">&larr; Back</a>
+                </p>
+            </div>
         </div>
-        <button id="login-btn" class="btn btn-primary" style="width:100%;">Login</button>
-        <p style="margin-top:16px; text-align:center; color:#8b949e;">
-            No account? <a href="#" id="show-signup">Sign up</a>
-        </p>
+
+        <!-- SIGNUP FORM -->
+        <div id="signup-form" style="display:none;">
+            <div class="auth-card">
+                <h2 style="margin-top:0;">Sign Up</h2>
+                <div id="signup-error" class="flash flash-error" style="display:none;"></div>
+                <div id="signup-success" class="flash flash-success" style="display:none;"></div>
+                <div class="form-group">
+                    <label for="signup-user">Username <span style="color:#8b949e;">*</span></label>
+                    <input type="text" id="signup-user" autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label for="signup-email">Email (optional)</label>
+                    <input type="email" id="signup-email">
+                </div>
+                <div class="form-group">
+                    <label for="signup-name">Full Name (optional)</label>
+                    <input type="text" id="signup-name">
+                </div>
+                <div class="form-group">
+                    <label for="signup-pass">Password <span style="color:#8b949e;">(8 chars min) *</span></label>
+                    <input type="password" id="signup-pass" autocomplete="new-password">
+                </div>
+                <button id="signup-btn" class="btn btn-primary" style="width:100%;">Create Account</button>
+                <p style="margin-top:12px; text-align:center; color:#8b949e; font-size:0.9em;">
+                    Already have an account? <a href="#" id="show-login">Login</a>
+                </p>
+                <p style="margin-top:8px; text-align:center;">
+                    <a href="#" id="back-to-fate-2" style="color:#484f58; font-size:0.8em;">&larr; Back</a>
+                </p>
+            </div>
+        </div>
+
+        <!-- RESET FORM -->
+        <div id="reset-form" style="display:none;">
+            <div class="auth-card">
+                <h2 style="margin-top:0;">Reset Password</h2>
+                <div id="reset-error" class="flash flash-error" style="display:none;"></div>
+                <div id="reset-success" class="flash flash-success" style="display:none;"></div>
+                <div class="form-group">
+                    <label for="reset-email">Email address</label>
+                    <input type="email" id="reset-email">
+                </div>
+                <button id="reset-req-btn" class="btn btn-primary" style="width:100%;">Send Reset Link</button>
+                <p style="margin-top:12px; text-align:center; color:#8b949e; font-size:0.9em;">
+                    <a href="#" id="show-login-from-reset">Back to login</a>
+                </p>
+            </div>
+        </div>
+
     </div>
-
-    <div id="signup-form" style="display:none;">
-        <h1>Sign Up</h1>
-        <div id="signup-error" class="flash flash-error" style="display:none;"></div>
-        <div id="signup-success" class="flash flash-success" style="display:none;"></div>
-
-        <div class="form-group">
-            <label for="signup-user">Username <span style="color:#8b949e;">*</span></label>
-            <input type="text" id="signup-user" autocomplete="username">
-        </div>
-        <div class="form-group">
-            <label for="signup-email">Email (optional)</label>
-            <input type="email" id="signup-email">
-        </div>
-        <div class="form-group">
-            <label for="signup-name">Full Name (optional)</label>
-            <input type="text" id="signup-name">
-        </div>
-        <div class="form-group">
-            <label for="signup-pass">Password <span style="color:#8b949e;">(8 chars min) *</span></label>
-            <input type="password" id="signup-pass" autocomplete="new-password">
-        </div>
-        <button id="signup-btn" class="btn btn-primary" style="width:100%;">Create Account</button>
-        <p style="margin-top:16px; text-align:center; color:#8b949e;">
-            Already have an account? <a href="#" id="show-login">Login</a>
-        </p>
-    </div>
-
 </div>
 {% endblock %}
 
 {% block extra_js %}
 <script>
 (function() {
-    var loginForm = document.getElementById('login-form');
-    var signupForm = document.getElementById('signup-form');
+    var fateScreen  = document.getElementById('fate-screen');
+    var loginForm   = document.getElementById('login-form');
+    var signupForm  = document.getElementById('signup-form');
+    var resetForm   = document.getElementById('reset-form');
 
-    function showSignup(e) {
-        if (e) e.preventDefault();
-        loginForm.style.display = 'none';
-        signupForm.style.display = 'block';
-        document.getElementById('signup-user').focus();
+    function hideAll() {
+        fateScreen.style.display  = 'none';
+        loginForm.style.display   = 'none';
+        signupForm.style.display  = 'none';
+        resetForm.style.display   = 'none';
     }
 
-    function showLogin(e) {
-        if (e) e.preventDefault();
-        signupForm.style.display = 'none';
-        loginForm.style.display = 'block';
-        document.getElementById('login-user').focus();
-    }
+    function showFate()   { hideAll(); fateScreen.style.display  = 'block'; }
+    function showLogin()  { hideAll(); loginForm.style.display   = 'block'; setTimeout(function(){ document.getElementById('login-user').focus(); }, 50); }
+    function showSignup() { hideAll(); signupForm.style.display  = 'block'; setTimeout(function(){ document.getElementById('signup-user').focus(); }, 50); }
+    function showReset()  { hideAll(); resetForm.style.display   = 'block'; }
 
+    // Fate screen buttons
+    document.getElementById('enter-realm-btn').addEventListener('click', showLogin);
+    document.getElementById('browse-btn').addEventListener('click', function() {
+    window.location = '/browse';
+});
+
+    // Back links
+    document.getElementById('back-to-fate').addEventListener('click', function(e) { e.preventDefault(); showFate(); });
+    document.getElementById('back-to-fate-2').addEventListener('click', function(e) { e.preventDefault(); showFate(); });
+
+    // Toggle links
+    document.getElementById('show-signup').addEventListener('click', function(e) { e.preventDefault(); showSignup(); });
+    document.getElementById('show-login').addEventListener('click', function(e) { e.preventDefault(); showLogin(); });
+    document.getElementById('show-reset').addEventListener('click', function(e) { e.preventDefault(); showReset(); });
+    document.getElementById('show-login-from-reset').addEventListener('click', function(e) { e.preventDefault(); showLogin(); });
+
+    // LOGIN
     async function doLogin() {
-        var btn = document.getElementById('login-btn');
+        var btn   = document.getElementById('login-btn');
         var errEl = document.getElementById('login-error');
         errEl.style.display = 'none';
-
         var username = document.getElementById('login-user').value.trim();
         var password = document.getElementById('login-pass').value;
-
         if (!username || !password) {
             errEl.textContent = 'Username and password are required.';
             errEl.style.display = 'block';
             return;
         }
-
         btn.disabled = true;
         try {
             var form = new FormData();
             form.append('username', username);
             form.append('password', password);
-
             var res = await fetch('/api/auth/login', { method: 'POST', body: form });
-
             if (res.ok) {
                 window.location = '/';
             } else {
                 var data = {};
-                try { data = await res.json(); } catch (e) {}
+                try { data = await res.json(); } catch(e) {}
                 errEl.textContent = data.detail || 'Login failed.';
                 errEl.style.display = 'block';
             }
-        } catch (err) {
+        } catch(err) {
             errEl.textContent = 'Network error. Is the server running?';
             errEl.style.display = 'block';
         } finally {
@@ -110,16 +283,15 @@
         }
     }
 
+    // SIGNUP
     async function doSignup() {
-        var btn = document.getElementById('signup-btn');
+        var btn   = document.getElementById('signup-btn');
         var errEl = document.getElementById('signup-error');
-        var okEl = document.getElementById('signup-success');
+        var okEl  = document.getElementById('signup-success');
         errEl.style.display = 'none';
-        okEl.style.display = 'none';
-
+        okEl.style.display  = 'none';
         var username = document.getElementById('signup-user').value.trim();
         var password = document.getElementById('signup-pass').value;
-
         if (!username || !password) {
             errEl.textContent = 'Username and password are required.';
             errEl.style.display = 'block';
@@ -130,7 +302,6 @@
             errEl.style.display = 'block';
             return;
         }
-
         btn.disabled = true;
         try {
             var form = new FormData();
@@ -138,41 +309,65 @@
             form.append('password', password);
             form.append('email', document.getElementById('signup-email').value);
             form.append('full_name', document.getElementById('signup-name').value);
-
             var res = await fetch('/api/auth/signup', { method: 'POST', body: form });
-
             if (res.ok) {
                 okEl.textContent = 'Account created. You can now login.';
                 okEl.style.display = 'block';
                 setTimeout(showLogin, 1500);
             } else {
                 var data = {};
-                try { data = await res.json(); } catch (e) {}
+                try { data = await res.json(); } catch(e) {}
                 errEl.textContent = data.detail || 'Signup failed.';
                 errEl.style.display = 'block';
             }
-        } catch (err) {
-            errEl.textContent = 'Network error. Is the server running?';
+        } catch(err) {
+            errEl.textContent = 'Network error.';
             errEl.style.display = 'block';
         } finally {
             btn.disabled = false;
         }
     }
 
-    // Wire up events
-    document.getElementById('show-signup').addEventListener('click', showSignup);
-    document.getElementById('show-login').addEventListener('click', showLogin);
+    // RESET
+    async function doReset() {
+        var btn   = document.getElementById('reset-req-btn');
+        var errEl = document.getElementById('reset-error');
+        var okEl  = document.getElementById('reset-success');
+        errEl.style.display = 'none';
+        okEl.style.display  = 'none';
+        var email = document.getElementById('reset-email').value.trim();
+        if (!email) {
+            errEl.textContent = 'Email is required.';
+            errEl.style.display = 'block';
+            return;
+        }
+        btn.disabled = true;
+        try {
+            var form = new FormData();
+            form.append('email', email);
+            var res = await fetch('/api/auth/request-reset', { method: 'POST', body: form });
+            var data = await res.json();
+            okEl.textContent = data.message || 'Check server console for reset link.';
+            okEl.style.display = 'block';
+        } catch(e) {
+            errEl.textContent = 'Network error.';
+            errEl.style.display = 'block';
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
     document.getElementById('login-btn').addEventListener('click', doLogin);
     document.getElementById('signup-btn').addEventListener('click', doSignup);
+    document.getElementById('reset-req-btn').addEventListener('click', doReset);
 
-    // Enter key submits the active form
+    // Enter key
     document.addEventListener('keydown', function(e) {
         if (e.key !== 'Enter') return;
-        if (loginForm.style.display !== 'none') {
-            doLogin();
-        } else {
-            doSignup();
-        }
+        if (loginForm.style.display  !== 'none') doLogin();
+        else if (signupForm.style.display !== 'none') doSignup();
+        else if (resetForm.style.display  !== 'none') doReset();
+        else if (fateScreen.style.display !== 'none') showLogin();
     });
 })();
 </script>
