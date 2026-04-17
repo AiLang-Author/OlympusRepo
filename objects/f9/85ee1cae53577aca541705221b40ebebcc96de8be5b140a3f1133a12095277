@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}The Throne &mdash; OlympusRepo{% endblock %}
+
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            url('/static/throne-room.png') center center / cover no-repeat fixed;
+    }
+    .stat-card {
+        cursor: pointer;
+        transition: border-color 0.15s;
+    }
+    .stat-card:hover {
+        border-color: #58a6ff;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container-wide">
+
+    <h1>The Throne</h1>
+    <p style="color:#8b949e; margin-bottom:24px;">
+        Welcome, {{ user.username }}. You see all.
+    </p>
+
+    <!-- Stats row -->
+    <div style="display:grid; grid-template-columns:repeat(6,1fr); gap:12px; margin-bottom:32px;">
+        {% for label, key, link in [
+            ('Repositories', 'total_repos', '/zeus/repos'),
+            ('Active Users', 'total_users', '/zeus/users'),
+            ('Total Commits', 'total_commits', '/zeus/commits'),
+            ('Promotions', 'total_promotions', '/zeus/promotions'),
+            ('Active Staging', 'active_staging', '/zeus/staging'),
+            ('Commits Today', 'commits_today', '/zeus/commits?today=1')
+        ] %}
+        <a href="{{ link }}" class="card stat-card" style="text-align:center; padding:16px; display:block; text-decoration:none; color:inherit;">
+            <div style="font-size:1.8em; font-weight:700; color:#f0f6fc;">
+                {{ stats[key] }}
+            </div>
+            <div class="card-meta" style="margin-top:4px;">{{ label }}</div>
+        </a>
+        {% endfor %}
+    </div>
+
+    <!-- ACTIVE STAGING REALMS -->
+    <h2>Active Offerings</h2>
+    <p style="color:#8b949e; font-size:0.9em;">Staging realms with pending changes waiting for review.</p>
+
+    {% if staging %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Contributor</th>
+                    <th>Role</th>
+                    <th>Branch</th>
+                    <th>Changes</th>
+                    <th>Last Updated</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for s in staging %}
+                <tr>
+                    <td style="font-weight:600;">{{ s.username }}</td>
+                    <td><span class="role-tag role-{{ s.role }}">{{ s.role }}</span></td>
+                    <td><code>{{ s.branch_name }}</code></td>
+                    <td>{{ s.change_count }}</td>
+                    <td class="card-meta">
+                        {% if s.updated_at %}{{ s.updated_at.strftime('%b %d %H:%M') }}{% else %}&mdash;{% endif %}
+                    </td>
+                    <td>
+                        <a href="/repo/{{ s.repo_name }}/staging/{{ s.staging_id }}/review" class="btn btn-gold" style="padding:3px 8px; font-size:0.8em; text-decoration:none;">
+                            Review
+                        </a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% else %}
+        <div class="card" style="text-align:center; padding:32px; color:#8b949e;">
+            No active offerings. The realm is quiet.
+        </div>
+    {% endif %}
+
+    <!-- AUDIT LOG -->
+    <h2 style="margin-top:32px;">Audit Log</h2>
+    <p style="color:#8b949e; font-size:0.9em;">Every action recorded. Nothing escapes the Thunderer.</p>
+
+    {% if audit %}
+        <table>
+            <thead>
+                <tr>
+                    <th>When</th>
+                    <th>Who</th>
+                    <th>Action</th>
+                    <th>Target</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for a in audit %}
+                <tr>
+                    <td class="card-meta">
+                        {% if a.performed_at %}{{ a.performed_at.strftime('%b %d %H:%M') }}{% endif %}
+                    </td>
+                    <td>{{ a.username or '—' }}</td>
+                    <td><code>{{ a.action }}</code></td>
+                    <td>
+                        {% if a.target_type %}
+                            {{ a.target_type }}: <code>{{ a.target_id or '' }}</code>
+                        {% else %}
+                            &mdash;
+                        {% endif %}
+                    </td>
+                    <td class="card-meta">
+                        {% if a.details %}
+                            <code>{{ a.details | tojson }}</code>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% else %}
+        <div class="card" style="text-align:center; padding:24px; color:#8b949e;">
+            No activity yet.
+        </div>
+    {% endif %}
+
+    <!-- QUICK ADMIN -->
+    <h2 style="margin-top:32px;">Quick Actions</h2>
+    <div class="row">
+        <a href="/zeus/users" class="btn">Manage Users</a>
+        <a href="/zeus/repos" class="btn">Manage Repos &amp; Access</a>
+        <a href="/zeus/config" class="btn">Server Config</a>
+        <a href="/new" class="btn btn-primary">Create Repository</a>
+        <a href="/zeus/audit" class="btn">Full Audit Log</a>
+    </div>
+
+</div>
+{% endblock %}

@@ -1,0 +1,147 @@
+
+# Database connection and query helpers
+# Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering 
+# MIT License
+
+import os
+import psycopg2
+import psycopg2.extras
+
+DB_CONFIG = {
+    "dbname": os.getenv("OLYMPUSREPO_DB_NAME", "olympusrepo"),
+    "user": os.getenv("OLYMPUSREPO_DB_USER", "olympus"),
+    "password": os.getenv("OLYMPUSREPO_DB_PASS", ""),
+    "host": os.getenv("OLYMPUSREPO_DB_HOST", "127.0.0.1"),
+    "port": os.getenv("OLYMPUSREPO_DB_PORT", "5432"),
+}
+
+
+def connect():
+    """Connect to PostgreSQL. Returns connection or raises."""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        conn.set_session(autocommit=False)
+        return conn
+    except psycopg2.OperationalError as e:
+        print(f"ERROR: Cannot connect to database at {DB_CONFIG['host']}:{DB_CONFIG['port']}")
+        print(f"  Make sure PostgreSQL is running: systemctl status postgresql")
+        print(f"  Detail: {e}")
+        raise
+
+
+def cursor(conn):
+    """Get a dict cursor."""
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+def execute(conn, sql, params=None, commit=True):
+    """
+    Execute a statement.
+
+    By default commits immediately. For multi-statement transactions,
+    pass commit=False and call conn.commit() yourself at the end.
+    """
+    cur = cursor(conn)
+    cur.execute(sql, params)
+    if commit:
+        conn.commit()
+
+
+def query(conn, sql, params=None):
+    """Execute a query, return list of dicts."""
+    cur = cursor(conn)
+    cur.execute(sql, params)
+    try:
+        return cur.fetchall()
+    except psycopg2.ProgrammingError:
+        return []
+
+
+def query_one(conn, sql, params=None):
+    """Execute a query, return single dict or None."""
+    cur = cursor(conn)
+    cur.execute(sql, params)
+    try:
+        return cur.fetchone()
+    except psycopg2.ProgrammingError:
+        return None
+
+
+def query_scalar(conn, sql, params=None):
+    """Execute a query, return single value or None."""
+    row = query_one(conn, sql, params)
+    if row is None:
+        return None
+    # Return first value from the dict
+    return list(row.values())[0]
+
+
+def set_session_user(conn, user_id):
+    """
+    Set the current user ID for RLS policies.
+    Uses set_config() because SET does not accept parameterized values.
+    """
+    cur = cursor(conn)
+    cur.execute("SELECT set_config('app.current_user_id', %s, false)",
+                (str(user_id),))
+
+
+# =========================================================================
+# AUTH HELPERS (wrappers around SQL functions from 005_functions.sql)
+# =========================================================================
+
+MIN_PASSWORD_LENGTH = 8
+
+
+def create_user(conn, username, password, role="mortal", full_name=None, email=None):
+    """Create a user, returns user_id."""
+    if not password or len(password) < MIN_PASSWORD_LENGTH:
+        raise ValueError(
+            f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+        )
+    if not username or not username.strip():
+        raise ValueError("Username is required.")
+    return query_scalar(conn, "SELECT repo_create_user(%s, %s, %s, %s, %s)",
+                        (username, password, role, full_name, email))
+
+
+def verify_password(conn, username, password):
+    """Verify password, returns user_id or None."""
+    if not password:
+        return None
+    return query_scalar(conn, "SELECT repo_verify_password(%s, %s)", (username, password))
+
+
+def create_session(conn, user_id, ip=None, agent=None, ttl_hours=24):
+    """Create session token, returns token string."""
+    return query_scalar(conn, "SELECT repo_create_session(%s, %s, %s, %s)",
+                        (user_id, ip, agent, ttl_hours))
+
+
+def validate_session(conn, session_id):
+    """Validate session, returns user_id or None."""
+    return query_scalar(conn, "SELECT repo_validate_session(%s)", (session_id,))
+
+
+def get_user(conn, user_id):
+    """Get user by ID."""
+    return query_one(conn, "SELECT * FROM repo_users WHERE user_id = %s", (user_id,))
+
+
+def get_user_by_name(conn, username):
+    """Get user by username."""
+    return query_one(conn, "SELECT * FROM repo_users WHERE username = %s", (username,))
+
+
+# =========================================================================
+# AUDIT LOG
+# =========================================================================
+
+def audit_log(conn, action, user_id=None, repo_id=None, target_type=None,
+              target_id=None, details=None, ip=None, commit=True):
+    """Record an action in the audit log."""
+    execute(conn, """
+        INSERT INTO repo_audit_log (repo_id, user_id, action, target_type, target_id, details, ip_address)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+    """, (repo_id, user_id, action, target_type, target_id,
+          psycopg2.extras.Json(details) if details else None, ip), commit=commit)

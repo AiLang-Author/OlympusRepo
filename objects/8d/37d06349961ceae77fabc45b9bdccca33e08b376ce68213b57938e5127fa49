@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+{% block title %}Login &mdash; OlympusRepo{% endblock %}
+
+{% block content %}
+<div class="container" style="max-width:400px;">
+
+    <div id="login-form">
+        <h1>Login</h1>
+        <div id="login-error" class="flash flash-error" style="display:none;"></div>
+
+        <div class="form-group">
+            <label for="login-user">Username</label>
+            <input type="text" id="login-user" autocomplete="username" autofocus>
+        </div>
+        <div class="form-group">
+            <label for="login-pass">Password</label>
+            <input type="password" id="login-pass" autocomplete="current-password">
+        </div>
+        <button id="login-btn" class="btn btn-primary" style="width:100%;">Login</button>
+        <p style="margin-top:16px; text-align:center; color:#8b949e;">
+            No account? <a href="#" id="show-signup">Sign up</a>
+        </p>
+    </div>
+
+    <div id="signup-form" style="display:none;">
+        <h1>Sign Up</h1>
+        <div id="signup-error" class="flash flash-error" style="display:none;"></div>
+        <div id="signup-success" class="flash flash-success" style="display:none;"></div>
+
+        <div class="form-group">
+            <label for="signup-user">Username <span style="color:#8b949e;">*</span></label>
+            <input type="text" id="signup-user" autocomplete="username">
+        </div>
+        <div class="form-group">
+            <label for="signup-email">Email (optional)</label>
+            <input type="email" id="signup-email">
+        </div>
+        <div class="form-group">
+            <label for="signup-name">Full Name (optional)</label>
+            <input type="text" id="signup-name">
+        </div>
+        <div class="form-group">
+            <label for="signup-pass">Password <span style="color:#8b949e;">(8 chars min) *</span></label>
+            <input type="password" id="signup-pass" autocomplete="new-password">
+        </div>
+        <button id="signup-btn" class="btn btn-primary" style="width:100%;">Create Account</button>
+        <p style="margin-top:16px; text-align:center; color:#8b949e;">
+            Already have an account? <a href="#" id="show-login">Login</a>
+        </p>
+    </div>
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    var loginForm = document.getElementById('login-form');
+    var signupForm = document.getElementById('signup-form');
+
+    function showSignup(e) {
+        if (e) e.preventDefault();
+        loginForm.style.display = 'none';
+        signupForm.style.display = 'block';
+        document.getElementById('signup-user').focus();
+    }
+
+    function showLogin(e) {
+        if (e) e.preventDefault();
+        signupForm.style.display = 'none';
+        loginForm.style.display = 'block';
+        document.getElementById('login-user').focus();
+    }
+
+    async function doLogin() {
+        var btn = document.getElementById('login-btn');
+        var errEl = document.getElementById('login-error');
+        errEl.style.display = 'none';
+
+        var username = document.getElementById('login-user').value.trim();
+        var password = document.getElementById('login-pass').value;
+
+        if (!username || !password) {
+            errEl.textContent = 'Username and password are required.';
+            errEl.style.display = 'block';
+            return;
+        }
+
+        btn.disabled = true;
+        try {
+            var form = new FormData();
+            form.append('username', username);
+            form.append('password', password);
+
+            var res = await fetch('/api/auth/login', { method: 'POST', body: form });
+
+            if (res.ok) {
+                window.location = '/';
+            } else {
+                var data = {};
+                try { data = await res.json(); } catch (e) {}
+                errEl.textContent = data.detail || 'Login failed.';
+                errEl.style.display = 'block';
+            }
+        } catch (err) {
+            errEl.textContent = 'Network error. Is the server running?';
+            errEl.style.display = 'block';
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async function doSignup() {
+        var btn = document.getElementById('signup-btn');
+        var errEl = document.getElementById('signup-error');
+        var okEl = document.getElementById('signup-success');
+        errEl.style.display = 'none';
+        okEl.style.display = 'none';
+
+        var username = document.getElementById('signup-user').value.trim();
+        var password = document.getElementById('signup-pass').value;
+
+        if (!username || !password) {
+            errEl.textContent = 'Username and password are required.';
+            errEl.style.display = 'block';
+            return;
+        }
+        if (password.length < 8) {
+            errEl.textContent = 'Password must be at least 8 characters.';
+            errEl.style.display = 'block';
+            return;
+        }
+
+        btn.disabled = true;
+        try {
+            var form = new FormData();
+            form.append('username', username);
+            form.append('password', password);
+            form.append('email', document.getElementById('signup-email').value);
+            form.append('full_name', document.getElementById('signup-name').value);
+
+            var res = await fetch('/api/auth/signup', { method: 'POST', body: form });
+
+            if (res.ok) {
+                okEl.textContent = 'Account created. You can now login.';
+                okEl.style.display = 'block';
+                setTimeout(showLogin, 1500);
+            } else {
+                var data = {};
+                try { data = await res.json(); } catch (e) {}
+                errEl.textContent = data.detail || 'Signup failed.';
+                errEl.style.display = 'block';
+            }
+        } catch (err) {
+            errEl.textContent = 'Network error. Is the server running?';
+            errEl.style.display = 'block';
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    // Wire up events
+    document.getElementById('show-signup').addEventListener('click', showSignup);
+    document.getElementById('show-login').addEventListener('click', showLogin);
+    document.getElementById('login-btn').addEventListener('click', doLogin);
+    document.getElementById('signup-btn').addEventListener('click', doSignup);
+
+    // Enter key submits the active form
+    document.addEventListener('keydown', function(e) {
+        if (e.key !== 'Enter') return;
+        if (loginForm.style.display !== 'none') {
+            doLogin();
+        } else {
+            doSignup();
+        }
+    });
+})();
+</script>
+{% endblock %}

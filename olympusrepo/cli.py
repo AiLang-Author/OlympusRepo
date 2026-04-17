@@ -845,6 +845,48 @@ def cmd_offer(args):
         conn.close()
 
 
+def cmd_import_git(args):
+    """Import a git repository into OlympusRepo."""
+    from .core import import_git as ig
+    
+    conn = db.connect()
+    try:
+        config = worktree.load_config(".") if os.path.exists(".olympusrepo") else {}
+        objects_dir = os.environ.get("OLYMPUSREPO_OBJECTS_DIR", "objects")
+        
+        requested_user = args.user or os.getenv("USER", "zeus")
+        user = db.get_user_by_name(conn, requested_user)
+        if not user:
+            print(f"ERROR: User '{requested_user}' not found.")
+            return 1
+        
+        print(f"Importing git repo: {args.source}")
+        print(f"  → OlympusRepo name: {args.name}")
+        
+        result = ig.import_git_repo(
+            conn=conn,
+            git_source=args.source,
+            repo_name=args.name,
+            user_id=user["user_id"],
+            objects_dir=objects_dir,
+            branch=args.branch,
+        )
+        
+        print(f"\n✓ Import complete!")
+        print(f"  Repository: {result['repo_name']}")
+        print(f"  Commits:    {result['commits_imported']}")
+        print(f"  Files:      {result['files_imported']}")
+        print(f"\n  View at: http://localhost:8000/repo/{result['repo_name']}")
+        return 0
+    except Exception as e:
+        print(f"ERROR: Import failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+    finally:
+        conn.close()
+
+
 def cmd_delete_repo(args):
     """Delete a repository and all its data."""
     conn = db.connect()
@@ -988,6 +1030,13 @@ def main():
     p.add_argument("--remote", default="origin")
     p.add_argument("-m", "--message", help="Why this should be accepted")
 
+    # import-git
+    p = sub.add_parser("import-git", help="Import a git repository into OlympusRepo")
+    p.add_argument("source", help="Git repo path or URL")
+    p.add_argument("name", help="OlympusRepo repository name")
+    p.add_argument("--branch", help="Git branch to import (default: HEAD)")
+    p.add_argument("--user", help="Username to attribute commits to")
+
     # delete-repo
     p = sub.add_parser("delete-repo", help="Delete a repository (Zeus only)")
     p.add_argument("name", help="Repository name")
@@ -1022,6 +1071,7 @@ def main():
         "clone": cmd_clone,
         "pull": cmd_pull,
         "offer": cmd_offer,
+        "import-git": cmd_import_git,
         "delete-repo": cmd_delete_repo,
         "user-create": cmd_user_create,
     }

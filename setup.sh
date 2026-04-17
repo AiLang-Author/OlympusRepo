@@ -59,6 +59,8 @@ while [[ $# -gt 0 ]]; do
     --mode) MODE="$2"; shift 2 ;;
     --port) APP_PORT="$2"; shift 2 ;;
     --dir)  INSTALL_DIR="$2"; shift 2 ;;
+    --db-pass) DB_PASS="$2"; shift 2 ;;
+    --zeus-pass) ZEUS_PASS="$2"; shift 2 ;;
     *) warn "Unknown argument: $1"; shift ;;
   esac
 done
@@ -196,16 +198,31 @@ divider
 echo -e "${BOLD}  STEP 3 — Database${RESET}"
 divider
 
-# DB password
-ask "PostgreSQL password for user '${DB_USER}':"
-while [[ -z "$DB_PASS" ]]; do
-  read -rsp "  Password (min 12 chars): " DB_PASS; echo ""
-  if [[ ${#DB_PASS} -lt 12 ]]; then
-    warn "Password too short. Try again."; DB_PASS=""
+  if [[ -z "$ZEUS_PASS" ]]; then
+    while true; do
+      echo -n "  Zeus secret (min 8 chars): "
+      read -r ZEUS_SECRET_INPUT
+
+      if [[ ${#ZEUS_SECRET_INPUT} -lt 8 ]]; then
+        warn "Input too short. Try again."
+        continue
+      fi
+
+      echo -n "  Confirm secret: "
+      read -r ZEUS_SECRET_INPUT2
+
+      if [[ "$ZEUS_SECRET_INPUT" != "$ZEUS_SECRET_INPUT2" ]]; then
+        warn "Inputs do not match. Try again."
+        continue
+      fi
+
+      # ONLY NOW do we assign it to the actual password variable
+      ZEUS_PASS="$ZEUS_SECRET_INPUT"
+      break
+    done
+  else
+    info "Using Zeus password provided via arguments."
   fi
-done
-read -rsp "  Confirm password: " DB_PASS2; echo ""
-[[ "$DB_PASS" == "$DB_PASS2" ]] || error "Passwords do not match."
 
 # Custom DB settings?
 read -rp "  Use defaults? (db=${DB_NAME}, user=${DB_USER}, host=${DB_HOST}, port=${DB_PORT}) [Y/n]: " db_defaults
@@ -347,14 +364,30 @@ if [[ "$MODE" != "contributor" ]]; then
     [[ -z "$ZEUS_USER" ]] && warn "Username cannot be empty."
   done
 
-  while [[ -z "$ZEUS_PASS" ]]; do
-    read -rsp "  Zeus password (min 12 chars): " ZEUS_PASS; echo ""
-    if [[ ${#ZEUS_PASS} -lt 12 ]]; then
-      warn "Password too short."; ZEUS_PASS=""
-    fi
-  done
-  read -rsp "  Confirm Zeus password: " ZEUS_PASS2; echo ""
-  [[ "$ZEUS_PASS" == "$ZEUS_PASS2" ]] || error "Passwords do not match."
+  if [[ -z "$ZEUS_PASS" ]]; then
+    stty sane 2>/dev/null || stty echo 2>/dev/null || true
+    while true; do
+      echo -n "  Zeus password (min 8 chars, visible): "
+      read -r PLAIN_TEXT_ENTRY
+      ZEUS_PASS="$PLAIN_TEXT_ENTRY"
+      if [[ ${#ZEUS_PASS} -lt 8 ]]; then
+        warn "Password too short. Try again."
+        ZEUS_PASS=""
+        continue
+      fi
+      echo -n "  Confirm Zeus password: "
+      read -r PLAIN_TEXT_ENTRY2
+      ZEUS_PASS2="$PLAIN_TEXT_ENTRY2"
+      if [[ "$ZEUS_PASS" != "$ZEUS_PASS2" ]]; then
+        warn "Passwords do not match. Try again."
+        ZEUS_PASS=""
+        continue
+      fi
+      break
+    done
+  else
+    info "Using Zeus password provided via arguments."
+  fi
 
   # Create zeus user via psql function, deactivate default zeus
   PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
@@ -510,6 +543,7 @@ divider
 INSTALL_ABS="$(cd "$INSTALL_DIR" && pwd)"
 OBJECTS_DIR="${INSTALL_ABS}/objects"
 mkdir -p "$OBJECTS_DIR"
+ALIAS_NAME="olympus-$(basename "$INSTALL_ABS" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
 
 cat > "$ENV_FILE" << EOF
 # OlympusRepo configuration
@@ -543,7 +577,29 @@ set -a; source "$ENV_FILE"; set +a
 # Offer to add env export to shell rc
 read -rp "  Source .env automatically from $SHELL_RC? [Y/n]: " add_rc
 if [[ "${add_rc:-Y}" =~ ^[Yy]$ ]]; then
-  RC_ENTRY="# OlympusRepo env"
+  RC_ENTRY="set -a; source \"${INSTALL_ABS}/${ENV_FILE}\" 2>/dev/null; set +a"
+  if ! grep -q "OlympusRepo env" "$SHELL_RC" 2>/dev/null; then
+    echo "" >> "$SHELL_RC"
+    echo "# OlympusRepo env" >> "$SHELL_RC"
+    echo "$RC_ENTRY" >> "$SHELL_RC"
+    success "Added env sourcing to $SHELL_RC"
+  else
+    info "Already present in $SHELL_RC — skipping"
+  fi
+fi
+
+# Write instance alias to shellrc
+VENV_ACTIVATE=""
+[[ "$NEED_VENV" -eq 1 ]] && VENV_ACTIVATE="source \"${INSTALL_ABS}/.venv/bin/activate\" && "
+ALIAS_CMD="alias ${ALIAS_NAME}=\"${VENV_ACTIVATE}set -a; source \\\"${INSTALL_ABS}/${ENV_FILE}\\\"; set +a\""
+if ! grep -q "$ALIAS_NAME" "$SHELL_RC" 2>/dev/null; then
+  echo "" >> "$SHELL_RC"
+  echo "# OlympusRepo instance alias" >> "$SHELL_RC"
+  echo "$ALIAS_CMD" >> "$SHELL_RC"
+  success "Added alias '${ALIAS_NAME}' to $SHELL_RC"
+  info "Run '${ALIAS_NAME}' in any terminal to activate this instance"
+fi
+echo ""
 
 # =============================================================================
 # STEP 9 — Update instance_url in DB + run cascade migrations
@@ -565,7 +621,7 @@ SQL
 # =============================================================================
 if [[ "$MODE" == "contributor" ]]; then
   divider
-  echo -e "${BOLD}  STEP 9 — Contributor Remote${RESET}"
+  echo -e "${BOLD}  STEP 10 — Contributor Remote${RESET}"
   divider
   info "To start offering changes, clone a repo and add your canonical remote:"
   echo ""
@@ -641,99 +697,6 @@ fi
 
 echo -e "  ${BOLD}Reload shell to use alias:${RESET}"
 echo -e "  ${CYAN}source ${SHELL_RC}${RESET}"
-echo ""
-divider
-echo ""
-\n'"set -a; source \"${INSTALL_ABS}/${ENV_FILE}\" 2>/dev/null; set +a"
-  if ! grep -q "OlympusRepo env" "$SHELL_RC" 2>/dev/null; then
-    echo "" >> "$SHELL_RC"
-    echo "$RC_ENTRY" >> "$SHELL_RC"
-    success "Added env sourcing to $SHELL_RC"
-  else
-    info "Already present in $SHELL_RC — skipping"
-  fi
-fi
-
-# Write instance alias to shellrc
-VENV_ACTIVATE=""
-[[ "$NEED_VENV" -eq 1 ]] && VENV_ACTIVATE="source \"${INSTALL_ABS}/.venv/bin/activate\" && "
-ALIAS_NAME="olympus-$(basename "$INSTALL_ABS" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
-ALIAS_CMD="alias ${ALIAS_NAME}=\"${VENV_ACTIVATE}set -a; source \\\"${INSTALL_ABS}/${ENV_FILE}\\\"; set +a\""
-if ! grep -q "$ALIAS_NAME" "$SHELL_RC" 2>/dev/null; then
-  echo "" >> "$SHELL_RC"
-  echo "# OlympusRepo instance alias" >> "$SHELL_RC"
-  echo "$ALIAS_CMD" >> "$SHELL_RC"
-  success "Added alias '${ALIAS_NAME}' to $SHELL_RC"
-  info "Run '${ALIAS_NAME}' in any terminal to activate this instance"
-fi
-echo ""
-
-# =============================================================================
-# STEP 9 — Update instance_url in DB
-# =============================================================================
-PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
-  -c "UPDATE repo_server_config SET value='${PUBLIC_URL}' WHERE key='instance_url';" > /dev/null 2>&1 || true
-
-# =============================================================================
-# STEP 10 — Contributor remote config
-# =============================================================================
-if [[ "$MODE" == "contributor" ]]; then
-  divider
-  echo -e "${BOLD}  STEP 9 — Contributor Remote${RESET}"
-  divider
-  info "To start offering changes, clone a repo and add your canonical remote:"
-  echo ""
-  echo -e "  ${CYAN}olympusrepo clone ${PUBLIC_URL}/repo/REPONAME${RESET}"
-  echo -e "  ${CYAN}cd REPONAME${RESET}"
-  echo -e "  ${CYAN}olympusrepo remote add origin ${PUBLIC_URL}${RESET}"
-  echo ""
-fi
-
-# =============================================================================
-# STEP 11 — Final summary
-# =============================================================================
-divider
-echo ""
-echo -e "${GREEN}${BOLD}  ⚡ OlympusRepo is ready.${RESET}"
-divider
-echo ""
-echo -e "  ${BOLD}Start the server:${RESET}"
-echo ""
-echo -e "  ${CYAN}source .venv/bin/activate${RESET}"
-echo -e "  ${CYAN}uvicorn olympusrepo.web.app:app --host 0.0.0.0 --port ${APP_PORT} --reload${RESET}"
-echo ""
-echo -e "  ${BOLD}Open in browser:${RESET}  ${PUBLIC_URL}"
-echo ""
-
-if [[ "$MODE" != "contributor" && -n "$ZEUS_USER" ]]; then
-  echo -e "  ${BOLD}Login:${RESET}  ${ZEUS_USER} / (password you set)"
-fi
-
-echo ""
-
-if [[ "$MODE" == "team" ]]; then
-  echo -e "  ${BOLD}Share with contributors:${RESET}"
-  echo -e "  They clone with:  ${CYAN}olympusrepo clone ${PUBLIC_URL}/repo/REPONAME${RESET}"
-  echo -e "  They offer with:  ${CYAN}olympusrepo offer -m \"reason\"${RESET}"
-  echo ""
-fi
-
-if [[ "$MODE" == "team" && "$NETWORK_MODE" == "tailscale" ]]; then
-  echo -e "  ${YELLOW}Tailscale note:${RESET} Contributors need to be on your Tailnet."
-  echo -e "  Invite them at: https://login.tailscale.com/admin/users"
-  echo ""
-fi
-
-if [[ "$MODE" == "team" && "$NETWORK_MODE" == "tor" && -n "${ONION_ADDR:-}" ]]; then
-  echo -e "  ${YELLOW}Tor note:${RESET} Contributors need Tor Browser or torsocks to reach you."
-  echo -e "  Hidden service:  ${ONION_ADDR}"
-  echo ""
-fi
-
-echo -e "  ${BOLD}Next steps:${RESET}"
-echo -e "  1. Change the default 'zeus' seed account password (or it's already deactivated)"
-echo -e "  2. Create Titan accounts for your contributors"
-echo -e "  3. Initialize your first repo: ${CYAN}olympusrepo init myproject${RESET}"
 echo ""
 divider
 echo ""
