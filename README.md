@@ -17,10 +17,11 @@ OlympusRepo is a centralized, review-driven VCS with a clear power hierarchy, bu
 
 Modern version control has been captured by one platform. Modern backend architecture has been captured by a dozen SaaS vendors. OlympusRepo is a push back against both:
 
-- **One database.** Postgres handles users, auth, sessions, metadata, audit logs, discussion, full-text search, and row-level security. No Redis. No Elasticsearch. No MongoDB. No Auth0.
+- **One database.** Postgres handles users, auth, sessions, commits, blobs metadata, discussion, notifications, bug tracking, audit logs, and row-level security. No Redis. No Elasticsearch. No MongoDB. No Auth0.
 - **One language.** Pure Python. Install it, run it, read it.
 - **One workflow.** You commit to your own staging realm. A reviewer promotes it to the canonical tree. Every discussion about the code stays attached to the code forever.
 - **Self-hosted by default.** There is no hosted version. There is no company you have to trust. You run it. You own it.
+- **Federated by design.** Two instances can talk to each other. Contributors offer changes from their local instance to a canonical instance. Zeus decides what gets in.
 
 ---
 
@@ -31,11 +32,13 @@ OlympusRepo uses Greek mythology for roles because "maintainer" and "contributor
 | Role | Who | Can Do |
 |------|-----|--------|
 | **Zeus** | Repo owner | Everything. Controls the canonical tree, permissions, visibility. |
-| **Olympian** | Senior devs | Review and promote offerings to the canonical tree (scoped by Zeus). |
+| **Olympian** | Senior devs | Review and promote offerings to the canonical tree. |
 | **Titan** | Regular contributors | Commit to personal staging realm. |
 | **Mortal** | Junior devs / guests | Limited staging. |
 | **Prometheus** | Experimental coder | Isolated sandbox for risky changes. |
 | **Hermes** | Hotfix contributor | Emergency fast-path patches. |
+
+Roles are extensible — it's a CHECK constraint on a text column. Add your own via migration.
 
 ---
 
@@ -43,11 +46,24 @@ OlympusRepo uses Greek mythology for roles because "maintainer" and "contributor
 
 1. A **Titan** writes code and runs `olympusrepo commit -m "message"`.
 2. Changes go to the Titan's **personal staging realm**, not the canonical tree.
-3. An **Olympian** reviews the offering and discusses it via **mana** — comments attached to the specific file, commit, or staging realm.
+3. An **Olympian** reviews the offering via the side-by-side diff viewer and discusses it via **mana** — comments attached to the specific file, commit, or staging realm.
 4. The Olympian **promotes** the offering. The canonical tree gets a new commit with a global sequential revision number.
 5. **Zeus** controls who can promote, to which branches, and the long-term tree shape.
 
+Contributors on remote machines use `olympusrepo offer` to send their work to canonical. Nothing enters the canonical tree without review. You can offer but never push.
+
 All discussion is preserved forever. Every promotion is audited. Nothing is ephemeral.
+
+---
+
+## What's Built
+
+- **Full CLI** — init, add, commit, status, log, diff, branch, switch, resolve, mana, clone, pull, offer, delete-repo
+- **Web UI** — repo browser, file viewer with inline comments, commit history, side-by-side diff review, staging realms, mana discussion, direct messaging, notifications
+- **Bug tracker** — issues with file attachments, commit auto-linking (`fixes #N`), comments, priority, assignment
+- **Connector** — clone from remote, pull updates, offer changes for review, full two-instance federation
+- **Zeus Dashboard** — instance stats, audit log with filters, user management, server config
+- **Mythological UI** — 14 Grok-generated backgrounds, choose-your-fate login screen, Hades 404 page
 
 ---
 
@@ -55,76 +71,41 @@ All discussion is preserved forever. Every promotion is audited. Nothing is ephe
 
 ### Prerequisites
 
-- PostgreSQL 14 or newer
-- Python 3.10 or newer
-- `diff3` (from `diffutils`) for three-way merges
-
 ```bash
-# Install diff3 if you don't have it
-apt-get install diffutils      # Debian/Ubuntu
-brew install diffutils         # macOS
-yum install diffutils          # RHEL/Fedora
+# Ubuntu/Debian/WSL2
+sudo apt install postgresql postgresql-contrib python3 python3-venv diffutils
+
+# macOS
+brew install postgresql@16 python3 diffutils
 ```
 
 ### Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/olympusrepo.git
-cd olympusrepo
+git clone https://github.com/AiLang-Author/OlympusRepo.git
+cd OlympusRepo
 
-# Create the database
-createdb olympusrepo
+sudo -u postgres psql -c "CREATE USER olympus WITH PASSWORD 'olympus' SUPERUSER;"
+sudo -u postgres createdb -O olympus olympusrepo
 
-# Run migrations in order
-for f in sql/0*.sql; do psql olympusrepo < "$f"; done
-
-# Install the Python package
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
+pip install 'uvicorn[standard]'
+
+for f in sql/0*.sql; do psql olympusrepo < "$f"; done
 ```
 
-The seed script (`sql/007_seed.sql`) creates a default `zeus` user with password `changeme`. **Change this immediately after first login.**
-
-### Configuration
-
-OlympusRepo reads database connection info from environment variables:
+### Start
 
 ```bash
-export OLYMPUSREPO_DB_NAME=olympusrepo
-export OLYMPUSREPO_DB_USER=olympus
-export OLYMPUSREPO_DB_PASS=your_password
-export OLYMPUSREPO_DB_HOST=127.0.0.1
-export OLYMPUSREPO_DB_PORT=5432
-
-# Production only: set secure cookie flag (requires HTTPS)
-export OLYMPUSREPO_COOKIE_SECURE=1
+export OLYMPUSREPO_DB_PASS=olympus
+uvicorn olympusrepo.web.app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### First Repository
+Open `http://localhost:8000`. Login as `zeus` / `changeme`. Change the password.
 
-```bash
-# Create a user (if you didn't use the seed)
-olympusrepo user-create alice strongpassword --role titan
-
-# Initialize a new repo
-olympusrepo init my-project --user alice
-cd my-project
-
-# Create some content
-echo "# My Project" > README.md
-
-# Stage and commit
-olympusrepo add .
-olympusrepo commit -m "Initial commit"
-olympusrepo log
-```
-
-### Start the Web Server
-
-```bash
-uvicorn olympusrepo.web.app:app --host 0.0.0.0 --port 8000
-```
-
-Then open http://localhost:8000.
+See `docs/SETUP.md` for the full setup guide including WSL2 notes, macOS, and production checklist.
 
 ---
 
@@ -135,29 +116,42 @@ olympusrepo init <name>              Create a new repository
 olympusrepo add [files...]           Stage files for commit
 olympusrepo commit -m "message"      Commit staged changes
 olympusrepo status                   Show working tree status
-olympusrepo log [--limit N] [--path] Show commit history
-olympusrepo diff [file]              Show working tree diffs
+olympusrepo log                      Show commit history
+olympusrepo diff [file]              Show differences
 olympusrepo branch [name]            List or create branches
 olympusrepo switch <branch>          Switch branches
-olympusrepo resolve <file>           Mark a conflicted file resolved
-olympusrepo user-create <user> <pw>  Create a user (admin)
+olympusrepo resolve <file>           Mark conflict resolved
+olympusrepo clone <url> [dest]       Clone from remote instance
+olympusrepo pull [--remote origin]   Pull from canonical
+olympusrepo offer [-m "why"]         Offer commits for review
+olympusrepo remote add <name> <url>  Add a remote instance
+olympusrepo mana [-m "message"]      Post or list design discussion
+olympusrepo user-create <user> <pw>  Create a user (Zeus only)
+olympusrepo delete-repo <name>       Delete a repository (Zeus only)
 ```
 
 No `rebase`, no `cherry-pick`, no `reflog`, no `reset --mixed`. Commands do what their names say.
 
 ---
 
-## Ignoring Files
+## Two-Instance Federation
 
-OlympusRepo ignores common artifacts by default: `.git`, `__pycache__`, `*.pyc`, `node_modules`, `.venv`, `.DS_Store`, and similar. Add a `.olympusignore` file at your repo root for project-specific patterns. Syntax is glob-based (fnmatch), one pattern per line, `#` for comments.
+```bash
+# On contributor machine (Athens):
+olympusrepo clone http://canonical:8000/repo/myproject
+cd myproject
+# ... make changes ...
+olympusrepo commit -m "my fix - closes #12"
+olympusrepo offer -m "tested on Ubuntu 24.04, all passing"
 
+# On canonical (Olympus):
+# Zeus sees the offer in the Staging tab
+# Reviews side-by-side diff in the browser
+# Clicks Promote ⚡
+# Changes enter the canonical tree at the next global rev
 ```
-# .olympusignore example
-build/
-dist/
-*.log
-secrets.env
-```
+
+The contributor can never push directly. They can only offer. Zeus decides what enters.
 
 ---
 
@@ -165,12 +159,13 @@ secrets.env
 
 ```
 ┌─────────────────────────────────────────────────┐
-│              Browser / CLI Client               │
+│         Athens (slave instance)                 │
+│   olympusrepo clone / pull / offer              │
 └────────────────┬────────────────────────────────┘
-                 │ HTTP / HTTPS
+                 │ HTTP offer
 ┌────────────────▼────────────────────────────────┐
-│         FastAPI Web Server (Python)             │
-│   auth, routes, templates, RLS context          │
+│         Olympus (canonical instance)            │
+│   FastAPI + Jinja2 web server                   │
 └────────────────┬────────────────────────────────┘
                  │
 ┌────────────────▼────────────────────────────────┐
@@ -178,102 +173,42 @@ secrets.env
 │   objects, worktree, diff, repo operations      │
 └────────┬───────────────────┬────────────────────┘
          │                   │
-┌────────▼─────────┐   ┌─────▼──────────────────┐
-│ Content-addr.    │   │   PostgreSQL           │
-│ object store     │   │   users, sessions,     │
-│ (SHA-256 loose   │   │   commits, changesets, │
-│  objects on disk)│   │   refs, mana, audit    │
-└──────────────────┘   └────────────────────────┘
-```
-
-### Layers
-
-- **Core** (`olympusrepo/core/`) — pure Python, no framework dependencies. Object store, working tree scanner, diff/merge, high-level repo operations.
-- **CLI** (`olympusrepo/cli.py`) — argparse-based command-line interface.
-- **Web** (`olympusrepo/web/`) — FastAPI app. Session auth, API endpoints, HTML templates.
-- **Schema** (`sql/`) — 17 tables, numbered migrations, RLS policies for private messages, helper functions for auth.
-
-### Storage
-
-Blobs are stored as loose objects on disk at `.olympusrepo/objects/<2-char-prefix>/<rest-of-hash>`. Content-addressable and idempotent — the same file always hashes to the same object.
-
-Metadata (commits, branches, users, discussion, audit log) lives in Postgres.
-
----
-
-## Project Structure
-
-```
-olympusrepo/
-├── olympusrepo/              # Python package
-│   ├── core/                 # Object store, worktree, diff, repo ops
-│   │   ├── db.py
-│   │   ├── objects.py
-│   │   ├── diff.py
-│   │   ├── worktree.py
-│   │   └── repo.py
-│   ├── web/                  # FastAPI server
-│   │   └── app.py
-│   ├── cli.py                # CLI entry point
-│   └── __main__.py           # python -m olympusrepo
-├── sql/                      # Database migrations
-│   ├── 001_extensions.sql
-│   ├── 002_tables.sql
-│   ├── 003_indexes.sql
-│   ├── 004_rls.sql
-│   ├── 005_functions.sql
-│   ├── 006_defaults.sql
-│   └── 007_seed.sql
-├── templates/                # Jinja2 HTML
-│   ├── base.html
-│   ├── index.html
-│   ├── login.html
-│   ├── repo_browser.html
-│   └── zeus_dashboard.html
-├── docs/                     # Design documents
-│   ├── ARCHITECTURE.md
-│   ├── SCHEMA.md
-│   └── API.md
-├── setup.py
-├── requirements.txt
-├── LICENSE
-└── README.md
+┌────────▼─────────┐   ┌─────▼──────────────────────┐
+│ Content-addr.    │   │   PostgreSQL               │
+│ object store     │   │   users, sessions, commits  │
+│ (SHA-256 loose   │   │   blobs metadata, issues    │
+│  objects on disk)│   │   mana, messages, audit     │
+└──────────────────┘   └────────────────────────────┘
 ```
 
 ---
 
 ## Status
 
-**Alpha.** The core commit/log/branch/diff loop works. Three-way merge works if `diff3` is installed. The web UI shows repos, commits, and mana.
+**Alpha — v0.3.** Core workflow proven end to end. Two instances talking. Offers flowing. Zeus promoting.
 
-**Not yet implemented:**
+**Known gaps (good first contributions):**
+- Promote route needs applying (code written, see `docs/CONTRIBUTING.md`)
+- Folder drag-and-drop upload JS needs wiring
+- Setup script (`setup.sh`) not yet written
+- Notification polling interval too aggressive (60s → 5min)
+- Clone path prefix issue when committing whole folders
 
-- File tree loading in the repo browser (placeholder list)
-- WebSocket mana streaming (the REST endpoint works)
-- Clone / pack download endpoints
-- Full staging realm workflow in the web UI (DB schema is ready)
-- AILang binary core (the `repo_exec_tokens` table is reserved for it)
-
-PRs welcome on any of these.
+See `docs/CONTRIBUTING.md` for the full list with file locations and implementation notes.
 
 ---
 
 ## Contributing
 
-1. Fork the repo
-2. Create a branch: `git checkout -b feature/your-thing` *(yes, we still use git for the OlympusRepo repo itself — we're not that religious)*
-3. Commit with clear messages
-4. Open a pull request
+Read `docs/CONTRIBUTING.md` first. It covers the philosophy, setup, two-instance test environment, exactly what's broken, where the code is, and how to contribute using OlympusRepo itself.
 
-Bug reports with steps to reproduce are especially appreciated. File under "Issues."
+The short version: fix something from the known gaps list, commit it, offer it via `olympusrepo offer`. Don't open GitHub PRs for code — use the tool.
 
 ---
 
 ## Security
 
-Auth uses bcrypt via pgcrypto, session tokens are 64-char hex from `gen_random_bytes`, cookies are `httponly` and `samesite=strict` (and `secure` when `OLYMPUSREPO_COOKIE_SECURE=1`). Row-level security enforces private message visibility at the database layer.
-
-If you find a security issue, please email directly rather than filing a public issue.
+bcrypt via pgcrypto, 64-char hex session tokens from `gen_random_bytes`, `httponly` + `samesite=strict` cookies, row-level security for private messages. Email security issues directly rather than filing public issues.
 
 ---
 
@@ -290,8 +225,5 @@ Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering.
 - **Postgres.** Does everything. You don't need the other things.
 - **git**, for the content-addressable storage idea.
 - **SVN**, for proving linear history isn't a crime.
-<<<<<<< HEAD
 - **Greek mythology**, for having better role names than "maintainer."
-=======
-- **Greek mythology**, for having better role names than "maintainer."
->>>>>>> 7b8fc8a476708a403ca827bfc1d07a5c78021486
+- **The "I replaced my entire stack with Postgres" video**, for the thesis statement.
