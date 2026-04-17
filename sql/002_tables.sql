@@ -210,7 +210,7 @@ CREATE TABLE repo_messages (
     sender_id       BIGINT REFERENCES repo_users(user_id),
     content         TEXT NOT NULL,
     context_type    TEXT
-                    CHECK (context_type IN ('file', 'commit', 'staging', 'branch', 'general')),
+                    CHECK (context_type IN ('file', 'commit', 'staging', 'branch', 'general', 'direct')),
     context_id      TEXT,
     is_private      BOOLEAN DEFAULT FALSE,
     recipient_id    BIGINT REFERENCES repo_users(user_id),
