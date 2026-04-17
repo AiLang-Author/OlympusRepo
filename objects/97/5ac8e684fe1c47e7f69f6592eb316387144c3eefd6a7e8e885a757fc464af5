@@ -734,6 +734,8 @@ async def upload_files(name: str, request: Request,
     file_data = []
     for f in files:
         content = await f.read()
+        if not content:
+            continue
         # Use the filename field which contains the relative path
         # e.g. "src/main.py" not just "main.py"
         filepath = f.filename.replace("\\", "/").lstrip("/")
@@ -2589,20 +2591,16 @@ def promote_staging(name: str, staging_id: int,
     parent_hashes = [parent_hash] if parent_hash else None
 
     try:
-        next_rev = db.query_scalar(conn, 
-            "SELECT COALESCE(MAX(rev), 0) + 1 FROM repo_commits WHERE repo_id = %s",
-            (r["repo_id"],))
-
         db.execute(conn, """
             INSERT INTO repo_commits
                 (commit_hash, repo_id, tree_hash, author_id, author_name,
-                 committer_id, committer_name, message, parent_hashes, rev)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 committer_id, committer_name, message, parent_hashes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (commit_hash, r["repo_id"], tree_hash,
               staging_row["user_id"],
               owner["username"] if owner else "unknown",
               user["user_id"], user["username"],
-              msg, parent_hashes, next_rev), commit=False)
+              msg, parent_hashes), commit=False)
 
         for c in changes:
             db.execute(conn, """

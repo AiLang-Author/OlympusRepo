@@ -1,0 +1,175 @@
+{% extends "base.html" %}
+{% block title %}New Issue &mdash; {{ repo.name }}{% endblock %}
+
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            url('/static/forge-room.png') center center / cover no-repeat fixed;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container" style="max-width:700px;">
+
+    <div class="row-between" style="margin-bottom:24px;">
+        <h1 style="margin-bottom:0;">New Issue</h1>
+        <a href="/repo/{{ repo.name }}/issues" class="btn">← Issues</a>
+    </div>
+
+    <div id="issue-error" class="flash flash-error" style="display:none;"></div>
+
+    <div class="card">
+        <div class="form-group">
+            <label for="issue-title">
+                Title <span style="color:#8b949e;">*</span>
+            </label>
+            <input type="text" id="issue-title"
+                   placeholder="Short, clear description of the issue"
+                   autofocus>
+        </div>
+
+        <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px;">
+            <div class="form-group" style="margin-bottom:0;">
+                <label for="issue-type">Type</label>
+                <select id="issue-type">
+                    <option value="bug">🐛 Bug</option>
+                    <option value="feature">✨ Feature</option>
+                    <option value="task">📋 Task</option>
+                    <option value="question">❓ Question</option>
+                    <option value="security">🔒 Security</option>
+                </select>
+            </div>
+            <div class="form-group" style="margin-bottom:0;">
+                <label for="issue-priority">Priority</label>
+                <select id="issue-priority">
+                    <option value="low">Low</option>
+                    <option value="normal" selected>Normal</option>
+                    <option value="high">High</option>
+                    <option value="critical">Critical</option>
+                </select>
+            </div>
+            <div class="form-group" style="margin-bottom:0;">
+                <label for="issue-assignee">Assign To</label>
+                <select id="issue-assignee">
+                    <option value="">Unassigned</option>
+                    {% for u in all_users %}
+                    <option value="{{ u.user_id }}">
+                        {{ u.username }} ({{ u.role }})
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+        </div>
+
+        <div class="form-group" style="margin-top:16px;">
+            <label for="issue-desc">Description</label>
+            <textarea id="issue-desc" style="min-height:160px;"
+                      placeholder="Steps to reproduce, expected behavior, actual behavior..."></textarea>
+        </div>
+
+        <!-- File attachment -->
+        <div class="card" style="background:#0d1117; margin-bottom:0;">
+            <h3 style="margin-top:0;">Attach File (optional)</h3>
+            <p style="color:#8b949e; font-size:0.85em; margin-bottom:12px;">
+                Link this issue to a specific file or line range in the repo.
+            </p>
+            <div style="display:grid; grid-template-columns:2fr 1fr 1fr; gap:12px;">
+                <div class="form-group" style="margin-bottom:0;">
+                    <label for="file-path">File Path</label>
+                    <input type="text" id="file-path"
+                           value="{{ prefill_file }}"
+                           placeholder="e.g. olympusrepo/core/db.py">
+                </div>
+                <div class="form-group" style="margin-bottom:0;">
+                    <label for="line-start">Line Start</label>
+                    <input type="number" id="line-start"
+                           value="{{ prefill_line if prefill_line else '' }}"
+                           min="1" placeholder="e.g. 42">
+                </div>
+                <div class="form-group" style="margin-bottom:0;">
+                    <label for="line-end">Line End</label>
+                    <input type="number" id="line-end" min="1"
+                           placeholder="optional">
+                </div>
+            </div>
+        </div>
+
+        <div class="row" style="margin-top:20px;">
+            <button id="submit-issue-btn" class="btn btn-primary">
+                Submit Issue
+            </button>
+            <a href="/repo/{{ repo.name }}/issues" class="btn">Cancel</a>
+        </div>
+    </div>
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    var repoName = {{ repo.name | tojson }};
+    var btn  = document.getElementById('submit-issue-btn');
+    var errEl = document.getElementById('issue-error');
+
+    btn.addEventListener('click', async function() {
+        errEl.style.display = 'none';
+
+        var title = document.getElementById('issue-title').value.trim();
+        if (!title) {
+            errEl.textContent = 'Title is required.';
+            errEl.style.display = 'block';
+            document.getElementById('issue-title').focus();
+            return;
+        }
+
+        btn.disabled = true;
+        btn.textContent = 'Submitting...';
+
+        try {
+            var form = new FormData();
+            form.append('title',       title);
+            form.append('description', document.getElementById('issue-desc').value.trim());
+            form.append('issue_type',  document.getElementById('issue-type').value);
+            form.append('priority',    document.getElementById('issue-priority').value);
+            form.append('assigned_to', document.getElementById('issue-assignee').value);
+            form.append('file_path',   document.getElementById('file-path').value.trim());
+            form.append('line_start',  document.getElementById('line-start').value);
+            form.append('line_end',    document.getElementById('line-end').value);
+
+            var res = await fetch(
+                '/api/repos/' + encodeURIComponent(repoName) + '/issues',
+                { method: 'POST', body: form }
+            );
+
+            if (res.ok) {
+                var data = await res.json();
+                window.location = '/repo/' + encodeURIComponent(repoName) +
+                                  '/issues/' + data.number;
+            } else {
+                var d = {};
+                try { d = await res.json(); } catch(e) {}
+                errEl.textContent = d.detail || 'Could not create issue.';
+                errEl.style.display = 'block';
+                btn.disabled = false;
+                btn.textContent = 'Submit Issue';
+            }
+        } catch(err) {
+            errEl.textContent = 'Network error.';
+            errEl.style.display = 'block';
+            btn.disabled = false;
+            btn.textContent = 'Submit Issue';
+        }
+    });
+
+    // Enter in title submits
+    document.getElementById('issue-title')
+        .addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') btn.click();
+        });
+})();
+</script>
+{% endblock %}

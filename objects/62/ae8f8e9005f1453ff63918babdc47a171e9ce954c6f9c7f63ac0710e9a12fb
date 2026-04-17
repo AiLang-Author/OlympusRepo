@@ -120,56 +120,75 @@ def commit(conn, repo_id: int, user_id: int, message: str,
         print("ERROR: User not found")
         return None
 
-    index = worktree.load_index(repo_root)
-    branch = worktree.get_current_branch(repo_root)
-    ref_name = f"refs/heads/{branch}"
+    # Detect changes
+    changes = worktree.detect_changes(repo_root, objects_dir)
 
-    # Replay all changesets up to HEAD to build prev_tree
-    existing = db.query(conn, """
-        SELECT cs.path, cs.blob_after, cs.change_type
-          FROM repo_changesets cs
-          JOIN repo_commits c ON c.commit_hash = cs.commit_hash
-         WHERE c.repo_id = %s
-         ORDER BY c.rev ASC, cs.path ASC
-    """, (repo_id,))
-
-    prev_tree = {}
-    for row in existing:
-        if row["change_type"] in ("add", "modify"):
-            prev_tree[row["path"]] = row["blob_after"]
-        elif row["change_type"] == "delete":
-            prev_tree.pop(row["path"], None)
-
-    print(f"DEBUG commit: index={len(index)} files, prev_tree={len(prev_tree)} files")
-
-    # Diff index against prev_tree
-    changes = {"added": [], "modified": [], "deleted": []}
-    for filepath, entry in index.items():
-        new_hash = entry["hash"]
-        if filepath not in prev_tree:
-            changes["added"].append((filepath, new_hash))
-        elif prev_tree[filepath] != new_hash:
-            changes["modified"].append((filepath, prev_tree[filepath], new_hash))
-            
-    for filepath, old_hash in prev_tree.items():
-        if filepath not in index:
-            changes["deleted"].append((filepath, old_hash))
+    # If no changes detected but index has files and no prior commits exist,
+    # treat all indexed files as new additions (first commit)
+    if not any(changes.values()):
+        index = worktree.load_index(repo_root)
+        if index:
+            parent_row = db.query_one(conn,
+                "SELECT commit_hash FROM repo_refs WHERE repo_id = %s AND ref_name = %s",
+                (repo_id, f"refs/heads/{worktree.get_current_branch(repo_root)}"))
+            if not parent_row or not parent_row["commit_hash"]:
+                # First commit — everything in index is new
+                changes["added"] = [
+                    (path, entry["hash"])
+                    for path, entry in index.items()
+                ]
 
     total_changes = len(changes["modified"]) + len(changes["added"]) + len(changes["deleted"])
     if total_changes == 0:
         print("Nothing to commit.")
         return None
 
+    # Store new/modified blobs (idempotent — safe even if we retry)
+    for filepath, new_hash in changes["added"]:
+        full_path = os.path.join(repo_root, filepath)
+        objects.store_file(full_path, objects_dir)
+
+    for filepath, old_hash, new_hash in changes["modified"]:
+        full_path = os.path.join(repo_root, filepath)
+        objects.store_file(full_path, objects_dir)
+
+    # Build tree entries from index + changes
+    index = worktree.load_index(repo_root)
+    tree_entries = dict(index)
+
+    for filepath, new_hash in changes["added"]:
+        full_path = os.path.join(repo_root, filepath)
+        stat = os.stat(full_path)
+        tree_entries[filepath] = {
+            "hash": new_hash,
+            "mtime": stat.st_mtime,
+            "size": stat.st_size,
+        }
+
+    for filepath, old_hash, new_hash in changes["modified"]:
+        full_path = os.path.join(repo_root, filepath)
+        stat = os.stat(full_path)
+        tree_entries[filepath] = {
+            "hash": new_hash,
+            "mtime": stat.st_mtime,
+            "size": stat.st_size,
+        }
+
+    for filepath, old_hash in changes["deleted"]:
+        tree_entries.pop(filepath, None)
+
     # Tree hash = hash of sorted entries
-    tree_entries = {k: v["hash"] for k, v in index.items()}
     tree_content = json.dumps(
-        {k: v for k, v in sorted(tree_entries.items())},
+        {k: v["hash"] for k, v in sorted(tree_entries.items())},
         sort_keys=True
     ).encode()
     tree_hash = objects.hash_content(tree_content)
     objects.store_blob(tree_content, objects_dir)
 
     # Commit hash = hash of tree + parent + message + timestamp
+    branch = worktree.get_current_branch(repo_root)
+    ref_name = f"refs/heads/{branch}"
+
     parent_row = db.query_one(conn,
         "SELECT commit_hash FROM repo_refs WHERE repo_id = %s AND ref_name = %s",
         (repo_id, ref_name))
@@ -206,12 +225,16 @@ def commit(conn, repo_id: int, user_id: int, message: str,
         for filepath, old_hash, new_hash in changes["modified"]:
             # Get diff stats
             old_content = objects.retrieve_blob(old_hash, objects_dir)
-            new_content = objects.retrieve_blob(new_hash, objects_dir)
+            try:
+                with open(os.path.join(repo_root, filepath), "rb") as f:
+                    new_content = f.read()
+            except OSError:
+                new_content = None
 
             if old_content and new_content:
                 _, added, removed = diff.diff_content(
                     old_content.decode("utf-8", errors="replace"),
-                    new_content.decode("utf-8", errors="replace") if new_content else "",
+                    new_content.decode("utf-8", errors="replace"),
                     filepath, filepath
                 )
             else:
@@ -295,6 +318,9 @@ def commit(conn, repo_id: int, user_id: int, message: str,
                         """, (issue_row["issue_id"],))
                 except Exception:
                     pass
+
+    # Only update local index AFTER successful DB commit
+    worktree.save_index(repo_root, tree_entries)
 
     rev = db.query_scalar(conn,
         "SELECT rev FROM repo_commits WHERE commit_hash = %s", (commit_hash,))
