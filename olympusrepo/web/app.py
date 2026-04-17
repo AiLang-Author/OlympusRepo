@@ -22,10 +22,80 @@ import re
 import urllib.request
 import urllib.error
 import json as json_stdlib
+import threading
+import time
+import httpx
+from contextlib import asynccontextmanager
 
 from ..core import db, repo
+from ..core import identity as identity_mod
+from ..relay_bootstrap import get_relay_list
 
-app = FastAPI(title="OlympusRepo", version="0.2")
+RELAY_ENABLED    = os.environ.get("OLYMPUSREPO_RELAY_ENABLED", "1") == "1"
+RELAY_PORT       = int(os.environ.get("PORT", os.environ.get("OLYMPUSREPO_PORT", 8000)))
+HEARTBEAT_INTERVAL = 300  # 5 minutes
+
+
+def _register_with_relay(relay_url: str, identity: dict,
+                         port: int) -> bool:
+    """
+    Send a signed heartbeat to one relay. Returns True on success.
+    Silent on failure — relay is enhancement, not requirement.
+    """
+    try:
+        envelope = identity_mod.make_heartbeat(identity, port=port)
+        r = httpx.post(
+            relay_url.rstrip("/") + "/relay/register",
+            json=envelope,
+            timeout=5,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _heartbeat_loop(identity: dict, port: int):
+    """
+    Background thread — registers with all known relays every 5 minutes.
+    Starts immediately on first iteration, then sleeps.
+    """
+    while True:
+        if RELAY_ENABLED:
+            relays = get_relay_list()
+            ok = 0
+            for relay_url in relays:
+                if _register_with_relay(relay_url, identity, port):
+                    ok += 1
+            if ok:
+                pass  # registered with at least one relay
+        time.sleep(HEARTBEAT_INTERVAL)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # ── Identity ──────────────────────────────────────────────────────────
+    ident = identity_mod.load_or_create()
+    app.state.identity = ident
+    print(f"  Instance: {ident['human_name']} ({ident['instance_id'][:16]}...)")
+
+    # ── Relay heartbeat thread ────────────────────────────────────────────
+    if RELAY_ENABLED:
+        relays = get_relay_list()
+        print(f"  Relay:    enabled — {len(relays)} relay(s) configured")
+        t = threading.Thread(
+            target=_heartbeat_loop,
+            args=(ident, RELAY_PORT),
+            daemon=True,
+            name="relay-heartbeat",
+        )
+        t.start()
+    else:
+        print("  Relay:    disabled (OLYMPUSREPO_RELAY_ENABLED=0)")
+
+    yield
+    # shutdown — nothing to clean up (daemon thread dies with process)
+
+app = FastAPI(title="OlympusRepo", version="0.2", lifespan=lifespan)
 
 from fastapi.staticfiles import StaticFiles
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "static")
@@ -486,6 +556,112 @@ def zeus_commits_page(request: Request, today: str = "0", conn=Depends(get_db)):
     return templates.TemplateResponse(request, "zeus_commits.html", {
         "user": user, "commits": commits, "today": is_today,
     })
+
+
+@app.get("/zeus/relay", response_class=HTMLResponse)
+def zeus_relay(request: Request, conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user or user["role"] not in ("zeus", "olympian"):
+        raise HTTPException(403)
+
+    from ..core import identity as identity_mod
+    from ..relay_bootstrap import get_relay_list
+    import httpx as _httpx
+
+    ident   = identity_mod.load_or_create()
+    env_name = os.environ.get("OLYMPUSREPO_INSTANCE_NAME", "").strip()
+    if env_name:
+        ident["human_name"] = env_name
+    relays  = get_relay_list()
+    enabled = os.environ.get("OLYMPUSREPO_RELAY_ENABLED", "1") == "1"
+
+    # Check registration status on each configured relay
+    relay_statuses = []
+    for url in relays:
+        status = {"url": url, "reachable": False, "instances": None}
+        try:
+            r = _httpx.get(url.rstrip("/") + "/relay/health", timeout=3)
+            if r.status_code == 200:
+                data = r.json()
+                status["reachable"]  = True
+                status["instances"]  = data.get("instances", 0)
+                status["relay_id"]   = data.get("relay_id", "")
+        except Exception:
+            pass
+        relay_statuses.append(status)
+
+    # Check if this instance is registered on any reachable relay
+    registered_on = []
+    for s in relay_statuses:
+        if not s["reachable"]:
+            continue
+        try:
+            r = _httpx.get(
+                s["url"].rstrip("/") + f"/relay/find/{ident['instance_id']}",
+                timeout=3)
+            if r.status_code == 200:
+                registered_on.append(s["url"])
+        except Exception:
+            pass
+
+    return templates.TemplateResponse(request, "zeus_relay.html", {
+        "user":           user,
+        "identity":       ident,
+        "relay_enabled":  enabled,
+        "relay_statuses": relay_statuses,
+        "registered_on":  registered_on,
+        "relay_urls":     relays,
+    })
+
+
+@app.post("/zeus/relay/save", response_class=HTMLResponse)
+async def zeus_relay_save(request: Request, conn=Depends(get_db)):
+    """Save relay config to .env and reload env vars."""
+    user = get_current_user(request, conn)
+    if not user or user["role"] != "zeus":
+        raise HTTPException(403)
+
+    form = await request.form()
+    enabled       = "1" if form.get("relay_enabled") else "0"
+    instance_name = form.get("instance_name", "").strip()
+    relay_urls    = form.get("relay_urls", "").strip()
+
+    # Update live env (takes effect immediately without restart)
+    os.environ["OLYMPUSREPO_RELAY_ENABLED"]  = enabled
+    if instance_name:
+        os.environ["OLYMPUSREPO_INSTANCE_NAME"] = instance_name
+    if relay_urls:
+        os.environ["OLYMPUSREPO_RELAYS"] = relay_urls
+
+    # Patch .env file
+    env_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", ".env")
+    env_path = os.path.normpath(env_path)
+
+    lines = []
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            lines = f.readlines()
+
+    def _set(key, val, lines):
+        for i, line in enumerate(lines):
+            if line.startswith(f"{key}=") or line.startswith(f"# {key}="):
+                lines[i] = f"{key}={val}\n"
+                return lines
+        lines.append(f"{key}={val}\n")
+        return lines
+
+    lines = _set("OLYMPUSREPO_RELAY_ENABLED",  enabled,       lines)
+    lines = _set("OLYMPUSREPO_INSTANCE_NAME",  instance_name, lines)
+    lines = _set("OLYMPUSREPO_RELAYS",         relay_urls,    lines)
+
+    with open(env_path, "w") as f:
+        f.writelines(lines)
+
+    db.audit_log(conn, "relay_config_save", user_id=user["user_id"],
+                 details={"enabled": enabled, "relay_urls": relay_urls})
+
+    return RedirectResponse("/zeus/relay?saved=1", status_code=303)
 
 
 # =========================================================================

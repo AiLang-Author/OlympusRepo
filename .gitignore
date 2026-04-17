@@ -3,3 +3,13 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Relay
+relay.db
+relay/*.db
+
+# Instance identity (contains private key — never commit)
+.olympusrepo/
+
+# Environment (contains secrets)
+.env

@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block title %}Relay Config — OlympusRepo{% endblock %}
+
+{% block extra_css %}
+<style>
+main {
+    background:
+        linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+        url('/static/throne-room.png') center center / cover no-repeat fixed;
+}
+.relay-status { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; }
+.relay-ok     { background:#3fb950; }
+.relay-down   { background:#f85149; }
+.id-box       { font-family:monospace; font-size:0.78em; color:#8b949e; word-break:break-all; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+
+    <div class="row-between" style="margin-bottom:24px;">
+        <h1 style="margin-bottom:0;">⚡ Relay Configuration</h1>
+        <a href="/zeus" class="btn">&larr; The Throne</a>
+    </div>
+
+    {% if request.query_params.get('saved') %}
+    <div class="card" style="border-color:#3fb950; color:#3fb950; margin-bottom:16px; padding:12px 16px;">
+        ✓ Relay configuration saved and applied.
+    </div>
+    {% endif %}
+
+    <!-- IDENTITY -->
+    <div class="card" style="margin-bottom:24px;">
+        <h2 style="margin-top:0;">Instance Identity</h2>
+        <table style="width:100%;">
+            <tr>
+                <td style="color:#8b949e; width:160px;">Instance ID</td>
+                <td class="id-box">{{ identity.instance_id }}</td>
+            </tr>
+            <tr>
+                <td style="color:#8b949e;">Human Name</td>
+                <td>{{ identity.human_name }}</td>
+            </tr>
+            <tr>
+                <td style="color:#8b949e;">Created</td>
+                <td class="card-meta">{{ identity.created_at }}</td>
+            </tr>
+            <tr>
+                <td style="color:#8b949e;">Clone URI</td>
+                <td class="id-box">olympus://{{ identity.instance_id }}/<em>repo-name</em></td>
+            </tr>
+        </table>
+    </div>
+
+    <!-- RELAY STATUS -->
+    <div class="card" style="margin-bottom:24px;">
+        <h2 style="margin-top:0;">Relay Status</h2>
+
+        {% if not relay_enabled %}
+        <div style="color:#f85149; margin-bottom:12px;">
+            ⚠ Relay registration is disabled (OLYMPUSREPO_RELAY_ENABLED=0).
+            This instance is not discoverable via <code>olympus://</code> URIs.
+        </div>
+        {% endif %}
+
+        {% if relay_statuses %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Relay URL</th>
+                    <th>Status</th>
+                    <th>Instances</th>
+                    <th>This Instance</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for s in relay_statuses %}
+            <tr>
+                <td><code>{{ s.url }}</code></td>
+                <td>
+                    {% if s.reachable %}
+                        <span class="relay-status relay-ok"></span>Reachable
+                    {% else %}
+                        <span class="relay-status relay-down"></span>Unreachable
+                    {% endif %}
+                </td>
+                <td>{{ s.instances if s.instances is not none else '—' }}</td>
+                <td>
+                    {% if s.url in registered_on %}
+                        <span style="color:#3fb950;">✓ Registered</span>
+                    {% elif s.reachable %}
+                        <span style="color:#f85149;">✗ Not registered</span>
+                        <span class="card-meta"> (heartbeat pending)</span>
+                    {% else %}
+                        <span style="color:#8b949e;">—</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div style="color:#8b949e;">No relays configured.</div>
+        {% endif %}
+    </div>
+
+    <!-- CONFIGURE -->
+    <div class="card">
+        <h2 style="margin-top:0;">Configure</h2>
+        <form method="post" action="/zeus/relay/save">
+
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" name="relay_enabled"
+                           {% if relay_enabled %}checked{% endif %}
+                           style="margin-right:8px;">
+                    Enable relay registration
+                </label>
+                <div class="card-meta" style="margin-top:4px; margin-left:20px;">
+                    When enabled, this instance registers with configured relays every 5 minutes
+                    and is discoverable via <code>olympus://</code> URIs.
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>Instance Name</label>
+                <input type="text" name="instance_name"
+                       value="{{ identity.human_name }}"
+                       placeholder="My Olympus">
+                <div class="card-meta">Shown in relay instance lists.</div>
+            </div>
+
+            <div class="form-group">
+                <label>Relay URLs</label>
+                <input type="text" name="relay_urls"
+                       value="{{ relay_urls | join(',') }}"
+                       placeholder="http://localhost:9000,https://relay1.olympus.community">
+                <div class="card-meta">
+                    Comma-separated. Leave blank to use bootstrap relays only.
+                    If running a local relay on this machine, add
+                    <code>http://localhost:9000</code> first.
+                </div>
+            </div>
+
+            <button type="submit" class="btn btn-primary">Save &amp; Apply</button>
+            <span class="card-meta" style="margin-left:12px;">
+                Changes take effect immediately — no restart needed.
+            </span>
+        </form>
+    </div>
+
+    <!-- LOCAL RELAY -->
+    {% if 'localhost' in (relay_urls | join(',')) %}
+    <div class="card" style="margin-top:24px; border-color:#9e6a03;">
+        <h2 style="margin-top:0; color:#e3b341;">Local Relay Node</h2>
+        <p style="color:#8b949e;">
+            A local relay is configured. Start it with:
+        </p>
+        <pre style="background:#0d1117; padding:12px; border-radius:4px; color:#c9d1d9;">./start-relay.sh</pre>
+        <p style="color:#8b949e; margin-bottom:0;">
+            Or manually:
+            <code>olympusrelay --port 9000 --id "{{ identity.human_name }}-relay"</code>
+        </p>
+    </div>
+    {% endif %}
+
+</div>
+{% endblock %}

@@ -15,6 +15,7 @@ import base64
 import json as json_mod
 
 from .core import db, objects, worktree, repo, diff, repo_setup
+from .relay_bootstrap import get_relay_list
 
 
 def cmd_init(args):
@@ -113,6 +114,8 @@ def cmd_commit(args):
     repo_root = worktree.find_repo_root()
     if not repo_root:
         print("ERROR: Not in a repository.")
+        print("  Run from inside a repo directory, e.g.:")
+        print("    cd olympusrepo-source && olympusrepo fsck")
         return 1
 
     config = worktree.load_config(repo_root)
@@ -418,8 +421,99 @@ def _blob_exists_local(repo_root: str, obj_hash: str) -> bool:
     return objects.exists(obj_hash, objects_dir)
 
 
+def _resolve_olympus_uri(uri: str) -> str:
+    """
+    Resolve an olympus:// URI to an http:// URL.
+
+    Format:  olympus://<instance_id>/<repo_name>
+    Example: olympus://428d8f944604e1ab.../olympusrepo-source
+             → http://172.19.176.76:8000/repo/olympusrepo-source
+
+    Steps:
+      1. Parse instance_id and repo_name from URI
+      2. Query each known relay for the instance
+      3. Verify the returned record's public_key matches instance_id
+      4. Return http://ip:port/repo/<repo_name>
+
+    Raises ValueError with a clear message if resolution fails.
+    """
+    # Strip scheme
+    rest = uri[len("olympus://"):]
+    if "/" not in rest:
+        raise ValueError(
+            f"Invalid olympus:// URI — expected olympus://<instance_id>/<repo>\n"
+            f"  Got: {uri}"
+        )
+
+    instance_id, repo_name = rest.split("/", 1)
+    repo_name = repo_name.strip("/")
+
+    if len(instance_id) != 64:
+        raise ValueError(
+            f"Invalid instance_id in URI — expected 64 hex chars, got {len(instance_id)}\n"
+            f"  URI: {uri}"
+        )
+
+    relays = get_relay_list()
+    last_error = "No relays reachable."
+
+    for relay_url in relays:
+        try:
+            import urllib.request as _ur
+            import json as _json
+            req = _ur.Request(
+                relay_url.rstrip("/") + f"/relay/find/{instance_id}",
+                headers={"Accept": "application/json"},
+            )
+            with _ur.urlopen(req, timeout=5) as resp:
+                data = _json.loads(resp.read())
+
+            if "ip" not in data:
+                last_error = f"Instance not found on {relay_url}"
+                continue
+
+            # Verify public_key matches instance_id
+            # (instance_id IS the public key hex — they must be identical)
+            returned_pubkey = data.get("public_key", "")
+            if returned_pubkey != instance_id:
+                last_error = (
+                    f"Relay {relay_url} returned mismatched public key!\n"
+                    f"  Expected: {instance_id}\n"
+                    f"  Got:      {returned_pubkey}\n"
+                    f"  Refusing to connect — possible relay compromise."
+                )
+                print(f"WARNING: {last_error}")
+                continue
+
+            ip   = data["ip"]
+            port = data["port"]
+            url  = f"http://{ip}:{port}/repo/{repo_name}"
+            print(f"  Resolved {instance_id[:16]}... → {ip}:{port}")
+            return url
+
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    raise ValueError(
+        f"Could not resolve olympus://{instance_id[:16]}.../{repo_name}\n"
+        f"  Last error: {last_error}\n"
+        f"  Tried relays: {relays}"
+    )
+
+
 def cmd_clone(args):
     """Clone a repository from a remote OlympusRepo instance."""
+    
+    # ── Resolve olympus:// URI if needed ─────────────────────────────────
+    if args.url.startswith("olympus://"):
+        try:
+            args.url = _resolve_olympus_uri(args.url)
+            print(f"  Relay resolved → {args.url}")
+        except ValueError as e:
+            print(f"ERROR: {e}")
+            return 1
+
     url = args.url.rstrip("/")
     
     # Parse: http://host:port/repo/name  OR  http://host:port
@@ -845,6 +939,92 @@ def cmd_offer(args):
         conn.close()
 
 
+def cmd_fsck(args):
+    """Check repository integrity."""
+    repo_root = worktree.find_repo_root()
+    if not repo_root:
+        print("ERROR: Not in a repository.")
+        return 1
+
+    config = worktree.load_config(repo_root)
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(repo_root, ".olympusrepo", "objects")
+    )
+
+    from .core import fsck as fsck_mod
+
+    conn = db.connect()
+    try:
+        print(f"Checking '{config.get('repo_name', '?')}'...")
+        results = fsck_mod.check(conn, config["repo_id"], objects_dir)
+        ok = True
+
+        if results["missing_blobs"]:
+            ok = False
+            print(f"\n  MISSING BLOBS ({len(results['missing_blobs'])}):")
+            for commit_hash, path, blob_hash in results["missing_blobs"]:
+                print(f"    {commit_hash[:12]}  {path}")
+                print(f"      blob: {blob_hash}")
+            print("\n  Pull from canonical to re-fetch missing blobs.")
+
+        if results["null_blob_after"]:
+            ok = False
+            print(f"\n  NULL BLOB_AFTER ON NON-DELETE ({len(results['null_blob_after'])}):")
+            for commit_hash, path in results["null_blob_after"]:
+                print(f"    {commit_hash[:12]}  {path}")
+
+        if results["orphaned_blobs"]:
+            total_bytes = sum(
+                objects.object_size(h, objects_dir)
+                for h in results["orphaned_blobs"]
+            )
+            print(f"\n  ORPHANED BLOBS: {len(results['orphaned_blobs'])} "
+                  f"({total_bytes / 1024:.1f} KB reclaimable)")
+            print("    Run 'olympusrepo prune' to remove them.")
+
+        if ok and not results["orphaned_blobs"]:
+            print("  OK — no problems found.")
+        elif ok:
+            print("\n  Repository is consistent (orphaned blobs are harmless).")
+
+        return 0 if ok else 1
+    finally:
+        conn.close()
+
+
+def cmd_prune(args):
+    """Remove unreferenced blobs from the object store."""
+    repo_root = worktree.find_repo_root()
+    if not repo_root:
+        print("ERROR: Not in a repository.")
+        print("  Run from inside a repo directory.")
+        return 1
+
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(repo_root, ".olympusrepo", "objects")
+    )
+
+    from .core import fsck as fsck_mod
+
+    conn = db.connect()
+    try:
+        dry_run = not getattr(args, "force", False)
+        count = fsck_mod.prune(conn, objects_dir, dry_run=dry_run)
+        if dry_run:
+            if count == 0:
+                print("Nothing to prune.")
+            else:
+                print(f"Would remove {count} orphaned object(s).")
+                print("Run 'olympusrepo prune --force' to delete.")
+        else:
+            print(f"Pruned {count} orphaned object(s).")
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_import_git(args):
     """Import a git repository into OlympusRepo."""
     from .core import import_git as ig
@@ -1051,6 +1231,16 @@ def main():
                    choices=["zeus", "olympian", "titan", "mortal", "prometheus", "hermes"])
     p.add_argument("--full-name")
 
+    # fsck
+    p = sub.add_parser("fsck", help="Check repository integrity")
+    p.add_argument("--fix", action="store_true",
+                   help="Attempt to repair fixable issues (reserved)")
+
+    # prune
+    p = sub.add_parser("prune", help="Remove unreferenced blobs from object store")
+    p.add_argument("--force", action="store_true",
+                   help="Actually delete (default is dry-run)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1074,6 +1264,8 @@ def main():
         "import-git": cmd_import_git,
         "delete-repo": cmd_delete_repo,
         "user-create": cmd_user_create,
+        "fsck": cmd_fsck,
+        "prune": cmd_prune,
     }
 
     handler = commands.get(args.command)

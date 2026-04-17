@@ -194,35 +194,29 @@ echo ""
 # =============================================================================
 # STEP 3 — Database setup
 # =============================================================================
-divider
-echo -e "${BOLD}  STEP 3 — Database${RESET}"
-divider
-
-  if [[ -z "$ZEUS_PASS" ]]; then
-    while true; do
-      echo -n "  Zeus secret (min 8 chars): "
-      read -r ZEUS_SECRET_INPUT
-
-      if [[ ${#ZEUS_SECRET_INPUT} -lt 8 ]]; then
-        warn "Input too short. Try again."
-        continue
-      fi
-
-      echo -n "  Confirm secret: "
-      read -r ZEUS_SECRET_INPUT2
-
-      if [[ "$ZEUS_SECRET_INPUT" != "$ZEUS_SECRET_INPUT2" ]]; then
-        warn "Inputs do not match. Try again."
-        continue
-      fi
-
-      # ONLY NOW do we assign it to the actual password variable
-      ZEUS_PASS="$ZEUS_SECRET_INPUT"
-      break
-    done
-  else
-    info "Using Zeus password provided via arguments."
+# DB password
+ask "PostgreSQL password for user '${DB_USER}':"
+while [[ -z "$DB_PASS" ]]; do
+  read -rp "  Password (min 8 chars): " DB_PASS; echo ""
+  if [[ ${#DB_PASS} -lt 8 ]]; then
+    warn "Password too short. Try again."; DB_PASS=""
   fi
+done
+read -rp "  Confirm password: " DB_PASS2; echo ""
+if [[ "$DB_PASS" != "$DB_PASS2" ]]; then
+  warn "Passwords do not match. Try again."
+  DB_PASS=""
+  while [[ -z "$DB_PASS" ]]; do
+    read -rp "  Password (min 8 chars): " DB_PASS; echo ""
+    if [[ ${#DB_PASS} -lt 8 ]]; then
+      warn "Password too short. Try again."; DB_PASS=""
+      continue
+    fi
+    read -rp "  Confirm password: " DB_PASS2; echo ""
+    [[ "$DB_PASS" == "$DB_PASS2" ]] && break
+    warn "Passwords do not match. Try again."; DB_PASS=""
+  done
+fi
 
 # Custom DB settings?
 read -rp "  Use defaults? (db=${DB_NAME}, user=${DB_USER}, host=${DB_HOST}, port=${DB_PORT}) [Y/n]: " db_defaults
@@ -351,10 +345,10 @@ echo ""
 
 # =============================================================================
 # STEP 6 — Zeus account
+# Replace the existing Zeus account block in setup.sh with this.
+# The function call is wrapped in a DO block so it never prints a
+# warning to the user regardless of whether repo_create_user exists.
 # =============================================================================
-divider
-echo -e "${BOLD}  STEP 6 — Zeus Account${RESET}"
-divider
 
 if [[ "$MODE" != "contributor" ]]; then
   ask "Create your Zeus (admin) account:"
@@ -389,37 +383,151 @@ if [[ "$MODE" != "contributor" ]]; then
     info "Using Zeus password provided via arguments."
   fi
 
-  # Create zeus user via psql function, deactivate default zeus
-  PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
-    -c "SELECT repo_create_user('${ZEUS_USER}', '${ZEUS_PASS}', 'zeus');" > /dev/null 2>&1 \
-    || warn "Could not create Zeus via function — will update via direct INSERT fallback."
+  # Single SQL block — tries the helper function first, falls back to
+  # direct INSERT. All output suppressed. No warning ever reaches stdout.
+  PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" \
+    -U "$DB_USER" -d "$DB_NAME" -q \
+    --tuples-only --no-align \
+    << SQL > /dev/null 2>&1
+DO \$\$
+DECLARE
+  _user TEXT := '${ZEUS_USER}';
+  _pass TEXT := '${ZEUS_PASS}';
+BEGIN
+  -- Try the helper function (exists after migrations run)
+  BEGIN
+    PERFORM repo_create_user(_user, _pass, 'zeus');
+  EXCEPTION WHEN undefined_function THEN
+    -- Function not available yet — fall through to direct insert
+    NULL;
+  END;
 
-  # Fallback: direct insert (function may not exist yet depending on migration order)
-  PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" << SQL > /dev/null 2>&1
-INSERT INTO repo_users (username, password_hash, role, is_active)
-VALUES (
-  '${ZEUS_USER}',
-  crypt('${ZEUS_PASS}', gen_salt('bf', 12)),
-  'zeus',
-  TRUE
-) ON CONFLICT (username) DO UPDATE
-  SET password_hash = crypt('${ZEUS_PASS}', gen_salt('bf', 12)),
-      role = 'zeus',
-      is_active = TRUE;
--- Deactivate the default 'zeus' seed account
-UPDATE repo_users SET is_active = FALSE WHERE username = 'zeus' AND username != '${ZEUS_USER}';
+  -- Upsert directly regardless (idempotent — ensures correct role+hash)
+  INSERT INTO repo_users (username, password_hash, role, is_active)
+  VALUES (
+    _user,
+    crypt(_pass, gen_salt('bf', 12)),
+    'zeus',
+    TRUE
+  )
+  ON CONFLICT (username) DO UPDATE
+    SET password_hash = crypt(_pass, gen_salt('bf', 12)),
+        role          = 'zeus',
+        is_active     = TRUE;
+
+  -- Deactivate the default seed account if it's different from the new Zeus
+  UPDATE repo_users
+     SET is_active = FALSE
+   WHERE username = 'zeus'
+     AND username <> _user;
+END;
+\$\$;
 SQL
-  success "Zeus account '${ZEUS_USER}' created"
+
+  # Check if it worked by querying the user
+  USER_CHECK=$(PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" \
+    -U "$DB_USER" -d "$DB_NAME" -tAq \
+    -c "SELECT username FROM repo_users WHERE username='${ZEUS_USER}' AND is_active=TRUE;" \
+    2>/dev/null)
+
+  if [[ "$USER_CHECK" == "$ZEUS_USER" ]]; then
+    success "Zeus account '${ZEUS_USER}' created"
+  else
+    error "Could not create Zeus account '${ZEUS_USER}'. Check DB connection and run migrations first."
+  fi
+
 else
   info "Contributor mode — skipping Zeus account setup."
 fi
+
+# =============================================================================
+# STEP 7 — Relay configuration
+# =============================================================================
+divider
+echo -e "${BOLD}  STEP 7 — OlympusRelay${RESET}"
+divider
+
+RELAY_ENABLED_VAL="1"
+RELAY_URLS=""
+INSTANCE_NAME="$(hostname)"
+RUN_LOCAL_RELAY="n"
+LOCAL_RELAY_PORT="9000"
+
+if [[ "$MODE" != "contributor" ]]; then
+  ask "Relay configuration (enables olympus:// URIs and decentralized discovery):"
+
+  read -rp "  Enable relay registration? [Y/n]: " relay_enable
+  if [[ "${relay_enable:-Y}" =~ ^[Nn]$ ]]; then
+    RELAY_ENABLED_VAL="0"
+    info "Relay disabled. Running in fully private mode."
+  else
+    # Instance name
+    read -rp "  Instance name (shown in relay list) [$INSTANCE_NAME]: " inp
+    INSTANCE_NAME="${inp:-$INSTANCE_NAME}"
+
+    # Run a local relay?
+    read -rp "  Run a relay node on this instance? [y/N]: " run_relay
+    if [[ "${run_relay:-N}" =~ ^[Yy]$ ]]; then
+      RUN_LOCAL_RELAY="y"
+      read -rp "  Relay port [9000]: " inp
+      LOCAL_RELAY_PORT="${inp:-9000}"
+
+      # Install relay package
+      info "Installing olympusrelay..."
+      if [[ -d "relay" ]]; then
+        $PIP_CMD install -q -e relay/
+        success "olympusrelay installed"
+
+        # Write start-relay.sh
+        cat > start-relay.sh << RELAYSH
+#!/usr/bin/env bash
+# Start OlympusRelay
+# Generated by setup.sh
+cd "$(pwd)"
+source .venv/bin/activate 2>/dev/null || true
+set -a; source .env 2>/dev/null; set +a
+exec olympusrelay --port ${LOCAL_RELAY_PORT} --id "${INSTANCE_NAME}-relay"
+RELAYSH
+        chmod +x start-relay.sh
+        success "start-relay.sh written — run it to start your relay node"
+
+        # Local relay is the first in the list
+        RELAY_URLS="http://localhost:${LOCAL_RELAY_PORT}"
+      else
+        warn "relay/ directory not found — skipping olympusrelay install."
+        warn "Run 'pip install -e relay/' manually after setup."
+      fi
+    fi
+
+    # Additional relay URLs
+    if [[ "$RUN_LOCAL_RELAY" == "y" ]]; then
+      read -rp "  Add community/peer relay URLs? (comma-separated, blank to skip): " extra_relays
+      if [[ -n "$extra_relays" ]]; then
+        RELAY_URLS="${RELAY_URLS},${extra_relays}"
+      fi
+    else
+      echo "  Community bootstrap relays will be used by default."
+      echo "  Add your own: https://relay1.olympus.community (best-effort)"
+      read -rp "  Custom relay URLs? (comma-separated, blank for bootstrap): " custom_relays
+      RELAY_URLS="${custom_relays:-}"
+    fi
+
+    success "Relay configured"
+  fi
+else
+  # Contributor mode — ask for relay URL to find canonical
+  read -rp "  Relay URL for discovering instances (blank to skip): " contrib_relay
+  RELAY_URLS="${contrib_relay:-}"
+  [[ -n "$RELAY_URLS" ]] && success "Relay URL: $RELAY_URLS" || info "No relay configured."
+fi
+
 echo ""
 
 # =============================================================================
-# STEP 7 — Network / connectivity
+# STEP 8 — Network / connectivity
 # =============================================================================
 divider
-echo -e "${BOLD}  STEP 7 — Network${RESET}"
+echo -e "${BOLD}  STEP 8 — Network${RESET}"
 divider
 
 if [[ "$MODE" == "personal" ]]; then
@@ -534,10 +642,10 @@ fi
 echo ""
 
 # =============================================================================
-# STEP 8 — Write .env file
+# STEP 9 — Write .env file
 # =============================================================================
 divider
-echo -e "${BOLD}  STEP 8 — Writing .env${RESET}"
+echo -e "${BOLD}  STEP 9 — Writing .env${RESET}"
 divider
 
 INSTALL_ABS="$(cd "$INSTALL_DIR" && pwd)"
@@ -567,6 +675,11 @@ OLYMPUSREPO_OBJECTS_DIR=${OBJECTS_DIR}
 
 # Security (set to 1 if behind HTTPS reverse proxy)
 OLYMPUSREPO_COOKIE_SECURE=0
+
+# Relay
+OLYMPUSREPO_RELAY_ENABLED=${RELAY_ENABLED_VAL}
+OLYMPUSREPO_INSTANCE_NAME=${INSTANCE_NAME}
+OLYMPUSREPO_RELAYS=${RELAY_URLS}
 EOF
 
 success ".env written (objects dir: ${OBJECTS_DIR})"
@@ -602,7 +715,7 @@ fi
 echo ""
 
 # =============================================================================
-# STEP 9 — Update instance_url in DB + run cascade migrations
+# STEP 10 — Update instance_url in DB + run cascade migrations
 # =============================================================================
 PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
   -c "UPDATE repo_server_config SET value='${PUBLIC_URL}' WHERE key='instance_url';" > /dev/null 2>&1 || true
@@ -617,11 +730,11 @@ ALTER TABLE repo_offers ALTER COLUMN base_rev DROP NOT NULL;
 SQL
 
 # =============================================================================
-# STEP 10 — Contributor remote config
+# STEP 11 — Contributor remote config
 # =============================================================================
 if [[ "$MODE" == "contributor" ]]; then
   divider
-  echo -e "${BOLD}  STEP 10 — Contributor Remote${RESET}"
+  echo -e "${BOLD}  STEP 11 — Contributor Remote${RESET}"
   divider
   info "To start offering changes, clone a repo and add your canonical remote:"
   echo ""
@@ -632,7 +745,7 @@ if [[ "$MODE" == "contributor" ]]; then
 fi
 
 # =============================================================================
-# STEP 11 — Final summary
+# STEP 12 — Final summary
 # =============================================================================
 divider
 echo ""
