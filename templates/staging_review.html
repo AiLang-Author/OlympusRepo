@@ -213,7 +213,7 @@
             <div class="form-group">
                 <label for="promote-notes">Review Notes</label>
                 <textarea id="promote-notes" style="min-height:80px;"
-                          placeholder="What did you review? Why are you approving this?"></textarea>
+                          placeholder="What did you review? Why are you approving this? (required)"></textarea>
             </div>
             <div class="row">
                 <button id="confirm-promote-btn" class="btn btn-gold">
@@ -238,7 +238,8 @@
         try {
             var res = await fetch(
                 '/api/repos/' + encodeURIComponent(repoName) +
-                '/staging/' + stagingId + '/diff'
+                '/staging/' + stagingId + '/diff',
+                { credentials: 'include' }
             );
             if (!res.ok) throw new Error('Failed to load diffs');
             var diffs = await res.json();
@@ -335,6 +336,11 @@
             var btn   = this;
             var notes = document.getElementById('promote-notes').value.trim();
 
+            if (!notes) {
+                alert('Review notes are required before promoting');
+                return;
+            }
+
             btn.disabled = true;
             btn.textContent = 'Promoting...';
 
@@ -344,7 +350,7 @@
                 var res = await fetch(
                     '/api/repos/' + encodeURIComponent(repoName) +
                     '/promote/' + stagingId,
-                    { method: 'POST', body: form }
+                    { method: 'POST', body: form, credentials: 'include' }
                 );
                 if (res.ok) {
                     var data = await res.json();

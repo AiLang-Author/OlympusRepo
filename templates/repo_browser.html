@@ -9,6 +9,39 @@
             url('/static/{% if tab == "mana" %}chat-room{% elif tab == "commits" %}commit-room{% elif tab == "staging" %}offering-room{% else %}repo-room{% endif %}.png')
             center center / cover no-repeat fixed;
     }
+
+    /* File Tree */
+    .tree-row {
+        display: flex;
+        align-items: center;
+        padding: 8px 16px;
+        border-bottom: 1px solid #21262d;
+    }
+    .tree-row:last-child {
+        border-bottom: none;
+    }
+    .tree-row:hover {
+        background: #21262d;
+    }
+    .tree-folder {
+        cursor: pointer;
+        user-select: none;
+        background: #161b22;
+        font-weight: 600;
+    }
+    .tree-icon {
+        width: 24px;
+        text-align: center;
+        margin-right: 8px;
+        display: inline-block;
+    }
+    .tree-item-name { flex: 1; }
+    .tree-item-size {
+        color: #8b949e;
+        font-size: 0.9em;
+        text-align: right;
+        min-width: 80px;
+    }
 </style>
 {% endblock %}
 
@@ -109,10 +142,11 @@
         <h2>Commit History</h2>
         {% if commits %}
             {% for c in commits %}
-            <div class="card">
+            <a href="/repo/{{ repo.name }}/commit/{{ c.commit_hash }}" style="text-decoration:none;">
+            <div class="card" style="cursor:pointer;">
                 <div class="card-header">
                     <span>
-                        <span style="color:#f0f6fc; font-weight:600;">rev {{ c.rev }}</span>
+                        <span style="color:#f0f6fc; font-weight:600;">rev {{ c.rev if c.rev else "—" }}</span>
                         <span class="hash" style="margin-left:8px;">{{ c.commit_hash[:12] }}</span>
                     </span>
                     <span class="card-meta">
@@ -120,8 +154,12 @@
                     </span>
                 </div>
                 <p style="margin:4px 0;">{{ c.message }}</p>
-                <div class="card-meta">{{ c.author_name }}</div>
+                <div class="card-meta" style="display:flex; justify-content:space-between;">
+                    <span>{{ c.author_name }}</span>
+                    <span style="color:#58a6ff; font-size:0.8em;">View details →</span>
+                </div>
             </div>
+            </a>
             {% endfor %}
         {% else %}
             <div class="empty-state"><p>No commits yet.</p></div>
@@ -189,6 +227,11 @@
                     <span class="row">
                         <span class="badge" style="background:#1f6feb; color:#fff;">{{ s.change_count }} changes</span>
                         {% if user and user.role in ('zeus', 'olympian') %}
+                            <a href="/repo/{{ repo.name }}/staging/{{ s.staging_id }}/review"
+                               class="btn"
+                               style="padding:4px 10px; font-size:0.8em;">
+                                Review Diff
+                            </a>
                             <button class="btn btn-gold promote-btn"
                                     data-staging-id="{{ s.staging_id }}"
                                     style="padding:4px 10px; font-size:0.8em;">
@@ -254,20 +297,7 @@
         {% endif %}
 
         {% if files %}
-            <table>
-                <thead>
-                    <tr><th>Name</th><th>Type</th><th>Size</th></tr>
-                </thead>
-                <tbody>
-                    {% for f in files %}
-                    <tr>
-                        <td><a href="/repo/{{ repo.name }}/blob/{{ current_branch }}/{{ f.path }}">{{ f.path }}</a></td>
-                        <td style="color:#8b949e;">{{ f.type }}</td>
-                        <td style="color:#8b949e;">{{ f.size }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+            <div id="file-tree-container" class="card" style="padding:0; overflow:hidden;"></div>
         {% else %}
             <div class="empty-state">
                 <p>No files yet.</p>
@@ -289,6 +319,8 @@ olympusrepo commit -m "Initial commit"</pre>
 <script>
 (function() {
     var repoName = {{ repo.name | tojson }};
+    var currentBranch = {{ current_branch | default('main') | tojson }};
+    var filesData = {{ files | default([]) | tojson }};
 
     // Mana WebSocket
     var manaChannel = 'repo-' + repoName;
@@ -333,6 +365,96 @@ olympusrepo commit -m "Initial commit"</pre>
             .replace(/</g,'&lt;')
             .replace(/>/g,'&gt;')
             .replace(/"/g,'&quot;');
+    }
+
+    // File Tree Render
+    function renderFileTree() {
+        var container = document.getElementById('file-tree-container');
+        if (!container || !filesData || filesData.length === 0) return;
+
+        var tree = { name: '', children: {}, files: [] };
+        filesData.forEach(function(f) {
+            var parts = f.path.split('/');
+            var fileName = parts.pop();
+            var current = tree;
+            parts.forEach(function(part) {
+                if (!current.children[part]) {
+                    current.children[part] = { name: part, children: {}, files: [] };
+                }
+                current = current.children[part];
+            });
+            f.name = fileName;
+            current.files.push(f);
+        });
+
+        function getFileIcon(filename) {
+            var parts = filename.split('.');
+            if (parts.length > 1) {
+                var ext = parts.pop().toLowerCase();
+                if (ext === 'py') return '🐍';
+                if (ext === 'md') return '📝';
+                if (ext === 'sql') return '🗄️';
+                if (ext === 'html' || ext === 'htm') return '🌐';
+            }
+            return '📄';
+        }
+
+        var folderCounter = 0;
+        function buildHtml(node, depth) {
+            var html = '';
+            var indent = depth * 20;
+
+            var folderNames = Object.keys(node.children).sort();
+            folderNames.forEach(function(folderName) {
+                var childNode = node.children[folderName];
+                var folderId = 'folder-' + (++folderCounter);
+
+                html += '<div class="tree-row tree-folder" onclick="toggleFolder(\'' + folderId + '\', this)">' +
+                        '<span style="display:inline-block; width:' + indent + 'px"></span>' +
+                        '<span class="tree-icon toggle-icon" style="color:#8b949e; font-size:0.8em;">▼</span>' +
+                        '<span class="tree-icon">📁</span>' +
+                        '<span class="tree-item-name">' + escapeHtml(folderName) + '</span>' +
+                        '</div>';
+
+                html += '<div id="' + folderId + '" style="display:block;">';
+                html += buildHtml(childNode, depth + 1);
+                html += '</div>';
+            });
+
+            node.files.sort(function(a, b) { return a.name.localeCompare(b.name); });
+            node.files.forEach(function(f) {
+                var href = '/repo/' + encodeURIComponent(repoName) + '/blob/' + 
+                           encodeURIComponent(currentBranch) + '/' + 
+                           f.path.split('/').map(encodeURIComponent).join('/');
+                html += '<div class="tree-row">' +
+                        '<span style="display:inline-block; width:' + indent + 'px"></span>' +
+                        '<span class="tree-icon" style="opacity:0;"></span>' + 
+                        '<span class="tree-icon">' + getFileIcon(f.name) + '</span>' +
+                        '<span class="tree-item-name"><a href="' + href + '">' + escapeHtml(f.name) + '</a></span>' +
+                        '<span class="tree-item-size">' + escapeHtml(f.size || '') + '</span>' +
+                        '</div>';
+            });
+
+            return html;
+        }
+
+        container.innerHTML = buildHtml(tree, 0);
+    }
+
+    window.toggleFolder = function(folderId, el) {
+        var content = document.getElementById(folderId);
+        var icon = el.querySelector('.toggle-icon');
+        if (content.style.display === 'none') {
+            content.style.display = 'block';
+            icon.textContent = '▼';
+        } else {
+            content.style.display = 'none';
+            icon.textContent = '▶';
+        }
+    };
+
+    if (document.getElementById('file-tree-container')) {
+        renderFileTree();
     }
 
     // Only connect on mana tab

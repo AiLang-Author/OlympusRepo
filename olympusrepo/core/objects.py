@@ -18,7 +18,10 @@ import os
 from pathlib import Path
 
 
-DEFAULT_OBJECTS_DIR = "objects"
+DEFAULT_OBJECTS_DIR = os.environ.get(
+    "OLYMPUSREPO_OBJECTS_DIR",
+    os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+)
 
 
 def hash_content(content: bytes) -> str:

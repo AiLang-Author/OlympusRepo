@@ -429,6 +429,9 @@ def commit_files(conn, repo_id: int, user_id: int, message: str,
 
         conn.commit()
 
+        # Snapshot committed state for diff/status
+        worktree.save_committed_index(repo_root, tree_entries)
+
     except Exception:
         conn.rollback()
         raise

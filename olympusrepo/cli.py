@@ -14,7 +14,7 @@ import urllib.error
 import base64
 import json as json_mod
 
-from .core import db, objects, worktree, repo, diff
+from .core import db, objects, worktree, repo, diff, repo_setup
 
 
 def cmd_init(args):
@@ -47,9 +47,14 @@ def cmd_init(args):
             "user": user["username"],
             "user_id": user["user_id"],
         })
+        
+        repo_setup.init_instance_user(conn)
 
         # Create local objects directory
-        objects_dir = os.path.join(repo_root, ".olympusrepo", "objects")
+        objects_dir = os.environ.get(
+            "OLYMPUSREPO_OBJECTS_DIR",
+            os.path.join(repo_root, ".olympusrepo", "objects")
+        )
         os.makedirs(objects_dir, exist_ok=True)
 
         print(f"  Local directory: {repo_root}")
@@ -67,7 +72,10 @@ def cmd_add(args):
         print("  Run 'olympusrepo init <name>' first.")
         return 1
 
-    objects_dir = os.path.join(repo_root, ".olympusrepo", "objects")
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(repo_root, ".olympusrepo", "objects")
+    )
 
     targets = args.files or ["."]
 
@@ -108,7 +116,10 @@ def cmd_commit(args):
         return 1
 
     config = worktree.load_config(repo_root)
-    objects_dir = os.path.join(repo_root, ".olympusrepo", "objects")
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(repo_root, ".olympusrepo", "objects")
+    )
 
     conn = db.connect()
     try:
@@ -140,7 +151,10 @@ def cmd_status(args):
         print("ERROR: Not in a repository.")
         return 1
 
-    objects_dir = os.path.join(repo_root, ".olympusrepo", "objects")
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(repo_root, ".olympusrepo", "objects")
+    )
     changes = worktree.detect_changes(repo_root, objects_dir)
 
     branch = worktree.get_current_branch(repo_root)
@@ -206,7 +220,10 @@ def cmd_diff(args):
         print("ERROR: Not in a repository.")
         return 1
 
-    objects_dir = os.path.join(repo_root, ".olympusrepo", "objects")
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(repo_root, ".olympusrepo", "objects")
+    )
     changes = worktree.detect_changes(repo_root, objects_dir)
 
     if not changes["modified"]:
@@ -354,7 +371,10 @@ def _post_json(url: str, payload: dict) -> dict:
 def _blob_exists_local(repo_root: str, obj_hash: str) -> bool:
     if not obj_hash:
         return True
-    objects_dir = os.path.join(repo_root, ".olympusrepo", "objects")
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(repo_root, ".olympusrepo", "objects")
+    )
     return objects.exists(obj_hash, objects_dir)
 
 
@@ -387,7 +407,10 @@ def cmd_clone(args):
 
     # Create local directory and init
     os.makedirs(dest, exist_ok=True)
-    objects_dir = os.path.join(dest, ".olympusrepo", "objects")
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(dest, ".olympusrepo", "objects")
+    )
 
     worktree.init_local(dest, {
         "repo_name":      info["repo_name"],
@@ -530,11 +553,12 @@ def cmd_clone(args):
             full_path = os.path.join(dest, fpath)
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             obj_store.retrieve_to_file(h, full_path, objects_dir)
+        # Committed index = same as staged after fresh clone
+        worktree.save_committed_index(dest, index)
 
         print(f"  {commits_applied} commit(s), {blobs_fetched} blob(s)")
         print(f"  Cloned into ./{dest}/")
-        print(f"  cd {dest}")
-        print(f"  olympusrepo status")
+        repo_setup.post_clone_setup(dest, base_url, conn, username=args.user)
         return 0
 
     except Exception as e:
@@ -598,7 +622,10 @@ def cmd_pull(args):
 
     remote_url = remotes[args.remote]["url"].rstrip("/")
     repo_name = config.get("repo_name")
-    objects_dir = os.path.join(repo_root, ".olympusrepo", "objects")
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(repo_root, ".olympusrepo", "objects")
+    )
 
     conn = db.connect()
     try:
@@ -707,7 +734,10 @@ def cmd_offer(args):
 
     remote_url = remotes[args.remote]["url"].rstrip("/")
     repo_name = config.get("repo_name")
-    objects_dir = os.path.join(repo_root, ".olympusrepo", "objects")
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(repo_root, ".olympusrepo", "objects")
+    )
 
     conn = db.connect()
     try:

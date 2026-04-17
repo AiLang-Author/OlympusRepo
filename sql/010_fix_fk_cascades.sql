@@ -73,3 +73,13 @@ ALTER TABLE repo_audit_log
         ON DELETE SET NULL;
 
 COMMIT;
+-- Allow NULL rev on slave commits (rev assigned by canonical at promotion)
+ALTER TABLE repo_commits ALTER COLUMN rev DROP NOT NULL;
+ALTER TABLE repo_commits ALTER COLUMN rev DROP DEFAULT;
+
+-- Allow NULL global_rev in file revisions (populated at promotion)
+ALTER TABLE repo_file_revisions ALTER COLUMN global_rev DROP NOT NULL;
+
+-- Allow NULL from_rev and base_rev on offers from slave instances
+ALTER TABLE repo_offers ALTER COLUMN from_rev DROP NOT NULL;
+ALTER TABLE repo_offers ALTER COLUMN base_rev DROP NOT NULL;

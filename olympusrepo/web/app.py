@@ -1235,7 +1235,18 @@ def blob_page(name: str, branch: str, path: str, request: Request,
          ORDER BY committed_at DESC
     """, (r["repo_id"], path))
 
-    objects_dir = os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    )
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    )
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    )
     from ..core import objects as obj_store
     content_bytes = obj_store.retrieve_blob(blob_hash, objects_dir)
     if content_bytes is None:
@@ -1271,14 +1282,15 @@ def commit_page(name: str, commit_hash: str, request: Request, conn=Depends(get_
         raise HTTPException(403)
 
     commit_row = db.query_one(conn, """
-        SELECT * FROM repo_commits WHERE commit_hash = %s AND repo_id = %s
-    """, (commit_hash, r["repo_id"]))
+        SELECT * FROM repo_commits 
+        WHERE commit_hash LIKE %s AND repo_id = %s
+    """, (commit_hash + '%', r["repo_id"]))
     if not commit_row:
         raise HTTPException(404, "Commit not found.")
 
     changesets = db.query(conn, """
         SELECT * FROM repo_changesets WHERE commit_hash = %s ORDER BY path
-    """, (commit_hash,))
+    """, (commit_row["commit_hash"],))
 
     branches = repo.get_branches(conn, r["repo_id"])
     return templates.TemplateResponse(request, "commit.html", {
@@ -1778,6 +1790,83 @@ def get_commit_comments(name: str, commit_hash: str,
            AND m.parent_id IS NULL
          ORDER BY m.created_at ASC
     """, (r["repo_id"], commit_hash))
+
+
+@app.get("/api/repos/{name}/commits/{commit_hash}/diff")
+def commit_diff_api(name: str, commit_hash: str, 
+                    request: Request, conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(403)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_visibility(conn, r["repo_id"], user["user_id"]):
+        raise HTTPException(403)
+
+    commit_row = db.query_one(conn, """
+        SELECT * FROM repo_commits WHERE commit_hash = %s AND repo_id = %s
+    """, (commit_hash, r["repo_id"]))
+    if not commit_row:
+        raise HTTPException(404)
+
+    changes = db.query(conn, """
+        SELECT path, change_type, blob_before, blob_after,
+               lines_added, lines_removed
+          FROM repo_changesets
+         WHERE commit_hash = %s ORDER BY path
+    """, (commit_hash,))
+
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    )
+    from ..core import objects as obj_store
+    from ..core import diff as diff_mod
+
+    result = []
+    for change in changes:
+        entry = {
+            "path":          change["path"],
+            "change_type":   change["change_type"],
+            "lines_added":   change["lines_added"],
+            "lines_removed": change["lines_removed"],
+            "diff":          None,
+            "is_binary":     False,
+        }
+
+        def get_content(blob_hash):
+            if not blob_hash:
+                return "", False
+            b = obj_store.retrieve_blob(blob_hash, objects_dir)
+            if b:
+                try:
+                    return b.decode("utf-8"), False
+                except UnicodeDecodeError:
+                    return None, True
+            return "", False
+
+        if change["change_type"] == "modify":
+            old_content, old_binary = get_content(change["blob_before"])
+            new_content, new_binary = get_content(change["blob_after"])
+            if old_binary or new_binary:
+                entry["is_binary"] = True
+            else:
+                entry["diff"] = diff_mod.diff_side_by_side(old_content, new_content)
+        elif change["change_type"] == "add":
+            new_content, is_binary = get_content(change["blob_after"])
+            entry["is_binary"] = is_binary
+            if not is_binary:
+                entry["diff"] = diff_mod.diff_side_by_side("", new_content)
+        elif change["change_type"] == "delete":
+            old_content, is_binary = get_content(change["blob_before"])
+            entry["is_binary"] = is_binary
+            if not is_binary:
+                entry["diff"] = diff_mod.diff_side_by_side(old_content, "")
+
+        result.append(entry)
+
+    return result
 
 
 # =========================================================================
@@ -2416,8 +2505,10 @@ def staging_diff_api(name: str, staging_id: int,
          WHERE staging_id = %s ORDER BY path
     """, (staging_id,))
 
-    objects_dir = os.path.join(
-        os.path.dirname(__file__), "..", "..", "objects")
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    )
     from ..core import objects as obj_store
     from ..core import diff as diff_mod
 
@@ -2538,6 +2629,9 @@ def promote_staging(name: str, staging_id: int,
                     request: Request,
                     notes: str = Form(""),
                     conn=Depends(get_db)):
+    if not notes or not notes.strip():
+        raise HTTPException(400, "Review notes are required")
+
     user = get_current_user(request, conn)
     if not user or user["role"] not in ("zeus", "olympian"):
         raise HTTPException(403)
@@ -2560,7 +2654,10 @@ def promote_staging(name: str, staging_id: int,
     if not changes:
         raise HTTPException(400, "No changes to promote.")
 
-    objects_dir = os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    )
     from ..core import objects as obj_store
     import time
 
