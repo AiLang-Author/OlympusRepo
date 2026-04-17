@@ -31,10 +31,10 @@
         {% for label, key, link in [
             ('Repositories', 'total_repos', '/zeus/repos'),
             ('Active Users', 'total_users', '/zeus/users'),
-            ('Total Commits', 'total_commits', '/zeus/repos'),
-            ('Promotions', 'total_promotions', '/zeus/audit'),
-            ('Active Staging', 'active_staging', '/zeus/repos'),
-            ('Commits Today', 'commits_today', '/zeus/audit')
+            ('Total Commits', 'total_commits', '/zeus/commits'),
+            ('Promotions', 'total_promotions', '/zeus/promotions'),
+            ('Active Staging', 'active_staging', '/zeus/staging'),
+            ('Commits Today', 'commits_today', '/zeus/commits?today=1')
         ] %}
         <a href="{{ link }}" class="card stat-card" style="text-align:center; padding:16px; display:block; text-decoration:none; color:inherit;">
             <div style="font-size:1.8em; font-weight:700; color:#f0f6fc;">

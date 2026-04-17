@@ -421,6 +421,73 @@ def zeus_repos_page(request: Request, conn=Depends(get_db)):
     })
 
 
+@app.get("/zeus/staging", response_class=HTMLResponse)
+def zeus_staging_page(request: Request, conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user or user["role"] not in ("zeus", "olympian"):
+        raise HTTPException(403, "The Throne is reserved for Zeus and the Olympian council.")
+
+    staging = db.query(conn, """
+        SELECT s.*, u.username, u.role, r.name as repo_name,
+               COUNT(sc.change_id) as change_count
+          FROM repo_staging s
+          JOIN repo_users u ON u.user_id = s.user_id
+          JOIN repo_repositories r ON r.repo_id = s.repo_id
+          LEFT JOIN repo_staging_changes sc ON sc.staging_id = s.staging_id
+         WHERE s.status = 'active'
+         GROUP BY s.staging_id, u.username, u.role, r.name
+         ORDER BY s.updated_at DESC
+    """)
+
+    return templates.TemplateResponse(request, "zeus_staging.html", {
+        "user": user, "staging": staging,
+    })
+
+
+@app.get("/zeus/promotions", response_class=HTMLResponse)
+def zeus_promotions_page(request: Request, conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user or user["role"] not in ("zeus", "olympian"):
+        raise HTTPException(403, "The Throne is reserved for Zeus and the Olympian council.")
+
+    promotions = db.query(conn, """
+        SELECT p.*, u.username as promoted_by_name,
+               r.name as repo_name, c.commit_hash, c.message, c.rev
+          FROM repo_promotions p
+          JOIN repo_users u ON u.user_id = p.promoted_by
+          JOIN repo_repositories r ON r.repo_id = p.repo_id
+          JOIN repo_commits c ON c.commit_hash = p.commit_hash
+         ORDER BY p.promoted_at DESC LIMIT 100
+    """)
+
+    return templates.TemplateResponse(request, "zeus_promotions.html", {
+        "user": user, "promotions": promotions,
+    })
+
+
+@app.get("/zeus/commits", response_class=HTMLResponse)
+def zeus_commits_page(request: Request, today: str = "0", conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user or user["role"] not in ("zeus", "olympian"):
+        raise HTTPException(403, "The Throne is reserved for Zeus and the Olympian council.")
+
+    is_today = today == "1"
+    where_clause = "c.committed_at >= CURRENT_DATE" if is_today else "1 = 1"
+
+    commits = db.query(conn, f"""
+        SELECT c.*, r.name as repo_name, u.username
+          FROM repo_commits c
+          JOIN repo_repositories r ON r.repo_id = c.repo_id
+          LEFT JOIN repo_users u ON u.user_id = c.author_id
+         WHERE {where_clause}
+         ORDER BY c.committed_at DESC LIMIT 200
+    """)
+
+    return templates.TemplateResponse(request, "zeus_commits.html", {
+        "user": user, "commits": commits, "today": is_today,
+    })
+
+
 # =========================================================================
 # PAGE ROUTES
 # =========================================================================
