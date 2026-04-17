@@ -629,8 +629,8 @@ def cmd_pull(args):
 
     conn = db.connect()
     try:
-        latest = db.query_one(conn, "SELECT rev FROM repo_commits WHERE repo_id = %s ORDER BY rev DESC LIMIT 1", (config["repo_id"],))
-        local_rev = latest["rev"] if latest else 0
+        # Use last_synced_rev from config — never derived from NULL-rev local commits
+        local_rev = config.get("last_synced_rev", 0) or 0
 
         print(f"Fetching from {remote_url}...")
         info = _fetch_json(f"{remote_url}/api/sync/{repo_name}/info")
@@ -659,7 +659,7 @@ def cmd_pull(args):
             conn.commit()
             print(f"  Created local mirror of '{repo_name}'")
 
-        if info["latest_rev"] <= local_rev:
+        if (info["latest_rev"] or 0) <= local_rev:
             print("Already up to date.")
             return 0
 
@@ -699,6 +699,15 @@ def cmd_pull(args):
 
         conn.commit()
         print(f"Pulled {len(commits)} commit(s).")
+        # Save last synced rev to config
+        if commits:
+            latest_pulled_rev = max((c.get("rev") or 0) for c in commits)
+            if latest_pulled_rev:
+                config["last_synced_rev"] = latest_pulled_rev
+                config_path = os.path.join(repo_root, ".olympusrepo", "config.json")
+                import json as _json
+                with open(config_path, "w") as _f:
+                    _json.dump(config, _f, indent=2)
         
         latest_tree_hash = commits[-1]["tree_hash"]
         tree_data = objects.retrieve_blob(latest_tree_hash, objects_dir)

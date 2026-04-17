@@ -430,7 +430,8 @@ def commit_files(conn, repo_id: int, user_id: int, message: str,
         conn.commit()
 
         # Snapshot committed state for diff/status
-        worktree.save_committed_index(repo_root, tree_entries)
+        # Save full index format (with mtime/size) for fast-path diff detection
+        worktree.save_committed_index(repo_root, worktree.load_index(repo_root))
 
     except Exception:
         conn.rollback()

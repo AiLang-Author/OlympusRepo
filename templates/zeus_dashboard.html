@@ -8,6 +8,13 @@
             linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
             url('/static/throne-room.png') center center / cover no-repeat fixed;
     }
+    .stat-card {
+        cursor: pointer;
+        transition: border-color 0.15s;
+    }
+    .stat-card:hover {
+        border-color: #58a6ff;
+    }
 </style>
 {% endblock %}
 
@@ -21,20 +28,20 @@
 
     <!-- Stats row -->
     <div style="display:grid; grid-template-columns:repeat(6,1fr); gap:12px; margin-bottom:32px;">
-        {% for label, key in [
-            ('Repositories', 'total_repos'),
-            ('Active Users', 'total_users'),
-            ('Total Commits', 'total_commits'),
-            ('Promotions', 'total_promotions'),
-            ('Active Staging', 'active_staging'),
-            ('Commits Today', 'commits_today')
+        {% for label, key, link in [
+            ('Repositories', 'total_repos', '/zeus/repos'),
+            ('Active Users', 'total_users', '/zeus/users'),
+            ('Total Commits', 'total_commits', '/zeus/repos'),
+            ('Promotions', 'total_promotions', '/zeus/audit'),
+            ('Active Staging', 'active_staging', '/zeus/repos'),
+            ('Commits Today', 'commits_today', '/zeus/audit')
         ] %}
-        <div class="card" style="text-align:center; padding:16px;">
+        <a href="{{ link }}" class="card stat-card" style="text-align:center; padding:16px; display:block; text-decoration:none; color:inherit;">
             <div style="font-size:1.8em; font-weight:700; color:#f0f6fc;">
                 {{ stats[key] }}
             </div>
             <div class="card-meta" style="margin-top:4px;">{{ label }}</div>
-        </div>
+        </a>
         {% endfor %}
     </div>
 
@@ -65,11 +72,9 @@
                         {% if s.updated_at %}{{ s.updated_at.strftime('%b %d %H:%M') }}{% else %}&mdash;{% endif %}
                     </td>
                     <td>
-                        <button class="btn btn-gold promote-btn"
-                                data-staging-id="{{ s.staging_id }}"
-                                style="padding:3px 8px; font-size:0.8em;">
-                            Promote
-                        </button>
+                        <a href="/repo/{{ s.repo_name }}/staging/{{ s.staging_id }}/review" class="btn btn-gold" style="padding:3px 8px; font-size:0.8em; text-decoration:none;">
+                            Review
+                        </a>
                     </td>
                 </tr>
                 {% endfor %}
@@ -137,41 +142,4 @@
     </div>
 
 </div>
-{% endblock %}
-
-{% block extra_js %}
-<script>
-(function() {
-    document.querySelectorAll('.promote-btn').forEach(function(btn) {
-        btn.addEventListener('click', async function() {
-            var stagingId = btn.getAttribute('data-staging-id');
-            var notes = prompt('Promotion notes (optional):');
-            if (notes === null) return;
-
-            btn.disabled = true;
-            try {
-                // The throne-level promote endpoint (cross-repo view)
-                var res = await fetch('/api/promote/' + stagingId, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ notes: notes })
-                });
-
-                if (res.ok) {
-                    alert('Promoted to canonical tree.');
-                    window.location.reload();
-                } else {
-                    var data = {};
-                    try { data = await res.json(); } catch (e) {}
-                    alert(data.detail || 'Promotion failed.');
-                    btn.disabled = false;
-                }
-            } catch (err) {
-                alert('Network error.');
-                btn.disabled = false;
-            }
-        });
-    });
-})();
-</script>
 {% endblock %}

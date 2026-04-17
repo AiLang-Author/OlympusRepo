@@ -376,7 +376,7 @@
 
             // Poll every 60 seconds for new notifications
             loadNotifications();
-            setInterval(loadNotifications, 60000);
+            setInterval(loadNotifications, 300000);
 
             // Poll for unread messages
             var msgBadge = document.getElementById('msg-unread-badge');
@@ -395,7 +395,7 @@
                     } catch(e) {}
                 }
                 loadUnreadMessages();
-                setInterval(loadUnreadMessages, 60000);
+                setInterval(loadUnreadMessages, 300000);
             }
         })();
     </script>

@@ -1567,6 +1567,15 @@ def message_thread_page(message_id: int, request: Request,
         VALUES (%s, %s)
         ON CONFLICT DO NOTHING
     """, (user["user_id"], message_id))
+    # Clear notification badge for this message thread
+    db.execute(conn, """
+        UPDATE repo_notifications
+           SET is_read = TRUE
+         WHERE user_id = %s
+           AND (link LIKE %s OR link LIKE %s)
+    """, (user["user_id"],
+          f"%/messages/{message_id}%",
+          f"%/messages/thread/{message_id}%"))
 
     return templates.TemplateResponse(request, "message_thread.html", {
         "user": user, "root": root, "replies": replies,
@@ -2263,7 +2272,7 @@ def sync_info(name: str, request: Request, conn=Depends(get_db)):
     latest = db.query_one(conn, """
         SELECT c.rev, c.commit_hash, c.committed_at
           FROM repo_commits c
-         WHERE c.repo_id = %s
+         WHERE c.repo_id = %s AND c.rev IS NOT NULL
          ORDER BY c.rev DESC LIMIT 1
     """, (r["repo_id"],))
 
@@ -2707,6 +2716,7 @@ def promote_staging(name: str, staging_id: int,
                     (commit_hash, path, change_type, blob_before,
                      blob_after, lines_added, lines_removed)
                 VALUES (%s, %s, %s, NULL, %s, %s, %s)
+                ON CONFLICT DO NOTHING
             """, (commit_hash, c["path"], c["change_type"],
                   c["blob_hash"], c["lines_added"],
                   c["lines_removed"]), commit=False)
