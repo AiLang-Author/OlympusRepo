@@ -62,8 +62,19 @@ def _get_files_at_commit(git_dir: str, commit_hash: str) -> dict[str, bytes]:
         git_dir
     )
     files = {}
+    # Patterns to skip
+    skip_patterns = ['.venv/', 'venv/', '__pycache__/', 
+                     'node_modules/', '.git/', 'objects/',
+                     '.egg-info/', '.pytest_cache/']
+    
     for path in output.splitlines():
         if not path.strip():
+            continue
+        # Skip ignored paths
+        if any(path.startswith(p) or ('/' + p) in path 
+               for p in skip_patterns):
+            continue
+        if path.endswith(('.pyc', '.pyo')):
             continue
         # Skip binary-unfriendly paths
         try:
