@@ -57,6 +57,10 @@
         </div>
         <div class="row">
             <a href="/repo/{{ repo.name }}" class="btn">Back to Files</a>
+            <a href="/repo/{{ repo.name }}/issues/new?file={{ path }}"
+               class="btn" style="font-size:0.85em;">
+                File Issue
+            </a>
             <a href="/api/repos/{{ repo.name }}/raw/{{ branch }}/{{ path }}" class="btn btn-primary" target="_blank">Raw</a>
         </div>
     </div>

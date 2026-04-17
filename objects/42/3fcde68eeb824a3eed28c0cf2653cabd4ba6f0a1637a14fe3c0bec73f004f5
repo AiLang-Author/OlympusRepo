@@ -1,0 +1,175 @@
+{% extends "base.html" %}
+{% block title %}Commit {{ commit.commit_hash[:7] }} &mdash; {{ repo.name }}{% endblock %}
+
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            url('/static/commit-room.png') center center / cover no-repeat fixed;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="row-between" style="margin-bottom:24px;">
+        <h1 style="margin-bottom:0;">Commit Details</h1>
+        <a href="/repo/{{ repo.name }}/commits" class="btn">Back to Commits</a>
+    </div>
+
+    <div class="card" style="margin-bottom:24px;">
+        <div class="card-header">
+            <span>
+                <span style="color:#f0f6fc; font-weight:600; font-size:1.1em;">rev {{ commit.rev }}</span>
+                <span class="hash" style="margin-left:12px; font-size:1em;">{{ commit.commit_hash }}</span>
+            </span>
+        </div>
+        <p style="font-size:1.1em; margin:12px 0; white-space:pre-wrap;">{{ commit.message }}</p>
+        <div class="card-meta">
+            <strong style="color:#c9d1d9;">{{ commit.author_name }}</strong>
+            committed {% if commit.committed_at %}on {{ commit.committed_at.strftime('%b %d, %Y %H:%M') }}{% endif %}
+        </div>
+    </div>
+
+    <div style="margin-bottom:16px;">
+        {% set ns = namespace(added=0, removed=0) %}
+        {% for c in changesets %}
+            {% set ns.added = ns.added + (c.lines_added or 0) %}
+            {% set ns.removed = ns.removed + (c.lines_removed or 0) %}
+        {% endfor %}
+        <span style="font-weight:600; color:#c9d1d9;">{{ changesets|length }} file{% if changesets|length != 1 %}s{% endif %} changed</span>
+        {% if ns.added > 0 or ns.removed > 0 %}
+            <span class="diff-stats" style="margin-left:12px;">
+                <span class="diff-add">+{{ ns.added }}</span>
+                <span class="diff-remove">-{{ ns.removed }}</span>
+            </span>
+        {% endif %}
+    </div>
+
+    <div class="card" style="padding:0;">
+        <table style="margin:0;">
+            <tbody>
+                {% for c in changesets %}
+                <tr>
+                    <td style="width:1%;">
+                        {% if c.change_type == 'add' %}
+                            <span class="badge" style="background:#238636; color:#fff;">added</span>
+                        {% elif c.change_type == 'delete' %}
+                            <span class="badge" style="background:#da3633; color:#fff;">deleted</span>
+                        {% else %}
+                            <span class="badge" style="background:#1f6feb; color:#fff;">modified</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if c.change_type != 'delete' %}
+                            <a href="/repo/{{ repo.name }}/blob/{{ current_branch }}/{{ c.path }}" class="mono">{{ c.path }}</a>
+                        {% else %}
+                            <span class="mono" style="color:#8b949e; text-decoration:line-through;">{{ c.path }}</span>
+                        {% endif %}
+                    </td>
+                    <td style="text-align:right; width:15%;" class="diff-stats">
+                        {% if c.lines_added %}<span class="diff-add">+{{ c.lines_added }}</span>{% endif %}
+                        {% if c.lines_removed %}<span class="diff-remove" style="margin-left:8px;">-{{ c.lines_removed }}</span>{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Commit Comments -->
+    <div style="margin-top:32px;">
+        <h2>Discussion</h2>
+
+        <div id="commit-comments-list">
+            <div style="color:#8b949e; font-size:0.9em;">Loading...</div>
+        </div>
+
+        {% if user %}
+        <div class="card" style="margin-top:16px;">
+            <div class="form-group">
+                <textarea id="commit-comment-input"
+                          placeholder="Leave a comment on this commit..."
+                          style="min-height:80px;"></textarea>
+            </div>
+            <button id="commit-comment-btn" class="btn btn-primary">Comment</button>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    var repoName = {{ repo.name | tojson }};
+    var commitHash = {{ commit.commit_hash | tojson }};
+    var isLoggedIn = {{ 'true' if user else 'false' }};
+
+    function escapeHtml(str) {
+        return String(str || '')
+            .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+            .replace(/>/g,'&gt;');
+    }
+
+    async function loadComments() {
+        var list = document.getElementById('commit-comments-list');
+        try {
+            var res = await fetch(
+                '/api/repos/' + encodeURIComponent(repoName) +
+                '/commit/' + commitHash + '/comments'
+            );
+            var comments = await res.json();
+
+            if (comments.length === 0) {
+                list.innerHTML = '<div class="empty-state" style="padding:24px;">' +
+                    '<p>No comments yet.</p></div>';
+                return;
+            }
+
+            list.innerHTML = comments.map(function(c) {
+                return '<div class="card" style="padding:12px;">' +
+                    '<div class="row-between" style="margin-bottom:6px;">' +
+                    '<span style="font-weight:600;color:#f0f6fc;">' +
+                    escapeHtml(c.username) + '</span>' +
+                    '<span class="card-meta">' +
+                    new Date(c.created_at).toLocaleString() + '</span>' +
+                    '</div>' +
+                    '<p style="margin:0;white-space:pre-wrap;">' +
+                    escapeHtml(c.content) + '</p>' +
+                    '</div>';
+            }).join('');
+        } catch(e) {
+            list.innerHTML = '<div style="color:#f85149;">Could not load comments.</div>';
+        }
+    }
+
+    if (isLoggedIn) {
+        document.getElementById('commit-comment-btn')
+            .addEventListener('click', async function() {
+                var btn = this;
+                var content = document.getElementById('commit-comment-input').value.trim();
+                if (!content) return;
+                btn.disabled = true;
+                try {
+                    var form = new FormData();
+                    form.append('content', content);
+                    var res = await fetch(
+                        '/api/repos/' + encodeURIComponent(repoName) +
+                        '/commit/' + commitHash + '/comments',
+                        { method: 'POST', body: form }
+                    );
+                    if (res.ok) {
+                        document.getElementById('commit-comment-input').value = '';
+                        loadComments();
+                    }
+                } catch(e) {}
+                finally { btn.disabled = false; }
+            });
+    }
+
+    loadComments();
+})();
+</script>
+{% endblock %}

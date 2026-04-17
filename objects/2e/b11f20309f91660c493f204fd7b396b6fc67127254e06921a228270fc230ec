@@ -1,0 +1,2 @@
+[console_scripts]
+olympusrepo = olympusrepo.cli:main

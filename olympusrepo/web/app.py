@@ -16,6 +16,12 @@ from fastapi.templating import Jinja2Templates
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
 import asyncio
 import json as json_mod
+import base64
+import re
+
+import urllib.request
+import urllib.error
+import json as json_stdlib
 
 from ..core import db, repo
 
@@ -33,19 +39,23 @@ COOKIE_SECURE = os.getenv("OLYMPUSREPO_COOKIE_SECURE", "0") == "1"
 
 @app.exception_handler(403)
 async def forbidden_handler(request: Request, exc):
-    conn = next(get_db())
-    user = get_current_user(request, conn)
-    conn.close()
-    return templates.TemplateResponse(request, "403.html",
-        {"user": user}, status_code=403)
+    conn = db.connect()
+    try:
+        user = get_current_user(request, conn)
+        return templates.TemplateResponse(request, "403.html",
+            {"user": user}, status_code=403)
+    finally:
+        conn.close()
 
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc):
-    conn = next(get_db())
-    user = get_current_user(request, conn)
-    conn.close()
-    return templates.TemplateResponse(request, "404.html",
-        {"user": user}, status_code=404)
+    conn = db.connect()
+    try:
+        user = get_current_user(request, conn)
+        return templates.TemplateResponse(request, "404.html",
+            {"user": user}, status_code=404)
+    finally:
+        conn.close()
 
 # =========================================================================
 # DATABASE DEPENDENCY
@@ -207,6 +217,23 @@ def logout_route(request: Request, conn=Depends(get_db)):
         secure=COOKIE_SECURE,
     )
     return response
+
+
+@app.get("/api/users/search")
+def search_users(q: str = "", request: Request = None,
+                 conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+    if len(q) < 2:
+        return []
+    return db.query(conn, """
+        SELECT user_id, username, role, full_name
+          FROM repo_users
+         WHERE is_active = TRUE
+           AND (username ILIKE %s OR full_name ILIKE %s)
+         ORDER BY username LIMIT 10
+    """, (f"%{q}%", f"%{q}%"))
 
 
 @app.get("/api/auth/me")
@@ -376,6 +403,24 @@ def zeus_dashboard(request: Request, conn=Depends(get_db)):
     })
 
 
+@app.get("/zeus/repos", response_class=HTMLResponse)
+def zeus_repos_page(request: Request, conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user or user["role"] not in ("zeus", "olympian"):
+        raise HTTPException(403, "The Throne is reserved for Zeus and the Olympian council.")
+
+    repos = db.query(conn, """
+        SELECT r.*, u.username as owner_name
+          FROM repo_repositories r
+          LEFT JOIN repo_users u ON u.user_id = r.owner_id
+         ORDER BY r.name ASC
+    """)
+
+    return templates.TemplateResponse(request, "zeus_repos.html", {
+        "user": user, "repos": repos,
+    })
+
+
 # =========================================================================
 # PAGE ROUTES
 # =========================================================================
@@ -500,16 +545,28 @@ def _load_file_tree(conn, repo_id: int, branch: str) -> list[dict]:
 
     # Build display list sorted by path
     files = []
+    
+    BINARY_EXTENSIONS = {
+        '.png','.jpg','.jpeg','.gif','.ico','.svg',
+        '.pdf','.zip','.tar','.gz','.whl','.pyc',
+        '.pyo','.so','.dll','.exe','.bin'
+    }
     for path, blob_hash in sorted(tree.items()):
-        committed_at = db.query_scalar(conn, """
-            SELECT committed_at FROM repo_file_revisions
-             WHERE repo_id = %s AND path = %s AND change_type != 'delete'
-             ORDER BY committed_at DESC LIMIT 1
-        """, (repo_id, path))
+        try:
+            committed_at = db.query_scalar(conn, """
+                SELECT committed_at FROM repo_file_revisions
+                 WHERE repo_id = %s AND path = %s AND change_type != 'delete'
+                 ORDER BY committed_at DESC LIMIT 1
+            """, (repo_id, path))
+        except Exception:
+            committed_at = None
+
+        ext = os.path.splitext(path)[1].lower()
+        file_type = "binary" if ext in BINARY_EXTENSIONS else "file"
 
         files.append({
             "path": path,
-            "type": "file",
+            "type": file_type,
             "size": _format_size(blob_hash, conn, repo_id),
             "committed_at": committed_at.strftime('%Y-%m-%d %H:%M') if committed_at else None,
         })
@@ -902,6 +959,60 @@ def repo_settings_page(name: str, request: Request, conn=Depends(get_db)):
     if not r:
         raise HTTPException(404)
     return templates.TemplateResponse(request, "repo_settings.html", {"user": user, "repo": r})
+
+@app.get("/repo/{name}/access", response_class=HTMLResponse)
+def repo_access_page(name: str, request: Request, conn=Depends(get_db)):
+    user = require_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if user["role"] != "zeus" and user["user_id"] != r["owner_id"]:
+        raise HTTPException(403, "Access denied.")
+
+    access_users = db.get_repo_access_users(conn, r["repo_id"])
+
+    return templates.TemplateResponse(request, "repo_access.html", {
+        "user": user,
+        "repo": r,
+        "access_users": access_users,
+    })
+
+@app.post("/api/repos/{name}/access/grant")
+def grant_access_api(name: str, request: Request, user_id: int = Form(...),
+                     conn=Depends(get_db)):
+    user = require_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if user["role"] != "zeus" and user["user_id"] != r["owner_id"]:
+        raise HTTPException(403, "Access denied.")
+
+    target_user = db.get_user(conn, user_id)
+    if not target_user:
+        raise HTTPException(404, "User to grant access to not found.")
+
+    if r["owner_id"] == user_id:
+        raise HTTPException(400, "Owner already has access.")
+
+    db.grant_repo_access(conn, r["repo_id"], user_id, user["user_id"])
+    return {"status": "granted", "user_id": user_id}
+
+@app.delete("/api/repos/{name}/access/{user_id}")
+def revoke_access_api(name: str, user_id: int, request: Request,
+                      conn=Depends(get_db)):
+    user = require_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if user["role"] != "zeus" and user["user_id"] != r["owner_id"]:
+        raise HTTPException(403, "Access denied.")
+
+    if r["owner_id"] == user_id:
+        raise HTTPException(400, "Cannot revoke access from the repository owner.")
+
+    db.revoke_repo_access(conn, r["repo_id"], user_id, user["user_id"])
+    return {"status": "revoked", "user_id": user_id}
+
 
 @app.post("/api/repos/{name}/settings")
 def update_repo_settings(name: str, request: Request,
@@ -1669,6 +1780,878 @@ def get_commit_comments(name: str, commit_hash: str,
            AND m.parent_id IS NULL
          ORDER BY m.created_at ASC
     """, (r["repo_id"], commit_hash))
+
+
+# =========================================================================
+# ISSUE TRACKER
+# =========================================================================
+
+def _get_next_issue_number(conn, repo_id: int) -> int:
+    return db.query_scalar(conn,
+        "SELECT COALESCE(MAX(number), 0) + 1 FROM repo_issues WHERE repo_id = %s",
+        (repo_id,)) or 1
+
+
+def _parse_issue_refs(message: str) -> list[tuple[int, str]]:
+    """
+    Parse issue references from commit message.
+    Supports: fixes #N, closes #N, resolves #N, relates #N
+    Returns list of (issue_number, link_type)
+    """
+    import re
+    refs = []
+    patterns = [
+        (r'(?:fixes|fix|closes|close|resolves|resolve)\s+#(\d+)', 'fixed'),
+        (r'(?:introduces|introduced)\s+#(\d+)', 'introduced'),
+        (r'(?:relates|related|see)\s+#(\d+)', 'related'),
+        (r'#(\d+)', 'mentioned'),
+    ]
+    seen = set()
+    for pattern, link_type in patterns:
+        for match in re.finditer(pattern, message, re.IGNORECASE):
+            num = int(match.group(1))
+            if num not in seen:
+                refs.append((num, link_type))
+                seen.add(num)
+    return refs
+
+
+@app.get("/repo/{name}/issues", response_class=HTMLResponse)
+def issues_page(name: str, request: Request,
+                status: str = "open",
+                issue_type: str = "",
+                priority: str = "",
+                assigned: str = "",
+                conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 user["user_id"] if user else None):
+        raise HTTPException(403)
+
+    filters = ["i.repo_id = %s"]
+    params  = [r["repo_id"]]
+
+    if status:
+        filters.append("i.status = %s")
+        params.append(status)
+    if issue_type:
+        filters.append("i.issue_type = %s")
+        params.append(issue_type)
+    if priority:
+        filters.append("i.priority = %s")
+        params.append(priority)
+    if assigned:
+        filters.append("u2.username = %s")
+        params.append(assigned)
+
+    where = " AND ".join(filters)
+    issues = db.query(conn, f"""
+        SELECT i.*, 
+               u1.username as reporter_name,
+               u2.username as assignee_name,
+               COUNT(ic.comment_id) as comment_count
+          FROM repo_issues i
+          LEFT JOIN repo_users u1 ON u1.user_id = i.reported_by
+          LEFT JOIN repo_users u2 ON u2.user_id = i.assigned_to
+          LEFT JOIN repo_issue_comments ic ON ic.issue_id = i.issue_id
+         WHERE {where}
+         GROUP BY i.issue_id, u1.username, u2.username
+         ORDER BY
+             CASE i.priority
+                 WHEN 'critical' THEN 1
+                 WHEN 'high'     THEN 2
+                 WHEN 'normal'   THEN 3
+                 WHEN 'low'      THEN 4
+             END,
+             i.updated_at DESC
+    """, params)
+
+    # Counts for filter badges
+    counts = db.query(conn, """
+        SELECT status, COUNT(*) as n
+          FROM repo_issues WHERE repo_id = %s
+         GROUP BY status
+    """, (r["repo_id"],))
+    status_counts = {c["status"]: c["n"] for c in counts}
+
+    branches = repo.get_branches(conn, r["repo_id"])
+    all_users = db.query(conn, """
+        SELECT user_id, username, role FROM repo_users
+         WHERE is_active = TRUE ORDER BY username
+    """)
+
+    return templates.TemplateResponse(request, "repo_issues.html", {
+        "user": user, "repo": r, "issues": issues,
+        "branches": branches,
+        "current_branch": r.get("default_branch", "main"),
+        "filter_status": status,
+        "filter_type": issue_type,
+        "filter_priority": priority,
+        "filter_assigned": assigned,
+        "status_counts": status_counts,
+        "all_users": all_users,
+    })
+
+
+@app.get("/repo/{name}/issues/new", response_class=HTMLResponse)
+def new_issue_page(name: str, request: Request,
+                   file: str = "", line: int = 0,
+                   conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        return RedirectResponse(url="/login", status_code=302)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    all_users = db.query(conn, """
+        SELECT user_id, username, role FROM repo_users
+         WHERE is_active = TRUE ORDER BY username
+    """)
+
+    return templates.TemplateResponse(request, "new_issue.html", {
+        "user": user, "repo": r,
+        "all_users": all_users,
+        "prefill_file": file,
+        "prefill_line": line,
+    })
+
+
+@app.post("/api/repos/{name}/issues")
+def create_issue(name: str, request: Request,
+                 title: str = Form(...),
+                 description: str = Form(""),
+                 issue_type: str = Form("bug"),
+                 priority: str = Form("normal"),
+                 assigned_to: int = Form(None),
+                 file_path: str = Form(""),
+                 line_start: int = Form(None),
+                 line_end: int = Form(None),
+                 conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    try:
+        number = _get_next_issue_number(conn, r["repo_id"])
+
+        issue_id = db.query_scalar(conn, """
+            INSERT INTO repo_issues
+                (repo_id, number, title, description,
+                 issue_type, priority, reported_by, assigned_to)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING issue_id
+        """, (r["repo_id"], number, title.strip(),
+              description.strip() or None,
+              issue_type, priority,
+              user["user_id"], assigned_to or None))
+
+        # Attach file if provided
+        if file_path.strip():
+            db.execute(conn, """
+                INSERT INTO repo_issue_files
+                    (issue_id, path, line_start, line_end)
+                VALUES (%s, %s, %s, %s)
+            """, (issue_id, file_path.strip(),
+                  line_start or None, line_end or None),
+                commit=False)
+
+        # Notify assignee
+        if assigned_to and assigned_to != user["user_id"]:
+            db.create_notification(
+                conn,
+                user_id=assigned_to,
+                notif_type="issue_assigned",
+                message=f"{user['username']} assigned issue #{number} to you: {title}",
+                link=f"/repo/{name}/issues/{number}",
+                repo_id=r["repo_id"],
+                commit=False
+            )
+
+        db.audit_log(conn, "issue_create", user_id=user["user_id"],
+                     repo_id=r["repo_id"], target_type="issue",
+                     target_id=str(number),
+                     details={"title": title, "type": issue_type},
+                     commit=False)
+        conn.commit()
+        return {"status": "created", "issue_id": issue_id, "number": number}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+
+
+@app.get("/repo/{name}/issues/{number}", response_class=HTMLResponse)
+def issue_detail_page(name: str, number: int,
+                      request: Request, conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 user["user_id"] if user else None):
+        raise HTTPException(403)
+
+    issue = db.query_one(conn, """
+        SELECT i.*,
+               u1.username as reporter_name,
+               u2.username as assignee_name
+          FROM repo_issues i
+          LEFT JOIN repo_users u1 ON u1.user_id = i.reported_by
+          LEFT JOIN repo_users u2 ON u2.user_id = i.assigned_to
+         WHERE i.repo_id = %s AND i.number = %s
+    """, (r["repo_id"], number))
+    if not issue:
+        raise HTTPException(404, f"Issue #{number} not found.")
+
+    comments = db.query(conn, """
+        SELECT ic.*, u.username, u.role
+          FROM repo_issue_comments ic
+          LEFT JOIN repo_users u ON u.user_id = ic.user_id
+         WHERE ic.issue_id = %s
+         ORDER BY ic.created_at ASC
+    """, (issue["issue_id"],))
+
+    files = db.query(conn, """
+        SELECT * FROM repo_issue_files
+         WHERE issue_id = %s
+    """, (issue["issue_id"],))
+
+    linked_commits = db.query(conn, """
+        SELECT ic.link_type, c.commit_hash, c.rev,
+               c.message, c.author_name, c.committed_at
+          FROM repo_issue_commits ic
+          JOIN repo_commits c ON c.commit_hash = ic.commit_hash
+         WHERE ic.issue_id = %s
+         ORDER BY c.committed_at DESC
+    """, (issue["issue_id"],))
+
+    all_users = db.query(conn, """
+        SELECT user_id, username, role FROM repo_users
+         WHERE is_active = TRUE ORDER BY username
+    """)
+
+    return templates.TemplateResponse(request, "issue_detail.html", {
+        "user": user, "repo": r, "issue": issue,
+        "comments": comments, "files": files,
+        "linked_commits": linked_commits,
+        "all_users": all_users,
+    })
+
+
+@app.post("/api/repos/{name}/issues/{number}/comments")
+def add_issue_comment(name: str, number: int,
+                      request: Request,
+                      content: str = Form(...),
+                      conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    issue = db.query_one(conn,
+        "SELECT * FROM repo_issues WHERE repo_id = %s AND number = %s",
+        (r["repo_id"], number))
+    if not issue:
+        raise HTTPException(404)
+
+    try:
+        comment_id = db.query_scalar(conn, """
+            INSERT INTO repo_issue_comments (issue_id, user_id, content)
+            VALUES (%s, %s, %s) RETURNING comment_id
+        """, (issue["issue_id"], user["user_id"], content.strip()))
+
+        db.execute(conn,
+            "UPDATE repo_issues SET updated_at = NOW() WHERE issue_id = %s",
+            (issue["issue_id"],), commit=False)
+
+        # Notify reporter and assignee
+        notify_users = set()
+        if issue["reported_by"] and issue["reported_by"] != user["user_id"]:
+            notify_users.add(issue["reported_by"])
+        if issue["assigned_to"] and issue["assigned_to"] != user["user_id"]:
+            notify_users.add(issue["assigned_to"])
+
+        for uid in notify_users:
+            db.create_notification(
+                conn, user_id=uid,
+                notif_type="issue_comment",
+                message=f"{user['username']} commented on issue #{number}: {issue['title']}",
+                link=f"/repo/{name}/issues/{number}",
+                repo_id=r["repo_id"],
+                commit=False
+            )
+
+        conn.commit()
+        return {"status": "added", "comment_id": comment_id}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+
+
+@app.patch("/api/repos/{name}/issues/{number}")
+def update_issue(name: str, number: int,
+                 request: Request,
+                 status: str = Form(None),
+                 assigned_to: int = Form(None),
+                 priority: str = Form(None),
+                 conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    issue = db.query_one(conn,
+        "SELECT * FROM repo_issues WHERE repo_id = %s AND number = %s",
+        (r["repo_id"], number))
+    if not issue:
+        raise HTTPException(404)
+
+    updates = []
+    params  = []
+
+    if status:
+        valid = ('open','in_progress','resolved','closed','wontfix')
+        if status not in valid:
+            raise HTTPException(400, "Invalid status.")
+        updates.append("status = %s")
+        params.append(status)
+        if status in ('resolved', 'closed'):
+            updates.append("closed_at = NOW()")
+
+    if priority:
+        updates.append("priority = %s")
+        params.append(priority)
+
+    if assigned_to is not None:
+        updates.append("assigned_to = %s")
+        params.append(assigned_to or None)
+
+    if not updates:
+        raise HTTPException(400, "Nothing to update.")
+
+    updates.append("updated_at = NOW()")
+    params.append(issue["issue_id"])
+
+    db.execute(conn,
+        f"UPDATE repo_issues SET {', '.join(updates)} WHERE issue_id = %s",
+        params, commit=False)
+
+    db.audit_log(conn, "issue_update", user_id=user["user_id"],
+                 repo_id=r["repo_id"], target_type="issue",
+                 target_id=str(number),
+                 details={"status": status, "priority": priority},
+                 commit=False)
+    conn.commit()
+    return {"status": "updated"}
+
+
+# =========================================================================
+# SYNC API — endpoints canonical exposes to slaves
+# =========================================================================
+
+@app.get("/api/sync/{name}/info")
+def sync_info(name: str, request: Request, conn=Depends(get_db)):
+    """
+    Public sync info endpoint.
+    Slaves call this to find out the canonical rev and repo metadata.
+    """
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if r["visibility"] == "private":
+        user = get_current_user(request, conn)
+        if not user:
+            raise HTTPException(403)
+
+    latest = db.query_one(conn, """
+        SELECT c.rev, c.commit_hash, c.committed_at
+          FROM repo_commits c
+         WHERE c.repo_id = %s
+         ORDER BY c.rev DESC LIMIT 1
+    """, (r["repo_id"],))
+
+    return {
+        "repo_name":      r["name"],
+        "repo_id":        r["repo_id"],
+        "visibility":     r["visibility"],
+        "default_branch": r["default_branch"],
+        "latest_rev":     latest["rev"] if latest else 0,
+        "latest_hash":    latest["commit_hash"] if latest else None,
+    }
+
+
+@app.get("/api/sync/{name}/commits")
+def sync_commits(name: str, request: Request,
+                 since_rev: int = 0,
+                 conn=Depends(get_db)):
+    """
+    Returns all commits after since_rev.
+    Slaves call this during pull to get new commits.
+    """
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if r["visibility"] == "private":
+        user = get_current_user(request, conn)
+        if not user:
+            raise HTTPException(403)
+
+    commits = db.query(conn, """
+        SELECT c.rev, c.commit_hash, c.tree_hash,
+               c.author_name, c.committer_name,
+               c.message, c.committed_at, c.parent_hashes
+          FROM repo_commits c
+         WHERE c.repo_id = %s AND c.rev > %s
+         ORDER BY c.rev ASC
+    """, (r["repo_id"], since_rev))
+
+    # Include changesets for each commit
+    result = []
+    for c in commits:
+        changesets = db.query(conn, """
+            SELECT path, change_type, blob_before, blob_after,
+                   lines_added, lines_removed
+              FROM repo_changesets
+             WHERE commit_hash = %s
+        """, (c["commit_hash"],))
+        result.append({**dict(c), "changesets": list(changesets)})
+
+    return result
+
+
+@app.get("/api/sync/{name}/blob/{blob_hash}")
+def sync_blob(name: str, blob_hash: str,
+              request: Request, conn=Depends(get_db)):
+    """
+    Serve a blob by hash.
+    Slaves call this to fetch blob content they don't have locally.
+    """
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if r["visibility"] == "private":
+        user = get_current_user(request, conn)
+        if not user:
+            raise HTTPException(403)
+
+    # Validate hash format
+    if not re.match(r'^[a-f0-9]{64}$', blob_hash):
+        raise HTTPException(400, "Invalid blob hash.")
+
+    objects_dir = os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    from ..core import objects as obj_store
+    content = obj_store.retrieve_blob(blob_hash, objects_dir)
+    if content is None:
+        raise HTTPException(404, "Blob not found.")
+
+    from fastapi.responses import Response
+    return Response(content=content, media_type="application/octet-stream")
+
+
+# =========================================================================
+# OFFER — slave submits work to canonical for review
+# =========================================================================
+
+@app.post("/api/sync/{name}/offer")
+async def receive_offer(name: str, request: Request,
+                        conn=Depends(get_db)):
+    """
+    Receive an offer from a slave instance.
+    Creates a staging realm on canonical for Zeus/Olympian review.
+    Does NOT write to canonical tree — offer must be promoted.
+    """
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    body = await request.json()
+
+    branch_name = body.get("branch_name", "offered")
+    from_rev    = body.get("from_rev", 0)
+    base_rev    = body.get("base_rev", 0)
+    offered_by  = body.get("offered_by", "unknown")
+    message     = body.get("message", "")
+    changes     = body.get("changes", [])
+    blobs       = body.get("blobs", {})  # {hash: base64_content}
+
+    if not changes:
+        raise HTTPException(400, "No changes in offer.")
+
+    objects_dir = os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    from ..core import objects as obj_store
+
+    try:
+        # Store any blobs we don't have yet
+        for blob_hash, b64_content in blobs.items():
+            if not obj_store.exists(blob_hash, objects_dir):
+                content = base64.b64decode(b64_content)
+                stored_hash = obj_store.store_blob(content, objects_dir)
+                if stored_hash != blob_hash:
+                    raise HTTPException(400, f"Blob hash mismatch: {blob_hash}")
+
+        # Create offer record
+        offer_id = db.query_scalar(conn, """
+            INSERT INTO repo_offers
+                (repo_id, branch_name, from_rev, base_rev,
+                 offered_by, message, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'pending')
+            RETURNING offer_id
+        """, (r["repo_id"], branch_name, from_rev,
+              base_rev, offered_by, message))
+
+        # Store offer changes
+        for change in changes:
+            db.execute(conn, """
+                INSERT INTO repo_offer_changes
+                    (offer_id, path, change_type, blob_hash,
+                     lines_added, lines_removed)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (offer_id, change["path"], change["change_type"],
+                  change.get("blob_hash"), change.get("lines_added", 0),
+                  change.get("lines_removed", 0)), commit=False)
+
+        # Also create a staging realm so it shows in the normal UI
+        # Find or create a user account for the offerer
+        offering_user = db.get_user_by_name(conn, offered_by)
+        if offering_user:
+            staging_user_id = offering_user["user_id"]
+        else:
+            # Create a ghost account for the remote contributor
+            staging_user_id = db.query_scalar(conn, """
+                INSERT INTO repo_users
+                    (username, password_hash, role)
+                VALUES (%s, 'remote-contributor', 'titan')
+                ON CONFLICT (username) DO UPDATE
+                    SET username = EXCLUDED.username
+                RETURNING user_id
+            """, (offered_by,))
+
+        staging_id = db.query_scalar(conn, """
+            INSERT INTO repo_staging
+                (repo_id, user_id, branch_name, status)
+            VALUES (%s, %s, %s, 'active')
+            ON CONFLICT (repo_id, user_id, branch_name)
+            DO UPDATE SET status = 'active', updated_at = NOW()
+            RETURNING staging_id
+        """, (r["repo_id"], staging_user_id, branch_name))
+
+        for change in changes:
+            db.execute(conn, """
+                INSERT INTO repo_staging_changes
+                    (staging_id, path, change_type, blob_hash,
+                     lines_added, lines_removed)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (staging_id, change["path"], change["change_type"],
+                  change.get("blob_hash"), change.get("lines_added", 0),
+                  change.get("lines_removed", 0)), commit=False)
+
+        # Notify Zeus
+        zeus_users = db.query(conn,
+            "SELECT user_id FROM repo_users WHERE role = 'zeus' AND is_active = TRUE")
+        for z in zeus_users:
+            db.create_notification(
+                conn, user_id=z["user_id"],
+                notif_type="offer_received",
+                message=f"New offer from {offered_by} on {name}: {message[:80]}",
+                link=f"/repo/{name}/staging/{staging_id}",
+                repo_id=r["repo_id"],
+                commit=False
+            )
+
+        db.audit_log(conn, "offer_received", repo_id=r["repo_id"],
+                     target_type="offer", target_id=str(offer_id),
+                     details={"offered_by": offered_by,
+                              "files": len(changes)}, commit=False)
+        conn.commit()
+
+        return {
+            "status":     "received",
+            "offer_id":   offer_id,
+            "staging_id": staging_id,
+            "message":    f"Offer received. {len(changes)} file(s) pending review."
+        }
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+
+
+# =========================================================================
+# STAGING DIFF — side by side diff for offer review
+# =========================================================================
+
+@app.get("/api/repos/{name}/staging/{staging_id}/diff")
+def staging_diff_api(name: str, staging_id: int,
+                     request: Request, conn=Depends(get_db)):
+    """
+    Returns side-by-side diff for each changed file in a staging realm.
+    Compares canonical HEAD vs offered version.
+    """
+    user = get_current_user(request, conn)
+    if not user or user["role"] not in ("zeus", "olympian"):
+        raise HTTPException(403)
+
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    staging_row = db.query_one(conn,
+        "SELECT * FROM repo_staging WHERE staging_id = %s AND repo_id = %s",
+        (staging_id, r["repo_id"]))
+    if not staging_row:
+        raise HTTPException(404)
+
+    changes = db.query(conn, """
+        SELECT path, change_type, blob_hash,
+               lines_added, lines_removed
+          FROM repo_staging_changes
+         WHERE staging_id = %s ORDER BY path
+    """, (staging_id,))
+
+    objects_dir = os.path.join(
+        os.path.dirname(__file__), "..", "..", "objects")
+    from ..core import objects as obj_store
+    from ..core import diff as diff_mod
+
+    result = []
+    for change in changes:
+        entry = {
+            "path":          change["path"],
+            "change_type":   change["change_type"],
+            "lines_added":   change["lines_added"],
+            "lines_removed": change["lines_removed"],
+            "diff":          None,
+            "is_binary":     False,
+        }
+
+        def get_canonical_content(path):
+            row = db.query_one(conn, """
+                SELECT cs.blob_after FROM repo_changesets cs
+                  JOIN repo_commits c ON c.commit_hash = cs.commit_hash
+                  JOIN repo_refs rf ON rf.commit_hash = c.commit_hash
+                 WHERE c.repo_id = %s
+                   AND rf.ref_name = %s
+                   AND cs.path = %s
+                   AND cs.change_type != 'delete'
+                 ORDER BY c.rev DESC LIMIT 1
+            """, (r["repo_id"],
+                  f"refs/heads/{r.get('default_branch','main')}",
+                  path))
+            if row and row["blob_after"]:
+                b = obj_store.retrieve_blob(row["blob_after"], objects_dir)
+                if b:
+                    try:
+                        return b.decode("utf-8"), False
+                    except UnicodeDecodeError:
+                        return None, True
+            return "", False
+
+        def get_offered_content(blob_hash):
+            if not blob_hash:
+                return "", False
+            b = obj_store.retrieve_blob(blob_hash, objects_dir)
+            if b:
+                try:
+                    return b.decode("utf-8"), False
+                except UnicodeDecodeError:
+                    return None, True
+            return "", False
+
+        if change["change_type"] == "modify":
+            old_content, old_binary = get_canonical_content(change["path"])
+            new_content, new_binary = get_offered_content(change["blob_hash"])
+            if old_binary or new_binary:
+                entry["is_binary"] = True
+            else:
+                entry["diff"] = diff_mod.diff_content(
+                    old_content, new_content)[0]
+
+        elif change["change_type"] == "add":
+            new_content, is_binary = get_offered_content(change["blob_hash"])
+            if is_binary:
+                entry["is_binary"] = True
+            else:
+                entry["diff"] = diff_mod.diff_content("", new_content)[0]
+
+        elif change["change_type"] == "delete":
+            old_content, is_binary = get_canonical_content(change["path"])
+            if is_binary:
+                entry["is_binary"] = True
+            else:
+                entry["diff"] = diff_mod.diff_content(old_content, "")[0]
+
+        result.append(entry)
+
+    return result
+
+
+@app.get("/repo/{name}/staging/{staging_id}/review",
+         response_class=HTMLResponse)
+def staging_review_page(name: str, staging_id: int,
+                        request: Request, conn=Depends(get_db)):
+    """Full side-by-side review page for a staging realm."""
+    user = get_current_user(request, conn)
+    if not user or user["role"] not in ("zeus", "olympian"):
+        raise HTTPException(403)
+
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    staging_row = db.query_one(conn, """
+        SELECT s.*, u.username, u.role as user_role
+          FROM repo_staging s
+          JOIN repo_users u ON u.user_id = s.user_id
+         WHERE s.staging_id = %s AND s.repo_id = %s
+    """, (staging_id, r["repo_id"]))
+    if not staging_row:
+        raise HTTPException(404)
+
+    changes = db.query(conn, """
+        SELECT path, change_type, blob_hash,
+               lines_added, lines_removed
+          FROM repo_staging_changes
+         WHERE staging_id = %s ORDER BY path
+    """, (staging_id,))
+
+    branches = repo.get_branches(conn, r["repo_id"])
+
+    return templates.TemplateResponse(request, "staging_review.html", {
+        "user": user, "repo": r,
+        "staging": staging_row,
+        "changes": changes,
+        "branches": branches,
+        "current_branch": r.get("default_branch", "main"),
+    })
+
+
+@app.post("/api/repos/{name}/promote/{staging_id}")
+def promote_staging(name: str, staging_id: int,
+                    request: Request,
+                    notes: str = Form(""),
+                    conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user or user["role"] not in ("zeus", "olympian"):
+        raise HTTPException(403)
+
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    staging_row = db.query_one(conn,
+        "SELECT * FROM repo_staging WHERE staging_id = %s AND repo_id = %s",
+        (staging_id, r["repo_id"]))
+    if not staging_row:
+        raise HTTPException(404)
+    if staging_row["status"] != "active":
+        raise HTTPException(400, "This staging realm is not active.")
+
+    changes = db.query(conn,
+        "SELECT * FROM repo_staging_changes WHERE staging_id = %s",
+        (staging_id,))
+    if not changes:
+        raise HTTPException(400, "No changes to promote.")
+
+    objects_dir = os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    from ..core import objects as obj_store
+    import time
+
+    branch = staging_row["branch_name"]
+    owner = db.get_user(conn, staging_row["user_id"])
+
+    parent_row = db.query_one(conn,
+        "SELECT commit_hash FROM repo_refs WHERE repo_id = %s AND ref_name = %s",
+        (r["repo_id"], f"refs/heads/{r.get('default_branch','main')}"))
+    parent_hash = parent_row["commit_hash"] if parent_row else None
+
+    tree_content = json_mod.dumps(
+        {c["path"]: c["blob_hash"] for c in changes
+         if c["change_type"] != "delete"},
+        sort_keys=True
+    ).encode()
+    tree_hash = obj_store.hash_content(tree_content)
+    obj_store.store_blob(tree_content, objects_dir)
+
+    ts = str(time.time())
+    msg = f"Promote: {branch}"
+    if notes:
+        msg += f"\n\n{notes}"
+    commit_content = f"{tree_hash}\n{parent_hash or 'none'}\n{owner['username'] if owner else 'unknown'}\n{ts}\n{msg}"
+    commit_hash = obj_store.hash_content(commit_content.encode())
+    parent_hashes = [parent_hash] if parent_hash else None
+
+    try:
+        db.execute(conn, """
+            INSERT INTO repo_commits
+                (commit_hash, repo_id, tree_hash, author_id, author_name,
+                 committer_id, committer_name, message, parent_hashes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (commit_hash, r["repo_id"], tree_hash,
+              staging_row["user_id"],
+              owner["username"] if owner else "unknown",
+              user["user_id"], user["username"],
+              msg, parent_hashes), commit=False)
+
+        for c in changes:
+            db.execute(conn, """
+                INSERT INTO repo_changesets
+                    (commit_hash, path, change_type, blob_before,
+                     blob_after, lines_added, lines_removed)
+                VALUES (%s, %s, %s, NULL, %s, %s, %s)
+            """, (commit_hash, c["path"], c["change_type"],
+                  c["blob_hash"], c["lines_added"],
+                  c["lines_removed"]), commit=False)
+
+        db.execute(conn, """
+            UPDATE repo_refs
+               SET commit_hash = %s, updated_at = NOW(), updated_by = %s
+             WHERE repo_id = %s AND ref_name = %s
+        """, (commit_hash, user["user_id"], r["repo_id"],
+              f"refs/heads/{r.get('default_branch','main')}"),
+            commit=False)
+
+        db.execute(conn, """
+            INSERT INTO repo_promotions
+                (staging_id, repo_id, promoted_by, commit_hash, notes)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (staging_id, r["repo_id"], user["user_id"],
+              commit_hash, notes or None), commit=False)
+
+        db.execute(conn,
+            "UPDATE repo_staging SET status = 'promoted', updated_at = NOW() WHERE staging_id = %s",
+            (staging_id,), commit=False)
+
+        db.audit_log(conn, "promote", user_id=user["user_id"],
+                     repo_id=r["repo_id"], target_type="staging",
+                     target_id=str(staging_id),
+                     details={"commit_hash": commit_hash, "notes": notes},
+                     commit=False)
+
+        db.execute(conn,
+            "UPDATE repo_repositories SET updated_at = NOW() WHERE repo_id = %s",
+            (r["repo_id"],), commit=False)
+
+        conn.commit()
+
+        rev = db.query_scalar(conn,
+            "SELECT rev FROM repo_commits WHERE commit_hash = %s",
+            (commit_hash,))
+
+        return {"status": "promoted", "commit_hash": commit_hash, "rev": rev}
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, f"Promotion failed: {e}")
 
 
 # =========================================================================

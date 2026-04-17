@@ -123,6 +123,21 @@ def commit(conn, repo_id: int, user_id: int, message: str,
     # Detect changes
     changes = worktree.detect_changes(repo_root, objects_dir)
 
+    # If no changes detected but index has files and no prior commits exist,
+    # treat all indexed files as new additions (first commit)
+    if not any(changes.values()):
+        index = worktree.load_index(repo_root)
+        if index:
+            parent_row = db.query_one(conn,
+                "SELECT commit_hash FROM repo_refs WHERE repo_id = %s AND ref_name = %s",
+                (repo_id, f"refs/heads/{worktree.get_current_branch(repo_root)}"))
+            if not parent_row or not parent_row["commit_hash"]:
+                # First commit — everything in index is new
+                changes["added"] = [
+                    (path, entry["hash"])
+                    for path, entry in index.items()
+                ]
+
     total_changes = len(changes["modified"]) + len(changes["added"]) + len(changes["deleted"])
     if total_changes == 0:
         print("Nothing to commit.")
@@ -263,6 +278,47 @@ def commit(conn, repo_id: int, user_id: int, message: str,
         conn.rollback()
         raise
 
+    # Auto-link issue references from commit message
+    try:
+        from .app import _parse_issue_refs  # avoid circular import
+    except ImportError:
+        pass
+
+    # Inline the parser to avoid circular import
+    import re
+    issue_patterns = [
+        (r'(?:fixes|fix|closes|close|resolves|resolve)\s+#(\d+)', 'fixed'),
+        (r'(?:introduces|introduced)\s+#(\d+)', 'introduced'),
+        (r'(?:relates|related|see)\s+#(\d+)', 'related'),
+        (r'#(\d+)', 'mentioned'),
+    ]
+    seen_issues = set()
+    for pattern, link_type in issue_patterns:
+        for match in re.finditer(pattern, message, re.IGNORECASE):
+            num = int(match.group(1))
+            if num in seen_issues:
+                continue
+            seen_issues.add(num)
+            issue_row = db.query_one(conn,
+                "SELECT issue_id FROM repo_issues WHERE repo_id = %s AND number = %s",
+                (repo_id, num))
+            if issue_row:
+                try:
+                    db.execute(conn, """
+                        INSERT INTO repo_issue_commits
+                            (issue_id, commit_hash, link_type)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT DO NOTHING
+                    """, (issue_row["issue_id"], commit_hash, link_type))
+                    if link_type == 'fixed':
+                        db.execute(conn, """
+                            UPDATE repo_issues
+                               SET status = 'resolved', closed_at = NOW()
+                             WHERE issue_id = %s
+                        """, (issue_row["issue_id"],))
+                except Exception:
+                    pass
+
     # Only update local index AFTER successful DB commit
     worktree.save_index(repo_root, tree_entries)
 
@@ -273,7 +329,8 @@ def commit(conn, repo_id: int, user_id: int, message: str,
     try:
         _bump_file_revs(conn, repo_id, commit_hash, rev, changes, user["username"], message)
         conn.commit()
-    except Exception:
+    except Exception as e:
+        print(f"WARNING: _bump_file_revs failed: {e}")
         conn.rollback()
 
     return {
@@ -402,6 +459,47 @@ def commit_files(conn, repo_id: int, user_id: int, message: str,
         conn.rollback()
         raise
 
+    # Auto-link issue references from commit message
+    try:
+        from .app import _parse_issue_refs  # avoid circular import
+    except ImportError:
+        pass
+
+    # Inline the parser to avoid circular import
+    import re
+    issue_patterns = [
+        (r'(?:fixes|fix|closes|close|resolves|resolve)\s+#(\d+)', 'fixed'),
+        (r'(?:introduces|introduced)\s+#(\d+)', 'introduced'),
+        (r'(?:relates|related|see)\s+#(\d+)', 'related'),
+        (r'#(\d+)', 'mentioned'),
+    ]
+    seen_issues = set()
+    for pattern, link_type in issue_patterns:
+        for match in re.finditer(pattern, message, re.IGNORECASE):
+            num = int(match.group(1))
+            if num in seen_issues:
+                continue
+            seen_issues.add(num)
+            issue_row = db.query_one(conn,
+                "SELECT issue_id FROM repo_issues WHERE repo_id = %s AND number = %s",
+                (repo_id, num))
+            if issue_row:
+                try:
+                    db.execute(conn, """
+                        INSERT INTO repo_issue_commits
+                            (issue_id, commit_hash, link_type)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT DO NOTHING
+                    """, (issue_row["issue_id"], commit_hash, link_type))
+                    if link_type == 'fixed':
+                        db.execute(conn, """
+                            UPDATE repo_issues
+                               SET status = 'resolved', closed_at = NOW()
+                             WHERE issue_id = %s
+                        """, (issue_row["issue_id"],))
+                except Exception:
+                    pass
+
     rev = db.query_scalar(conn,
         "SELECT rev FROM repo_commits WHERE commit_hash = %s", (commit_hash,))
 
@@ -414,7 +512,8 @@ def commit_files(conn, repo_id: int, user_id: int, message: str,
     try:
         _bump_file_revs(conn, repo_id, commit_hash, rev, file_changes, user["username"], message)
         conn.commit()
-    except Exception:
+    except Exception as e:
+        print(f"WARNING: _bump_file_revs failed: {e}")
         conn.rollback()
 
     return {

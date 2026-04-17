@@ -132,6 +132,44 @@ def get_user_by_name(conn, username):
     """Get user by username."""
     return query_one(conn, "SELECT * FROM repo_users WHERE username = %s", (username,))
 
+def get_repo_access_users(conn, repo_id: int):
+    """List users with explicit access to a private repo."""
+    return query(conn, """
+        SELECT u.user_id, u.username, u.role, a.granted_at
+          FROM repo_access a
+          JOIN repo_users u ON u.user_id = a.user_id
+         WHERE a.repo_id = %s
+         ORDER BY u.username
+    """, (repo_id,))
+
+def grant_repo_access(conn, repo_id: int, user_id: int, granter_id: int):
+    """Grant a user access to a repo."""
+    execute(conn, """
+        INSERT INTO repo_access (repo_id, user_id, granted_by)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (repo_id, user_id) DO NOTHING
+    """, (repo_id, user_id, granter_id), commit=False)
+    audit_log(conn, "repo_access_grant", user_id=granter_id, repo_id=repo_id,
+              target_type="user", target_id=str(user_id), commit=False)
+    conn.commit()
+
+def revoke_repo_access(conn, repo_id: int, user_id: int, revoker_id: int):
+    """Revoke a user's access to a repo."""
+    execute(conn,
+        "DELETE FROM repo_access WHERE repo_id = %s AND user_id = %s",
+        (repo_id, user_id), commit=False)
+    audit_log(conn, "repo_access_revoke", user_id=revoker_id, repo_id=repo_id,
+              target_type="user", target_id=str(user_id), commit=False)
+    conn.commit()
+
+def create_notification(conn, user_id: int, notif_type: str,
+                        message: str, link: str = None,
+                        repo_id: int = None, commit: bool = True):
+    """Create a notification for a user."""
+    execute(conn, """
+        INSERT INTO repo_notifications (user_id, repo_id, type, message, link)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (user_id, repo_id, notif_type, message, link), commit=commit)
 
 # =========================================================================
 # AUDIT LOG

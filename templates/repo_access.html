@@ -1,76 +1,62 @@
 {% extends "base.html" %}
-{% block title %}Manage Access &mdash; {{ repo.name }}{% endblock %}
-
-{% block extra_css %}
-<style>
-    main {
-        background:
-            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
-            url('/static/gates-of-olympus.png') center center / cover no-repeat fixed;
-    }
-</style>
-{% endblock %}
+{% block title %}Manage Access for {{ repo.name }} &mdash; OlympusRepo{% endblock %}
 
 {% block content %}
-<div class="container" style="max-width:800px;">
-    <div class="row-between" style="margin-bottom:24px;">
-        <h1 style="margin-bottom:0;">Manage Access Grants</h1>
-        <a href="/repo/{{ repo.name }}/settings" class="btn">Back to Settings</a>
+<div class="container">
+    <div style="margin-bottom:24px;">
+        <h1 style="margin-bottom:4px;">
+            <a href="/repo/{{ repo.name }}">{{ repo.name }}</a> / Manage Access
+        </h1>
+        <p style="color:#8b949e; margin:0;">Grant and revoke user access for this repository.</p>
     </div>
 
-    {% if repo.visibility == 'public' %}
-    <div class="flash" style="background:#1f6feb20; border:1px solid #1f6feb; color:#c9d1d9;">
-        This repo is public &mdash; all users can read it. Explicit grants provide write or admin access.
-    </div>
-    {% endif %}
-
-    <div class="card" style="margin-bottom:32px;">
-        <h2 style="margin-top:0;">Grant Access</h2>
-        <div class="row">
-            <select id="grant-user" style="flex:1;">
-                <option value="">-- Select User --</option>
-                {% for u in all_users %}
-                    <option value="{{ u.user_id }}">{{ u.username }} ({{ u.role }})</option>
-                {% endfor %}
-            </select>
-            <select id="grant-level" style="width:auto;">
-                <option value="read">Read</option>
-                <option value="write">Write</option>
-                <option value="admin">Admin</option>
-            </select>
-            <button id="grant-btn" class="btn btn-primary">Grant</button>
-        </div>
+    <!-- Grant access form -->
+    <div class="card" style="margin-bottom: 24px;">
+        <h3 style="margin-top:0;">Grant Access</h3>
+        <div id="grant-error" class="flash flash-error" style="display:none;"></div>
+        <form id="grant-form" class="row" style="align-items: flex-end;">
+            <div class="form-group" style="flex:1; position:relative;">
+                <label>Search User</label>
+                <input type="text" id="user-search-input" placeholder="Type username..." autocomplete="off">
+                <div id="user-search-results" style="display:none; background:#161b22; border:1px solid #30363d; border-radius:0 0 6px 6px; max-height:200px; overflow-y:auto; position:absolute; z-index:50; width:100%;"></div>
+                <input type="hidden" id="selected-user-id" name="user_id">
+                <div id="selected-user-display" style="display:none; margin-top:6px; padding:6px 10px; background:#21262d; border-radius:4px; font-size:0.9em;"></div>
+            </div>
+            <button type="submit" class="btn btn-primary">Grant Access</button>
+        </form>
     </div>
 
-    <h2 style="margin-bottom:12px;">Current Grants</h2>
-    {% if grants %}
+    <!-- Users with access -->
+    <div class="card">
+        <h3 style="margin-top:0;">Users with Access</h3>
+        <div id="revoke-error" class="flash flash-error" style="display:none;"></div>
         <table>
             <thead>
                 <tr>
-                    <th>User</th>
+                    <th>Username</th>
                     <th>Role</th>
-                    <th>Access Level</th>
-                    <th>Granted</th>
-                    <th>Actions</th>
+                    <th>Access Granted</th>
+                    <th></th>
                 </tr>
             </thead>
             <tbody>
-                {% for g in grants %}
-                <tr>
-                    <td style="font-weight:600;">{{ g.username }}</td>
-                    <td><span class="role-tag role-{{ g.role }}">{{ g.role }}</span></td>
-                    <td>{{ g.access_level }}</td>
-                    <td class="card-meta">{% if g.granted_at %}{{ g.granted_at.strftime('%b %d, %Y') }}{% endif %}</td>
-                    <td>
-                        <button class="btn btn-danger revoke-btn" data-id="{{ g.access_id }}" style="padding:2px 8px; font-size:0.8em;">Revoke</button>
+                {% for u in access_users %}
+                <tr id="user-row-{{ u.user_id }}">
+                    <td>{{ u.username }}</td>
+                    <td><span class="role-tag role-{{ u.role }}">{{ u.role }}</span></td>
+                    <td>{{ u.granted_at.strftime('%Y-%m-%d') if u.granted_at else 'N/A' }}</td>
+                    <td style="text-align:right;">
+                        <button class="btn btn-danger revoke-btn" data-user-id="{{ u.user_id }}" data-username="{{ u.username }}">Revoke</button>
                     </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="4" style="text-align:center; color:#8b949e;">No users have been granted explicit access.</td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
-    {% else %}
-        <div class="empty-state"><p>No explicit access grants.</p></div>
-    {% endif %}
+    </div>
 </div>
 {% endblock %}
 
@@ -79,63 +65,133 @@
 (function() {
     var repoName = {{ repo.name | tojson }};
 
-    var grantBtn = document.getElementById('grant-btn');
-    if (grantBtn) {
-        grantBtn.addEventListener('click', async function() {
-            var userId = document.getElementById('grant-user').value;
-            var level = document.getElementById('grant-level').value;
+    var searchInput = document.getElementById('user-search-input');
+    var searchResults = document.getElementById('user-search-results');
+    var selectedUserId = document.getElementById('selected-user-id');
+    var selectedUserDisplay = document.getElementById('selected-user-display');
+    var searchTimeout = null;
 
-            if (!userId) {
-                alert('Please select a user.');
+    function escapeHtml(str) {
+        return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    if (searchInput) {
+        searchInput.addEventListener('input', function() {
+            clearTimeout(searchTimeout);
+            var q = this.value.trim();
+            if (q.length < 2) {
+                searchResults.style.display = 'none';
                 return;
             }
+            searchTimeout = setTimeout(async function() {
+                try {
+                    var res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
+                    if (res.ok) {
+                        var users = await res.json();
+                        searchResults.innerHTML = '';
+                        if (users.length === 0) {
+                            searchResults.innerHTML = '<div style="padding:8px 12px; color:#8b949e;">No users found</div>';
+                        } else {
+                            users.forEach(function(u) {
+                                var div = document.createElement('div');
+                                div.style.cssText = 'padding:8px 12px; cursor:pointer; border-bottom:1px solid #30363d;';
+                                div.innerHTML = '<strong>' + escapeHtml(u.username) + '</strong> <span style="color:#8b949e;font-size:0.85em;">' + escapeHtml(u.full_name || '') + '</span>';
+                                div.addEventListener('mouseenter', function() { div.style.background = '#21262d'; });
+                                div.addEventListener('mouseleave', function() { div.style.background = 'transparent'; });
+                                div.addEventListener('click', function() {
+                                    selectedUserId.value = u.user_id;
+                                    selectedUserDisplay.innerHTML = 'Selected: <strong>' + escapeHtml(u.username) + '</strong> <a href="#" id="clear-selected-user" style="color:#f85149; margin-left:8px; font-size:0.85em;">Clear</a>';
+                                    selectedUserDisplay.style.display = 'block';
+                                    searchInput.style.display = 'none';
+                                    searchResults.style.display = 'none';
+                                    
+                                    document.getElementById('clear-selected-user').addEventListener('click', function(e) {
+                                        e.preventDefault();
+                                        selectedUserId.value = '';
+                                        selectedUserDisplay.style.display = 'none';
+                                        searchInput.value = '';
+                                        searchInput.style.display = 'block';
+                                        searchInput.focus();
+                                    });
+                                });
+                                searchResults.appendChild(div);
+                            });
+                        }
+                        searchResults.style.display = 'block';
+                    }
+                } catch(e) {}
+            }, 300);
+        });
 
-            grantBtn.disabled = true;
-            try {
-                var form = new FormData();
-                form.append('user_id', userId);
-                form.append('access_level', level);
-
-                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/access', {
-                    method: 'POST',
-                    body: form
-                });
-
-                if (res.ok) {
-                    window.location.reload();
-                } else {
-                    var data = {};
-                    try { data = await res.json(); } catch(e) {}
-                    alert(data.detail || 'Could not grant access.');
-                    grantBtn.disabled = false;
-                }
-            } catch(err) {
-                alert('Network error.');
-                grantBtn.disabled = false;
+        document.addEventListener('click', function(e) {
+            if (!searchInput.contains(e.target) && !searchResults.contains(e.target)) {
+                searchResults.style.display = 'none';
             }
         });
     }
 
-    document.querySelectorAll('.revoke-btn').forEach(function(btn) {
-        btn.addEventListener('click', async function() {
-            if (!confirm('Revoke access for this user?')) return;
-            var accessId = btn.getAttribute('data-id');
+    // Grant access
+    var grantForm = document.getElementById('grant-form');
+    if (grantForm) {
+        grantForm.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            var errEl = document.getElementById('grant-error');
+            errEl.style.display = 'none';
+            var btn = grantForm.querySelector('button');
             btn.disabled = true;
 
             try {
-                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/access/' + accessId, {
-                    method: 'DELETE'
+                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/access/grant', {
+                    method: 'POST',
+                    body: new FormData(grantForm)
                 });
                 if (res.ok) {
                     window.location.reload();
                 } else {
                     var data = {};
                     try { data = await res.json(); } catch(e) {}
-                    alert(data.detail || 'Could not revoke access.');
+                    errEl.textContent = data.detail || 'Failed to grant access.';
+                    errEl.style.display = 'block';
                     btn.disabled = false;
                 }
-            } catch(err) {
-                alert('Network error.');
+            } catch (err) {
+                errEl.textContent = 'Network error.';
+                errEl.style.display = 'block';
+                btn.disabled = false;
+            }
+        });
+    }
+
+    // Revoke access
+    document.querySelectorAll('.revoke-btn').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+            var userId = btn.getAttribute('data-user-id');
+            var username = btn.getAttribute('data-username');
+            if (!confirm('Are you sure you want to revoke access for ' + username + '?')) {
+                return;
+            }
+
+            var errEl = document.getElementById('revoke-error');
+            errEl.style.display = 'none';
+            btn.disabled = true;
+
+            try {
+                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/access/' + encodeURIComponent(userId), {
+                    method: 'DELETE'
+                });
+                if (res.ok) {
+                    var row = document.getElementById('user-row-' + userId);
+                    if (row) row.remove();
+                } else {
+                    var data = {};
+                    try { data = await res.json(); } catch(e) {}
+                    errEl.textContent = data.detail || 'Failed to revoke access.';
+                    errEl.style.display = 'block';
+                    btn.disabled = false;
+                }
+            } catch (err) {
+                errEl.textContent = 'Network error.';
+                errEl.style.display = 'block';
                 btn.disabled = false;
             }
         });

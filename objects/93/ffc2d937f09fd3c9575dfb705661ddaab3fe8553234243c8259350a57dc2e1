@@ -1,0 +1,202 @@
+{% extends "base.html" %}
+{% block title %}Message &mdash; OlympusRepo{% endblock %}
+
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            url('/static/hermes-messenger.png') center center / cover no-repeat fixed;
+    }
+    .msg-bubble {
+        border-radius: 6px;
+        padding: 14px 16px;
+        margin-bottom: 12px;
+    }
+    .msg-mine {
+        background: #1c2d1e;
+        border: 1px solid #238636;
+        margin-left: 48px;
+    }
+    .msg-theirs {
+        background: #161b22;
+        border: 1px solid #30363d;
+        margin-right: 48px;
+    }
+    .msg-meta {
+        font-size: 0.8em;
+        color: #8b949e;
+        margin-bottom: 6px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .msg-content {
+        color: #c9d1d9;
+        white-space: pre-wrap;
+        word-break: break-word;
+        line-height: 1.6;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container" style="max-width:700px;">
+
+    <div class="row-between" style="margin-bottom:24px;">
+        <a href="/messages" class="btn">&larr; Inbox</a>
+        <div class="card-meta">
+            {% if root.created_at %}
+                Started {{ root.created_at.strftime('%b %d, %Y %H:%M') }}
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- ROOT MESSAGE -->
+    <div class="msg-bubble {% if root.sender_id == user.user_id %}msg-mine{% else %}msg-theirs{% endif %}">
+        <div class="msg-meta">
+            <strong style="color:#f0f6fc;">{{ root.sender_name }}</strong>
+            <span>&rarr;</span>
+            <span>{{ root.recipient_name }}</span>
+            {% if root.created_at %}
+            <span style="margin-left:auto;">
+                {{ root.created_at.strftime('%b %d %H:%M') }}
+            </span>
+            {% endif %}
+        </div>
+        <div class="msg-content">{{ root.content }}</div>
+    </div>
+
+    <!-- REPLIES -->
+    {% if replies %}
+    <div style="margin:16px 0 8px 0; color:#8b949e; font-size:0.85em;">
+        {{ replies|length }} repl{% if replies|length != 1 %}ies{% else %}y{% endif %}
+    </div>
+
+    {% for r in replies %}
+    <div class="msg-bubble {% if r.sender_id == user.user_id %}msg-mine{% else %}msg-theirs{% endif %}">
+        <div class="msg-meta">
+            <strong style="color:#f0f6fc;">{{ r.sender_name }}</strong>
+            {% if r.created_at %}
+            <span style="margin-left:auto;">
+                {{ r.created_at.strftime('%b %d %H:%M') }}
+            </span>
+            {% endif %}
+        </div>
+        <div class="msg-content">{{ r.content }}</div>
+    </div>
+    {% endfor %}
+    {% else %}
+    <div style="color:#484f58; font-size:0.85em; margin:12px 0;">
+        No replies yet.
+    </div>
+    {% endif %}
+
+    <!-- REPLY BOX -->
+    {% if user %}
+    <div class="card" style="margin-top:24px;">
+        <h3 style="margin-top:0;">Reply</h3>
+        <div id="reply-error" class="flash flash-error" style="display:none;"></div>
+        <div class="form-group">
+            <textarea id="reply-content"
+                      placeholder="Write your reply... (Shift+Enter for newline, Enter to send)"
+                      style="min-height:100px;"></textarea>
+        </div>
+        <button id="reply-btn" class="btn btn-primary">Send Reply</button>
+    </div>
+    {% endif %}
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    var rootId      = {{ root.message_id }};
+    var recipientId = {{ root.sender_id if root.sender_id != user.user_id else root.recipient_id }};
+    var replyBtn    = document.getElementById('reply-btn');
+    var errEl       = document.getElementById('reply-error');
+
+    if (!replyBtn) return;
+
+    async function sendReply() {
+        errEl.style.display = 'none';
+        var content = document.getElementById('reply-content').value.trim();
+        if (!content) {
+            errEl.textContent = 'Reply cannot be empty.';
+            errEl.style.display = 'block';
+            return;
+        }
+
+        replyBtn.disabled = true;
+        replyBtn.textContent = 'Sending...';
+
+        try {
+            var form = new FormData();
+            form.append('recipient_id', recipientId);
+            form.append('content', content);
+            form.append('parent_id', rootId);
+            form.append('thread_id', rootId);
+
+            var res = await fetch('/api/messages', {
+                method: 'POST', body: form
+            });
+
+            if (res.ok) {
+                // Append reply inline without full page reload
+                var data = await res.json();
+                var textarea = document.getElementById('reply-content');
+                textarea.value = '';
+
+                // Build reply bubble
+                var now = new Date().toLocaleString('en-US', {
+                    month:'short', day:'numeric',
+                    hour:'2-digit', minute:'2-digit'
+                });
+                var bubble = document.createElement('div');
+                bubble.className = 'msg-bubble msg-mine';
+                bubble.innerHTML =
+                    '<div class="msg-meta">' +
+                    '<strong style="color:#f0f6fc;">{{ user.username }}</strong>' +
+                    '<span style="margin-left:auto;">' + now + '</span>' +
+                    '</div>' +
+                    '<div class="msg-content">' +
+                    escapeHtml(content) + '</div>';
+
+                // Insert before the reply box card
+                var replyCard = document.querySelector('.card');
+                replyCard.parentNode.insertBefore(bubble, replyCard);
+                textarea.focus();
+            } else {
+                var d = {};
+                try { d = await res.json(); } catch(e) {}
+                errEl.textContent = d.detail || 'Could not send reply.';
+                errEl.style.display = 'block';
+            }
+        } catch(err) {
+            errEl.textContent = 'Network error.';
+            errEl.style.display = 'block';
+        } finally {
+            replyBtn.disabled = false;
+            replyBtn.textContent = 'Send Reply';
+        }
+    }
+
+    replyBtn.addEventListener('click', sendReply);
+
+    document.getElementById('reply-content')
+        .addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendReply();
+            }
+        });
+
+    function escapeHtml(str) {
+        return String(str || '')
+            .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+            .replace(/>/g,'&gt;');
+    }
+})();
+</script>
+{% endblock %}

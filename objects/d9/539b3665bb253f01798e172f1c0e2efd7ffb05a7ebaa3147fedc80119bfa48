@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}Reset Password &mdash; OlympusRepo{% endblock %}
+
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            url('/static/hermes-messenger.png') center center / cover no-repeat fixed;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div style="position:relative; min-height:100vh; display:flex; align-items:center; justify-content:center;">
+    <div style="position:relative; z-index:1; width:100%; max-width:400px; padding:24px;">
+        <div class="card" style="background:rgba(22,27,34,0.95); backdrop-filter:blur(8px);">
+            <h2 style="margin-top:0;">Reset Password</h2>
+            
+            {% if not token %}
+                <div class="empty-state">
+                    <p>Use the link from your reset email.</p>
+                </div>
+            {% else %}
+                <div id="reset-error" class="flash flash-error" style="display:none;"></div>
+                <div id="reset-success" class="flash flash-success" style="display:none;"></div>
+
+                <div id="reset-form-container">
+                    <div class="form-group">
+                        <label for="new-password">New Password <span style="color:#8b949e;">(8 chars min)</span></label>
+                        <input type="password" id="new-password">
+                    </div>
+                    <div class="form-group">
+                        <label for="confirm-password">Confirm Password</label>
+                        <input type="password" id="confirm-password">
+                    </div>
+                    <button id="reset-btn" class="btn btn-primary" style="width:100%;">Reset Password</button>
+                </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    var token = "{{ token }}";
+    if (!token) return;
+
+    var btn = document.getElementById('reset-btn');
+    var errEl = document.getElementById('reset-error');
+    var okEl = document.getElementById('reset-success');
+    var formContainer = document.getElementById('reset-form-container');
+
+    btn.addEventListener('click', async function() {
+        errEl.style.display = 'none';
+        okEl.style.display = 'none';
+
+        var newPass = document.getElementById('new-password').value;
+        var confirmPass = document.getElementById('confirm-password').value;
+
+        if (newPass.length < 8) {
+            errEl.textContent = 'Password must be at least 8 characters.';
+            errEl.style.display = 'block';
+            return;
+        }
+        if (newPass !== confirmPass) {
+            errEl.textContent = 'Passwords do not match.';
+            errEl.style.display = 'block';
+            return;
+        }
+
+        btn.disabled = true;
+        btn.textContent = 'Resetting...';
+
+        try {
+            var form = new FormData();
+            form.append('token', token);
+            form.append('new_password', newPass);
+
+            var res = await fetch('/api/auth/reset-password', {
+                method: 'POST',
+                body: form
+            });
+            
+            var data = {};
+            try { data = await res.json(); } catch(e) {}
+
+            if (res.ok) {
+                formContainer.style.display = 'none';
+                okEl.innerHTML = data.message + ' <a href="/login" style="font-weight:bold;">Go to Login</a>';
+                okEl.style.display = 'block';
+            } else {
+                errEl.textContent = data.detail || 'Could not reset password.';
+                errEl.style.display = 'block';
+                btn.disabled = false;
+                btn.textContent = 'Reset Password';
+            }
+        } catch(err) {
+            errEl.textContent = 'Network error.';
+            errEl.style.display = 'block';
+            btn.disabled = false;
+            btn.textContent = 'Reset Password';
+        }
+    });
+})();
+</script>
+{% endblock %}

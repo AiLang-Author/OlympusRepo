@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}{{ path }} &mdash; History &mdash; {{ repo.name }}{% endblock %}
+
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            url('/static/commit-room.png') center center / cover no-repeat fixed;
+    }
+    .rev-row { cursor: pointer; }
+    .rev-row:hover td { background: #161b22; }
+    .change-add    { background: #12261e; color: #3fb950; }
+    .change-modify { background: #0d1f40; color: #58a6ff; }
+    .change-delete { background: #3d1214; color: #f85149; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+
+    <!-- Breadcrumb -->
+    <div class="row" style="margin-bottom:8px; gap:6px; font-size:0.9em;">
+        <a href="/repo/{{ repo.name }}">{{ repo.name }}</a>
+        <span style="color:#484f58;">/</span>
+        {% set segments = path.split('/') %}
+        {% for seg in segments %}
+            {% if not loop.last %}
+                <span style="color:#8b949e;">{{ seg }}</span>
+                <span style="color:#484f58;">/</span>
+            {% else %}
+                <strong style="color:#f0f6fc;">{{ seg }}</strong>
+            {% endif %}
+        {% endfor %}
+    </div>
+
+    <div class="row-between" style="margin-bottom:24px;">
+        <div>
+            <h1 style="margin-bottom:4px; font-family:monospace; font-size:1.2em;">
+                {{ path }}
+            </h1>
+            <div class="card-meta">
+                {{ revisions|length }} version{% if revisions|length != 1 %}s{% endif %}
+            </div>
+        </div>
+        <div class="row">
+            <a href="/repo/{{ repo.name }}/blob/{{ repo.default_branch }}/{{ path }}"
+               class="btn btn-primary">View Current</a>
+            <a href="/repo/{{ repo.name }}" class="btn">Back to Files</a>
+        </div>
+    </div>
+
+    {% if revisions %}
+    <table>
+        <thead>
+            <tr>
+                <th>When</th>
+                <th>Global Rev</th>
+                <th>Author</th>
+                <th>Commit Message</th>
+                <th>Change</th>
+                <th>Action</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in revisions %}
+            <tr class="rev-row">
+                <td style="white-space:nowrap; font-family:monospace; font-size:0.85em; color:#ffd700;">
+                    {% if r.committed_at %}
+                        {{ r.committed_at.strftime('%Y-%m-%d %H:%M') }}
+                    {% endif %}
+                </td>
+                <td class="card-meta">
+                    <a href="/repo/{{ repo.name }}/commit/{{ r.commit_hash }}"
+                       style="font-family:monospace;">
+                        rev {{ r.global_rev }}
+                    </a>
+                </td>
+                <td>
+                    <a href="/user/{{ r.author_name }}">{{ r.author_name }}</a>
+                </td>
+                <td style="color:#c9d1d9; max-width:300px;">
+                    {{ (r.message or '')[:80] }}
+                    {% if r.message and r.message|length > 80 %}...{% endif %}
+                </td>
+                <td>
+                    <span class="badge change-{{ r.change_type }}">
+                        {{ r.change_type }}
+                    </span>
+                </td>
+                <td>
+                    {% if r.change_type != 'delete' %}
+                    <a href="/repo/{{ repo.name }}/blob/{{ repo.default_branch }}/{{ path }}?at={{ r.committed_at.strftime('%Y-%m-%dT%H:%M:%S') }}"
+                       class="btn" style="padding:3px 8px; font-size:0.8em;">
+                        View
+                    </a>
+                    {% else %}
+                    <span style="color:#484f58; font-size:0.85em;">deleted</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    {% else %}
+    <div class="empty-state">
+        <p>No version history found for this file.</p>
+        <p style="margin-top:8px; font-size:0.9em; color:#8b949e;">
+            File revision tracking is recorded on new commits.
+        </p>
+    </div>
+    {% endif %}
+
+</div>
+{% endblock %}

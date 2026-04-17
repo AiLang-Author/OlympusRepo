@@ -1,0 +1,209 @@
+{% extends "base.html" %}
+{% block title %}My Account &mdash; OlympusRepo{% endblock %}
+
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            url('/static/hero-profile.png') center center / cover no-repeat fixed;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container" style="max-width:600px;">
+
+    <h1>My Account</h1>
+
+    <!-- PROFILE INFO -->
+    <div class="card" style="margin-bottom:24px;">
+        <h2 style="margin-top:0;">Profile</h2>
+        <div id="profile-error" class="flash flash-error" style="display:none;"></div>
+        <div id="profile-success" class="flash flash-success" style="display:none;"></div>
+
+        <div class="form-group">
+            <label>Username</label>
+            <input type="text" value="{{ user.username }}" disabled
+                   style="opacity:0.5; cursor:not-allowed;">
+            <div style="font-size:0.8em; color:#484f58; margin-top:4px;">
+                Username cannot be changed.
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label>Role</label>
+            <div style="padding:8px 0;">
+                <span class="role-tag role-{{ user.role }}">{{ user.role }}</span>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label for="full-name">Full Name</label>
+            <input type="text" id="full-name" value="{{ user.full_name or '' }}"
+                   placeholder="Your full name">
+        </div>
+
+        <div class="form-group">
+            <label for="email">Email</label>
+            <input type="email" id="email" value="{{ user.email or '' }}"
+                   placeholder="your@email.com">
+        </div>
+
+        <button id="save-profile-btn" class="btn btn-primary">Save Profile</button>
+    </div>
+
+    <!-- CHANGE PASSWORD -->
+    <div class="card" style="margin-bottom:24px;">
+        <h2 style="margin-top:0;">Change Password</h2>
+        <div id="pw-error" class="flash flash-error" style="display:none;"></div>
+        <div id="pw-success" class="flash flash-success" style="display:none;"></div>
+
+        <div class="form-group">
+            <label for="current-pw">Current Password</label>
+            <input type="password" id="current-pw" autocomplete="current-password">
+        </div>
+        <div class="form-group">
+            <label for="new-pw">New Password <span style="color:#8b949e;">(8 chars min)</span></label>
+            <input type="password" id="new-pw" autocomplete="new-password">
+        </div>
+        <div class="form-group">
+            <label for="confirm-pw">Confirm New Password</label>
+            <input type="password" id="confirm-pw" autocomplete="new-password">
+        </div>
+
+        <button id="change-pw-btn" class="btn btn-primary">Change Password</button>
+    </div>
+
+    <!-- SESSION INFO -->
+    <div class="card">
+        <h2 style="margin-top:0;">Session</h2>
+        <p style="color:#8b949e; margin:0;">
+            Logged in as <strong style="color:#f0f6fc;">{{ user.username }}</strong>
+            {% if user.last_login %}
+                &mdash; last login {{ user.last_login.strftime('%b %d, %Y %H:%M') }}
+            {% endif %}
+        </p>
+        <div style="margin-top:16px;">
+            <a href="#" id="logout-from-account" class="btn btn-danger"
+               style="font-size:0.9em;">Logout</a>
+        </div>
+    </div>
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+
+    // Save profile
+    document.getElementById('save-profile-btn').addEventListener('click', async function() {
+        var btn   = this;
+        var errEl = document.getElementById('profile-error');
+        var okEl  = document.getElementById('profile-success');
+        errEl.style.display = 'none';
+        okEl.style.display  = 'none';
+
+        btn.disabled = true;
+        btn.textContent = 'Saving...';
+
+        try {
+            var form = new FormData();
+            form.append('full_name', document.getElementById('full-name').value);
+            form.append('email', document.getElementById('email').value);
+
+            var res = await fetch('/api/auth/update-profile', {
+                method: 'POST', body: form
+            });
+
+            if (res.ok) {
+                okEl.textContent = 'Profile updated.';
+                okEl.style.display = 'block';
+            } else {
+                var data = {};
+                try { data = await res.json(); } catch(e) {}
+                errEl.textContent = data.detail || 'Could not update profile.';
+                errEl.style.display = 'block';
+            }
+        } catch(err) {
+            errEl.textContent = 'Network error.';
+            errEl.style.display = 'block';
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Save Profile';
+        }
+    });
+
+    // Change password
+    document.getElementById('change-pw-btn').addEventListener('click', async function() {
+        var btn   = this;
+        var errEl = document.getElementById('pw-error');
+        var okEl  = document.getElementById('pw-success');
+        errEl.style.display = 'none';
+        okEl.style.display  = 'none';
+
+        var current = document.getElementById('current-pw').value;
+        var newpw   = document.getElementById('new-pw').value;
+        var confirm = document.getElementById('confirm-pw').value;
+
+        if (!current) {
+            errEl.textContent = 'Current password is required.';
+            errEl.style.display = 'block';
+            return;
+        }
+        if (newpw.length < 8) {
+            errEl.textContent = 'New password must be at least 8 characters.';
+            errEl.style.display = 'block';
+            return;
+        }
+        if (newpw !== confirm) {
+            errEl.textContent = 'New passwords do not match.';
+            errEl.style.display = 'block';
+            return;
+        }
+
+        btn.disabled = true;
+        btn.textContent = 'Updating...';
+
+        try {
+            var form = new FormData();
+            form.append('current_password', current);
+            form.append('new_password', newpw);
+            form.append('confirm_password', confirm);
+
+            var res = await fetch('/api/auth/change-password', {
+                method: 'POST', body: form
+            });
+
+            if (res.ok) {
+                okEl.textContent = 'Password changed successfully.';
+                okEl.style.display = 'block';
+                document.getElementById('current-pw').value = '';
+                document.getElementById('new-pw').value = '';
+                document.getElementById('confirm-pw').value = '';
+            } else {
+                var data = {};
+                try { data = await res.json(); } catch(e) {}
+                errEl.textContent = data.detail || 'Could not change password.';
+                errEl.style.display = 'block';
+            }
+        } catch(err) {
+            errEl.textContent = 'Network error.';
+            errEl.style.display = 'block';
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Change Password';
+        }
+    });
+
+    // Logout from account page
+    document.getElementById('logout-from-account').addEventListener('click', async function(e) {
+        e.preventDefault();
+        await fetch('/api/auth/logout', { method: 'POST' });
+        window.location = '/login';
+    });
+
+})();
+</script>
+{% endblock %}

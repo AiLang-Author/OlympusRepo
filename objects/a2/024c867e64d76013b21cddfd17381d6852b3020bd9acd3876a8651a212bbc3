@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Access Denied &mdash; OlympusRepo{% endblock %}
+
+{% block extra_css %}
+<style>
+    main {
+        background: linear-gradient(to bottom, rgba(13,17,23,0.75), rgba(13,17,23,0.95)), url('/static/acess-denied.png') center top / cover no-repeat fixed;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="card" style="text-align:center; padding:48px; background:rgba(22,27,34,0.85); backdrop-filter:blur(4px); border-color:#da3633; max-width:600px;">
+    <h1 style="color:#f85149; font-size:2.5em; margin-bottom:16px;">Access Denied</h1>
+    <p style="font-size:1.2em; color:#c9d1d9; margin-bottom:24px;">The Thunderer does not grant you passage.</p>
+    {% if user %}
+        <div style="margin-bottom:24px;">Current role: <span class="role-tag role-{{ user.role }}" style="font-size:1em; padding:4px 10px;">{{ user.role }}</span></div>
+    {% endif %}
+    <a href="/" class="btn btn-primary" style="font-size:1.1em; padding:10px 24px;">Return to Safety</a>
+</div>
+{% endblock %}
