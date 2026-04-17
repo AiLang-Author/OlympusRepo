@@ -13,3 +13,5 @@ relay/*.db
 
 # Environment (contains secrets)
 .env
+objects/
+*.egg-info/
