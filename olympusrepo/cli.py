@@ -72,8 +72,6 @@ def cmd_init(args):
             "user_id": user["user_id"],
         })
         
-        repo_setup.init_instance_user(conn)
-
         # Create local objects directory
         objects_dir = os.environ.get(
             "OLYMPUSREPO_OBJECTS_DIR",

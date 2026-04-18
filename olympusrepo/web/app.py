@@ -1126,8 +1126,17 @@ async def upload_files(name: str, request: Request,
     if not r:
         raise HTTPException(404, "Repository not found")
 
-    if not repo.check_visibility(conn, r["repo_id"], user["user_id"]):
-        raise HTTPException(403, "Access denied")
+    # Direct commits require write permission — owner or an explicit
+    # repo_access row at 'write' / 'admin' level. Non-owners contributing
+    # to someone else's repo must use the offer/staging flow
+    # (POST /api/sync/{name}/offer) which routes changes through
+    # Olympian/Zeus review rather than writing the canonical tree.
+    if not repo.check_can_write(conn, r["repo_id"], user["user_id"]):
+        raise HTTPException(
+            403,
+            "Direct commits require write access. "
+            "Use offer/staging to contribute to this repo.",
+        )
 
     file_data = []
     for f in files:

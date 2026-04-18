@@ -355,6 +355,12 @@ def commit_files(conn, repo_id: int, user_id: int, message: str,
         elif row["change_type"] == "delete":
             tree.pop(row["path"], None)
 
+    # Snapshot what existed BEFORE this commit. The change_type decision
+    # later needs to know "did this path exist pre-commit?" — we can't
+    # derive that after the tree has been mutated, because every new
+    # path will already be present.
+    existing_paths = set(tree.keys())
+
     # Apply new files
     new_hashes = {}
     for filepath, content in files:
@@ -393,7 +399,10 @@ def commit_files(conn, repo_id: int, user_id: int, message: str,
 
         for filepath, content in files:
             h = new_hashes[filepath]
-            change_type = "modify" if filepath in (tree.keys() - {f for f, _ in files}) else "add"
+            # Use the pre-mutation snapshot — `tree` was written above, so
+            # `filepath in tree.keys()` is always True here. Comparing against
+            # `existing_paths` is the correct "did this path exist before?"
+            change_type = "modify" if filepath in existing_paths else "add"
             db.execute(conn, """
                 INSERT INTO repo_changesets
                     (commit_hash, path, change_type, blob_after)
@@ -707,3 +716,37 @@ def check_visibility(conn, repo_id: int, user_id: int = None) -> bool:
         "SELECT 1 FROM repo_access WHERE repo_id = %s AND user_id = %s",
         (repo_id, user_id))
     return row is not None
+
+
+def check_can_write(conn, repo_id: int, user_id: int) -> bool:
+    """
+    Check if user can commit to this repo directly (as opposed to offering
+    to staging). Returns True only for:
+      - The repo owner
+      - Users with an explicit repo_access row at level 'write' or 'admin'
+
+    Read-only access (including public-repo visibility or 'read' grants)
+    does NOT authorize direct commits. Non-owners wanting to contribute
+    must use the offer/staging flow (/api/sync/{name}/offer) which
+    routes changes to a staging realm for Olympian/Zeus review.
+    """
+    if user_id is None:
+        return False
+
+    repo_row = db.query_one(conn,
+        "SELECT owner_id FROM repo_repositories WHERE repo_id = %s", (repo_id,))
+    if not repo_row:
+        return False
+
+    if repo_row["owner_id"] == user_id:
+        return True
+
+    row = db.query_one(conn, """
+        SELECT access_level
+          FROM repo_access
+         WHERE repo_id = %s AND user_id = %s
+    """, (repo_id, user_id))
+    if row and row["access_level"] in ("write", "admin"):
+        return True
+
+    return False
