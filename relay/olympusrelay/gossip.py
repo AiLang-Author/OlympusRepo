@@ -10,6 +10,13 @@ import httpx
 from . import config
 from .registry import registry
 
+# Import the same verifier the HTTP endpoint uses so gossip-exchange and
+# registration apply identical signature/freshness rules.
+try:
+    from olympusrepo.core.identity import verify_heartbeat
+except ImportError:
+    from .app import verify_heartbeat  # local stub fallback
+
 
 def _gossip_once():
     records = registry.list_for_gossip()
@@ -28,7 +35,8 @@ def _gossip_once():
                 data = r.json()
                 incoming = data.get("instances", [])
                 if incoming:
-                    registry.merge_gossip(incoming, via_relay=peer)
+                    registry.merge_gossip(incoming, via_relay=peer,
+                                          verify=verify_heartbeat)
         except Exception:
             pass  # peer unreachable — silent, try next cycle
 

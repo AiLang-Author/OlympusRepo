@@ -47,6 +47,7 @@ except ImportError:
 
 @asynccontextmanager
 async def lifespan(app):
+    config.ensure_secret()
     relay_id = config.RELAY_ID or "olympusrelay"
     print(f"  OlympusRelay starting — id: {relay_id}")
     print(f"  Port:    {config.PORT}")
@@ -74,7 +75,7 @@ async def register(request: Request):
         raise HTTPException(400, "Invalid instance_id.")
 
     existing = registry.find(iid)
-    token    = registry.register(payload, source="direct")
+    token    = registry.register(payload, source="direct", envelope=envelope)
     status   = "refreshed" if existing else "registered"
 
     return {
@@ -102,7 +103,9 @@ async def find(instance_id: str):
             "stale":       False,
         }
 
-    # Not found locally — fan out to peers (depth-1 only)
+    # Not found locally — fan out to peers (depth-1 only). Peer responses
+    # are treated as hostile: we do not cache them unless they include a
+    # verifiable signed envelope (which plain /relay/find responses do not).
     searched = []
     for peer in config.PEERS:
         url = peer.rstrip("/") + f"/relay/find/{instance_id}"
@@ -110,10 +113,7 @@ async def find(instance_id: str):
         try:
             r = httpx.get(url, timeout=3)
             if r.status_code == 200:
-                data = r.json()
-                # Merge into our registry so future queries hit local cache
-                registry.register(data, source="gossip", via_relay=peer)
-                return data
+                return r.json()
         except Exception:
             pass
 
@@ -125,6 +125,23 @@ async def find(instance_id: str):
 
 # ── POST /relay/punch ────────────────────────────────────────────────────────
 
+def _is_safe_egress_ip(ip: str) -> bool:
+    """Block private / loopback / link-local / metadata ranges to prevent
+    the relay from being used as an SSRF proxy into a deployer's network.
+    Operators explicitly hosting on private networks can set
+    OLYMPUSRELAY_ALLOW_PRIVATE=1 to skip this check."""
+    import ipaddress, os as _os
+    if _os.environ.get("OLYMPUSRELAY_ALLOW_PRIVATE") == "1":
+        return True
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not (addr.is_private or addr.is_loopback or
+                addr.is_link_local or addr.is_reserved or
+                addr.is_multicast or addr.is_unspecified)
+
+
 @app.post("/relay/punch")
 async def punch(request: Request):
     body = await request.json()
@@ -135,6 +152,11 @@ async def punch(request: Request):
     target = registry.find(to_id)
     if not target:
         raise HTTPException(404, "Target instance not found.")
+
+    if not _is_safe_egress_ip(target.ip):
+        raise HTTPException(400, "Target IP is not routable.")
+    if not (1 <= int(target.port) <= 65535):
+        raise HTTPException(400, "Target port is invalid.")
 
     import uuid
     punch_id = str(uuid.uuid4())
@@ -187,7 +209,10 @@ async def gossip(request: Request):
     from_relay = body.get("from_relay", "unknown")
     records    = body.get("instances", [])
 
-    registry.merge_gossip(records, via_relay=from_relay)
+    # Each record must be a signed envelope — registry verifies every one
+    # before accepting. Unsigned / bad-sig records are silently dropped.
+    registry.merge_gossip(records, via_relay=from_relay,
+                          verify=verify_heartbeat)
 
     # Return our own records so the peer can merge them too (single exchange)
     return {

@@ -194,29 +194,40 @@ echo ""
 # =============================================================================
 # STEP 3 — Database setup
 # =============================================================================
+# Passwords are interpolated into SQL single-quoted literals below, so any
+# quote/backslash/newline would break out of the literal. We reject those
+# characters at input time instead of trying to escape them.
+validate_password() {
+  local pw="$1"
+  [[ ${#pw} -lt 8 ]]       && /usr/bin/echo "too_short"  && return
+  [[ "$pw" == *"'"*    ]]  && /usr/bin/echo "bad_quote"  && return
+  [[ "$pw" == *'\'*    ]]  && /usr/bin/echo "bad_slash"  && return
+  [[ "$pw" == *$'\n'*  ]]  && /usr/bin/echo "bad_nl"     && return
+  [[ "$pw" == *$'\r'*  ]]  && /usr/bin/echo "bad_nl"     && return
+  /usr/bin/echo "ok"
+}
+
 # DB password
 ask "PostgreSQL password for user '${DB_USER}':"
-while [[ -z "$DB_PASS" ]]; do
-  read -rp "  Password (min 8 chars): " DB_PASS; /usr/bin/echo ""
-  if [[ ${#DB_PASS} -lt 8 ]]; then
-    warn "Password too short. Try again."; DB_PASS=""
-  fi
+DB_PASS=""
+while true; do
+  read -rp "  Password (min 8 chars, no single-quote or backslash): " DB_PASS; /usr/bin/echo ""
+  check=$(validate_password "$DB_PASS")
+  case "$check" in
+    too_short) warn "Password too short. Try again."; DB_PASS="" ;;
+    bad_quote) warn "Password contains a single quote. Try again."; DB_PASS="" ;;
+    bad_slash) warn "Password contains a backslash. Try again."; DB_PASS="" ;;
+    bad_nl)    warn "Password contains a newline. Try again."; DB_PASS="" ;;
+    ok)
+      read -rp "  Confirm password: " DB_PASS2; /usr/bin/echo ""
+      if [[ "$DB_PASS" != "$DB_PASS2" ]]; then
+        warn "Passwords do not match. Try again."; DB_PASS=""
+      else
+        break
+      fi
+      ;;
+  esac
 done
-read -rp "  Confirm password: " DB_PASS2; /usr/bin/echo ""
-if [[ "$DB_PASS" != "$DB_PASS2" ]]; then
-  warn "Passwords do not match. Try again."
-  DB_PASS=""
-  while [[ -z "$DB_PASS" ]]; do
-    read -rp "  Password (min 8 chars): " DB_PASS; /usr/bin/echo ""
-    if [[ ${#DB_PASS} -lt 8 ]]; then
-      warn "Password too short. Try again."; DB_PASS=""
-      continue
-    fi
-    read -rp "  Confirm password: " DB_PASS2; /usr/bin/echo ""
-    [[ "$DB_PASS" == "$DB_PASS2" ]] && break
-    warn "Passwords do not match. Try again."; DB_PASS=""
-  done
-fi
 
 # Custom DB settings?
 read -rp "  Use defaults? (db=${DB_NAME}, user=${DB_USER}, host=${DB_HOST}, port=${DB_PORT}) [Y/n]: " db_defaults
@@ -227,37 +238,70 @@ if [[ "${db_defaults:-Y}" =~ ^[Nn]$ ]]; then
   read -rp "  DB port [$DB_PORT]: " inp; DB_PORT="${inp:-$DB_PORT}"
 fi
 
-# Create DB user and database
+# Validate identifiers — they go into SQL unquoted, so anything outside
+# a safe Postgres identifier set is rejected.
+if ! [[ "$DB_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_]{0,62}$ ]]; then
+  error "DB user must match ^[a-zA-Z_][a-zA-Z0-9_]{0,62}\$ (got '${DB_USER}')."
+fi
+if ! [[ "$DB_NAME" =~ ^[a-zA-Z_][a-zA-Z0-9_]{0,62}$ ]]; then
+  error "DB name must match ^[a-zA-Z_][a-zA-Z0-9_]{0,62}\$ (got '${DB_NAME}')."
+fi
+
+# Create DB user and database.
+# Role is created WITHOUT SUPERUSER — limits blast radius if the app is
+# ever SQL-injected. pgcrypto (needed for crypt()) is installed into the
+# target DB by the postgres superuser after creation.
 info "Creating database user '${DB_USER}'..."
-sudo -u postgres psql -c \
+sudo -u postgres psql -v ON_ERROR_STOP=1 -c \
   "DO \$\$ BEGIN
      IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='${DB_USER}') THEN
-       CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}' SUPERUSER;
+       CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}'
+         NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT LOGIN;
      ELSE
-       ALTER USER ${DB_USER} WITH PASSWORD '${DB_PASS}' SUPERUSER;
+       ALTER USER ${DB_USER} WITH PASSWORD '${DB_PASS}'
+         NOSUPERUSER NOCREATEDB NOCREATEROLE;
      END IF;
    END \$\$;" 2>/dev/null || {
     # Fallback: maybe we're already the postgres superuser (macOS)
-    psql postgres -c \
+    psql postgres -v ON_ERROR_STOP=1 -c \
       "DO \$\$ BEGIN
          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='${DB_USER}') THEN
-           CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}' SUPERUSER;
+           CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}'
+             NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT LOGIN;
          ELSE
-           ALTER USER ${DB_USER} WITH PASSWORD '${DB_PASS}' SUPERUSER;
+           ALTER USER ${DB_USER} WITH PASSWORD '${DB_PASS}'
+             NOSUPERUSER NOCREATEDB NOCREATEROLE;
          END IF;
        END \$\$;" || error "Could not create DB user. Run as sudo or ensure postgres superuser access."
 }
-success "DB user '${DB_USER}' ready"
+success "DB user '${DB_USER}' ready (NOSUPERUSER)"
 
 info "Creating database '${DB_NAME}'..."
-if PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" \
-     -lqt 2>/dev/null | /usr/bin/cut -d'|' -f1 | /usr/bin/grep -qw "$DB_NAME"; then
+DB_EXISTS=""
+DB_EXISTS=$(sudo -u postgres psql -tAq -c \
+  "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" 2>/dev/null) \
+  || DB_EXISTS=$(psql postgres -tAq -c \
+       "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" 2>/dev/null) \
+  || true
+
+if [[ "$DB_EXISTS" == "1" ]]; then
   warn "Database '${DB_NAME}' already exists — skipping create."
 else
-  PGPASSWORD="$DB_PASS" createdb -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" "$DB_NAME" \
+  sudo -u postgres createdb -O "$DB_USER" "$DB_NAME" 2>/dev/null \
+    || createdb -h "$DB_HOST" -p "$DB_PORT" -O "$DB_USER" "$DB_NAME" \
     || error "Could not create database '${DB_NAME}'."
-  success "Database '${DB_NAME}' created"
+  success "Database '${DB_NAME}' created (owner: ${DB_USER})"
 fi
+
+# Install pgcrypto as the superuser into the target DB. The app role cannot
+# install extensions, which is the whole point of dropping SUPERUSER.
+info "Installing pgcrypto extension..."
+sudo -u postgres psql -d "$DB_NAME" -v ON_ERROR_STOP=1 -c \
+  "CREATE EXTENSION IF NOT EXISTS pgcrypto;" >/dev/null 2>&1 \
+  || psql -d "$DB_NAME" postgres -v ON_ERROR_STOP=1 -c \
+       "CREATE EXTENSION IF NOT EXISTS pgcrypto;" >/dev/null 2>&1 \
+  || error "Could not install pgcrypto extension as postgres superuser."
+success "pgcrypto installed"
 echo ""
 
 # =============================================================================
@@ -355,7 +399,11 @@ if [[ "$MODE" != "contributor" ]]; then
   while [[ -z "$ZEUS_USER" ]]; do
     read -rp "  Zeus username (not 'zeus'): " ZEUS_USER
     [[ "$ZEUS_USER" == "zeus" ]] && warn "Don't use 'zeus' — pick your actual username." && ZEUS_USER=""
-    [[ -z "$ZEUS_USER" ]] && warn "Username cannot be empty."
+    if [[ -n "$ZEUS_USER" && ! "$ZEUS_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_.-]{0,62}$ ]]; then
+      warn "Username must match ^[a-zA-Z_][a-zA-Z0-9_.-]{0,62}\$"
+      ZEUS_USER=""
+    fi
+    [[ -z "$ZEUS_USER" ]] && warn "Username cannot be empty or invalid."
   done
 
   if [[ -z "$ZEUS_PASS" ]]; then
@@ -364,11 +412,13 @@ if [[ "$MODE" != "contributor" ]]; then
       /usr/bin/echo -n "  Zeus password (min 8 chars, visible): "
       read -r PLAIN_TEXT_ENTRY
       ZEUS_PASS="$PLAIN_TEXT_ENTRY"
-      if [[ ${#ZEUS_PASS} -lt 8 ]]; then
-        warn "Password too short. Try again."
-        ZEUS_PASS=""
-        continue
-      fi
+      check=$(validate_password "$ZEUS_PASS")
+      case "$check" in
+        too_short) warn "Password too short. Try again."; ZEUS_PASS=""; continue ;;
+        bad_quote) warn "Password contains a single quote (breaks SQL)."; ZEUS_PASS=""; continue ;;
+        bad_slash) warn "Password contains a backslash (breaks SQL)."; ZEUS_PASS=""; continue ;;
+        bad_nl)    warn "Password contains a newline."; ZEUS_PASS=""; continue ;;
+      esac
       /usr/bin/echo -n "  Confirm Zeus password: "
       read -r PLAIN_TEXT_ENTRY2
       ZEUS_PASS2="$PLAIN_TEXT_ENTRY2"
@@ -381,6 +431,8 @@ if [[ "$MODE" != "contributor" ]]; then
     done
   else
     info "Using Zeus password provided via arguments."
+    check=$(validate_password "$ZEUS_PASS")
+    [[ "$check" != "ok" ]] && error "Zeus password supplied via --zeus-pass fails validation ($check)."
   fi
 
   # Single SQL block — tries the helper function first, falls back to

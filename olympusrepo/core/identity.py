@@ -71,12 +71,22 @@ def _generate_and_save(path: str) -> dict:
                        ),
     }
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    # Write atomically
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass  # best effort — Windows/WSL may refuse
+    # Write atomically, then lock down perms before any reader can open it
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(identity, f, indent=2)
     os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
     return identity
 
@@ -136,6 +146,41 @@ def make_heartbeat(identity: dict, port: int,
         "payload":   payload,
         "signature": sig.hex(),
     }
+
+
+def sign_envelope(identity: dict, payload: dict) -> dict:
+    """Generic signed envelope. The payload is stamped with a timestamp and
+    the signer's public key, then serialized deterministically and signed.
+
+    Callers MUST use :func:`verify_envelope` on the receiving end rather
+    than trusting fields on the wire.
+    """
+    body = dict(payload)
+    body["public_key"] = identity["instance_id"]
+    body["timestamp"] = int(time.time())
+    body_bytes = json.dumps(body, sort_keys=True).encode()
+    priv = _load_private_key(identity)
+    sig = priv.sign(body_bytes)
+    return {"payload": body, "signature": sig.hex()}
+
+
+def verify_envelope(envelope: dict,
+                    max_age_seconds: int = 300) -> dict | None:
+    """Verify a generic signed envelope. Returns the inner payload on
+    success, or ``None`` on any failure (bad shape, stale, bad sig)."""
+    try:
+        payload = envelope["payload"]
+        sig_bytes = bytes.fromhex(envelope["signature"])
+        age = int(time.time()) - int(payload["timestamp"])
+        if age > max_age_seconds or age < -30:
+            return None
+        pubkey_hex = payload["public_key"]
+        body_bytes = json.dumps(payload, sort_keys=True).encode()
+        pub = _load_public_key_from_hex(pubkey_hex)
+        pub.verify(sig_bytes, body_bytes)
+        return payload
+    except Exception:
+        return None
 
 
 def verify_heartbeat(envelope: dict,

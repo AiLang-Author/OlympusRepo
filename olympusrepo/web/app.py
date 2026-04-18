@@ -1004,6 +1004,35 @@ async def upload_files(name: str, request: Request,
 @app.websocket("/ws/mana/{channel}")
 async def mana_websocket(websocket: WebSocket, channel: str,
                          repo_name: str = None):
+    # Authenticate via session cookie before accepting the connection.
+    # Channel format is "repo-<name>" — the caller must be allowed to view
+    # that repo (private repos require matching membership).
+    session_id = websocket.cookies.get("session_id")
+    conn = db.connect()
+    try:
+        user_id = db.validate_session(conn, session_id) if session_id else None
+        user = db.get_user(conn, user_id) if user_id else None
+        if not user:
+            await websocket.close(code=1008)  # policy violation
+            return
+
+        if channel.startswith("repo-"):
+            repo_name_val = channel[len("repo-"):]
+            r = repo.get_repo(conn, repo_name_val)
+            if not r:
+                await websocket.close(code=1008)
+                return
+            if r["visibility"] == "private" and not repo.check_visibility(
+                    conn, r["repo_id"], user["user_id"]):
+                await websocket.close(code=1008)
+                return
+        else:
+            # Unknown channel shape — refuse rather than subscribe blindly.
+            await websocket.close(code=1008)
+            return
+    finally:
+        conn.close()
+
     await mana_manager.connect(channel, websocket)
     try:
         while True:
@@ -1573,13 +1602,13 @@ def request_password_reset(email: str = Form(...), conn=Depends(get_db)):
                  commit=False)
     conn.commit()
 
-    # In production send email. For now return token directly
-    # so admin can relay it. Log it to console.
+    # Token is only delivered via the server console (admin-relayed) or email.
+    # Never include it in the HTTP response — any caller with the target email
+    # would otherwise be able to reset that account's password.
     print(f"PASSWORD RESET TOKEN for {user['username']}: /reset-password?token={token}")
     return {
         "status": "ok",
-        "message": "Reset token generated. Check server console for the link.",
-        "debug_token": token  # Remove in production
+        "message": "If that email exists, a reset token has been generated.",
     }
 
 @app.post("/api/auth/reset-password")
@@ -2587,7 +2616,10 @@ def sync_blob(name: str, blob_hash: str,
     if not re.match(r'^[a-f0-9]{64}$', blob_hash):
         raise HTTPException(400, "Invalid blob hash.")
 
-    objects_dir = os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    )
     from ..core import objects as obj_store
     content = obj_store.retrieve_blob(blob_hash, objects_dir)
     if content is None:
@@ -2601,6 +2633,10 @@ def sync_blob(name: str, blob_hash: str,
 # OFFER — slave submits work to canonical for review
 # =========================================================================
 
+MAX_OFFER_BLOB_BYTES = 100 * 1024 * 1024  # 100 MiB total per offer
+MAX_OFFER_CHANGES    = 10_000
+
+
 @app.post("/api/sync/{name}/offer")
 async def receive_offer(name: str, request: Request,
                         conn=Depends(get_db)):
@@ -2608,35 +2644,67 @@ async def receive_offer(name: str, request: Request,
     Receive an offer from a slave instance.
     Creates a staging realm on canonical for Zeus/Olympian review.
     Does NOT write to canonical tree — offer must be promoted.
+
+    Requires a signed envelope:
+        { "payload": { ...offer fields..., "public_key": "<hex>",
+                       "timestamp": <unix> },
+          "signature": "<hex ed25519>" }
+    The signer's public_key identifies the remote contributor; the claimed
+    ``offered_by`` label is informational only.
     """
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
 
-    body = await request.json()
+    envelope = await request.json()
+    from ..core import identity as id_mod
 
-    branch_name = body.get("branch_name", "offered")
-    from_rev    = body.get("from_rev", 0)
-    base_rev    = body.get("base_rev", 0)
-    offered_by  = body.get("offered_by", "unknown")
-    message     = body.get("message", "")
-    changes     = body.get("changes", [])
-    blobs       = body.get("blobs", {})  # {hash: base64_content}
+    payload = id_mod.verify_envelope(envelope)
+    if not payload:
+        raise HTTPException(401, "Offer envelope missing or signature invalid.")
+
+    signer_pub  = payload["public_key"]             # authenticated
+    branch_name = payload.get("branch_name", "offered")
+    from_rev    = payload.get("from_rev", 0)
+    base_rev    = payload.get("base_rev", 0)
+    claimed_by  = str(payload.get("offered_by") or "")[:64]
+    message     = str(payload.get("message", ""))[:4000]
+    changes     = payload.get("changes", [])
+    blobs       = payload.get("blobs", {})  # {hash: base64_content}
 
     if not changes:
         raise HTTPException(400, "No changes in offer.")
+    if not isinstance(changes, list) or len(changes) > MAX_OFFER_CHANGES:
+        raise HTTPException(400, "Too many changes in offer.")
 
-    objects_dir = os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    # Approximate size from base64 payload (4 b64 chars ≈ 3 bytes).
+    if isinstance(blobs, dict):
+        approx_blob_bytes = sum(len(v) for v in blobs.values()) * 3 // 4
+        if approx_blob_bytes > MAX_OFFER_BLOB_BYTES:
+            raise HTTPException(413, "Offer blob payload too large.")
+    else:
+        blobs = {}
+
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    )
     from ..core import objects as obj_store
 
     try:
-        # Store any blobs we don't have yet
+        # Store any blobs we don't have yet (hash-verified by store_blob below)
         for blob_hash, b64_content in blobs.items():
+            if not isinstance(blob_hash, str) or not re.match(r'^[a-f0-9]{64}$', blob_hash):
+                raise HTTPException(400, "Invalid blob hash format.")
             if not obj_store.exists(blob_hash, objects_dir):
                 content = base64.b64decode(b64_content)
                 stored_hash = obj_store.store_blob(content, objects_dir)
                 if stored_hash != blob_hash:
                     raise HTTPException(400, f"Blob hash mismatch: {blob_hash}")
+
+        # The authenticated label includes the signer's pubkey prefix, so two
+        # different signers can't collide on one claimed username.
+        offered_by = f"{claimed_by or 'remote'}@{signer_pub[:12]}"
 
         # Create offer record
         offer_id = db.query_scalar(conn, """
@@ -2659,17 +2727,19 @@ async def receive_offer(name: str, request: Request,
                   change.get("blob_hash"), change.get("lines_added", 0),
                   change.get("lines_removed", 0)), commit=False)
 
-        # Also create a staging realm so it shows in the normal UI
-        # Find or create a user account for the offerer
+        # Staging realm also keyed by the (label@pubkey) identity so the
+        # ghost user is unambiguous and cannot hijack a real username.
         offering_user = db.get_user_by_name(conn, offered_by)
         if offering_user:
             staging_user_id = offering_user["user_id"]
         else:
-            # Create a ghost account for the remote contributor
+            # Remote contributor: lowest privilege, inactive (can't log in).
+            # The placeholder password hash is not a valid bcrypt string,
+            # so crypt() comparison in the login path will never match.
             staging_user_id = db.query_scalar(conn, """
                 INSERT INTO repo_users
-                    (username, password_hash, role)
-                VALUES (%s, 'remote-contributor', 'titan')
+                    (username, password_hash, role, is_active)
+                VALUES (%s, 'remote-contributor-no-login', 'mortal', FALSE)
                 ON CONFLICT (username) DO UPDATE
                     SET username = EXCLUDED.username
                 RETURNING user_id

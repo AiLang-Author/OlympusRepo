@@ -18,6 +18,29 @@ from .core import db, objects, worktree, repo, diff, repo_setup
 from .relay_bootstrap import get_relay_list
 
 
+def _safe_join(base, untrusted_path):
+    """Join ``untrusted_path`` onto ``base`` and guarantee the result stays
+    inside ``base``. Returns the resolved absolute path.
+
+    Raises ValueError for absolute paths, drive letters, traversal segments,
+    or any result that escapes ``base`` after symlink resolution. Remote
+    servers supply these paths during clone/pull, so treat them as hostile.
+    """
+    if not isinstance(untrusted_path, str) or not untrusted_path:
+        raise ValueError("empty path")
+    p = untrusted_path.replace("\\", "/")
+    if p.startswith("/") or (len(p) >= 2 and p[1] == ":"):
+        raise ValueError(f"absolute path not allowed: {untrusted_path!r}")
+    parts = [seg for seg in p.split("/") if seg not in ("", ".")]
+    if any(seg == ".." for seg in parts):
+        raise ValueError(f"path traversal not allowed: {untrusted_path!r}")
+    base_real = os.path.realpath(base)
+    full = os.path.realpath(os.path.join(base_real, *parts))
+    if full != base_real and not full.startswith(base_real + os.sep):
+        raise ValueError(f"path escapes repo root: {untrusted_path!r}")
+    return full
+
+
 def cmd_init(args):
     """Create a new repository."""
     name = args.name
@@ -398,10 +421,17 @@ def _fetch_json(url: str) -> dict:
         return json_mod.loads(response.read().decode("utf-8"))
 
 
-def _fetch_blob(url: str) -> bytes:
+def _fetch_blob(url: str, expected_hash: str | None = None) -> bytes | None:
+    """Fetch a blob. If ``expected_hash`` is given, reject any response whose
+    SHA-256 does not match — guards against a compromised server swapping
+    blob contents under an already-trusted hash reference."""
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req) as response:
-        return response.read()
+        content = response.read()
+    if expected_hash and objects.hash_content(content) != expected_hash:
+        print(f"  WARNING: blob hash mismatch at {url} — discarding")
+        return None
+    return content
 
 
 def _post_json(url: str, payload: dict) -> dict:
@@ -608,7 +638,8 @@ def cmd_clone(args):
                 bh = cs.get("blob_after")
                 if bh and not _blob_exists_local(dest, bh):
                     content = _fetch_blob(
-                        f"{base_url}/api/sync/{repo_name}/blob/{bh}")
+                        f"{base_url}/api/sync/{repo_name}/blob/{bh}",
+                        expected_hash=bh)
                     if content is not None:
                         obj_store.store_blob(content, objects_dir)
                         blobs_fetched += 1
@@ -679,12 +710,16 @@ def cmd_clone(args):
                     "size":  0,
                 }
         worktree.save_index(dest, index)
-        # Write files to working tree
+        # Write files to working tree — remote-supplied paths are untrusted
         for fpath, entry in index.items():
             h = entry["hash"] if isinstance(entry, dict) else entry
             if not h:
                 continue
-            full_path = os.path.join(dest, fpath)
+            try:
+                full_path = _safe_join(dest, fpath)
+            except ValueError as e:
+                print(f"  WARNING: skipping unsafe path from remote: {e}")
+                continue
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             obj_store.retrieve_to_file(h, full_path, objects_dir)
         # Committed index = same as staged after fresh clone
@@ -803,14 +838,20 @@ def cmd_pull(args):
             print(f"Pulling commit {c['rev']}: {c['commit_hash'][:8]}")
             
             if not _blob_exists_local(repo_root, c["tree_hash"]):
-                b = _fetch_blob(f"{remote_url}/api/sync/{repo_name}/blob/{c['tree_hash']}")
-                objects.store_blob(b, objects_dir)
+                b = _fetch_blob(
+                    f"{remote_url}/api/sync/{repo_name}/blob/{c['tree_hash']}",
+                    expected_hash=c["tree_hash"])
+                if b is not None:
+                    objects.store_blob(b, objects_dir)
 
             for cs in c["changesets"]:
                 h = cs["blob_after"]
                 if h and not _blob_exists_local(repo_root, h):
-                    b = _fetch_blob(f"{remote_url}/api/sync/{repo_name}/blob/{h}")
-                    objects.store_blob(b, objects_dir)
+                    b = _fetch_blob(
+                        f"{remote_url}/api/sync/{repo_name}/blob/{h}",
+                        expected_hash=h)
+                    if b is not None:
+                        objects.store_blob(b, objects_dir)
 
             parent_hashes = c.get("parent_hashes")
             db.execute(conn, """
@@ -849,7 +890,11 @@ def cmd_pull(args):
             tree_entries = json_mod.loads(tree_data.decode("utf-8"))
             worktree.save_index(repo_root, tree_entries)
             for path, h in tree_entries.items():
-                full_path = os.path.join(repo_root, path)
+                try:
+                    full_path = _safe_join(repo_root, path)
+                except ValueError as e:
+                    print(f"  WARNING: skipping unsafe path from remote: {e}")
+                    continue
                 os.makedirs(os.path.dirname(full_path), exist_ok=True)
                 objects.retrieve_to_file(h, full_path, objects_dir)
         print("Working tree updated.")
@@ -921,7 +966,11 @@ def cmd_offer(args):
             "blobs": blobs
         }
 
-        resp = _post_json(f"{remote_url}/api/sync/{repo_name}/offer", payload)
+        from .core import identity as id_mod
+        identity = id_mod.load_or_create()
+        envelope = id_mod.sign_envelope(identity, payload)
+
+        resp = _post_json(f"{remote_url}/api/sync/{repo_name}/offer", envelope)
         print(f"Offer received! Staging ID: {resp.get('staging_id')}")
         print(resp.get("message", ""))
         return 0

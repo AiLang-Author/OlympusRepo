@@ -26,6 +26,7 @@ class InstanceRecord:
     relay_token: str
     source:      str          # "direct" | "gossip"
     via_relay:   Optional[str] = None
+    envelope:    Optional[str] = None   # original signed heartbeat JSON
 
 
 class Registry:
@@ -57,9 +58,15 @@ class Registry:
                 last_seen   REAL NOT NULL,
                 relay_token TEXT NOT NULL,
                 source      TEXT NOT NULL,
-                via_relay   TEXT
+                via_relay   TEXT,
+                envelope    TEXT
             )
         """)
+        # Migrate older DBs that predate the envelope column.
+        cols = {row["name"] for row in
+                self._db.execute("PRAGMA table_info(instances)").fetchall()}
+        if "envelope" not in cols:
+            self._db.execute("ALTER TABLE instances ADD COLUMN envelope TEXT")
         self._db.commit()
 
     def _load_from_db(self):
@@ -74,16 +81,20 @@ class Registry:
 
     def _persist(self, r: InstanceRecord):
         self._db.execute("""
-            INSERT INTO instances VALUES
+            INSERT INTO instances
+                (instance_id, ip, port, public_key, human_name,
+                 last_seen, relay_token, source, via_relay, envelope)
+            VALUES
                 (:instance_id,:ip,:port,:public_key,:human_name,
-                 :last_seen,:relay_token,:source,:via_relay)
+                 :last_seen,:relay_token,:source,:via_relay,:envelope)
             ON CONFLICT(instance_id) DO UPDATE SET
                 ip          = excluded.ip,
                 port        = excluded.port,
                 last_seen   = excluded.last_seen,
                 relay_token = excluded.relay_token,
                 source      = excluded.source,
-                via_relay   = excluded.via_relay
+                via_relay   = excluded.via_relay,
+                envelope    = excluded.envelope
         """, asdict(r))
         self._db.commit()
 
@@ -94,17 +105,25 @@ class Registry:
         Deterministic per-instance token derived from relay secret.
         Same token is always issued for the same instance_id so
         re-registrations get the same token without storing state.
-        Falls back to a hash of instance_id if no secret configured.
+        Config.ensure_secret() guarantees SECRET is set before first call.
         """
-        key = (config.SECRET or "olympusrelay-default-secret").encode()
+        if not config.SECRET:
+            raise RuntimeError(
+                "OLYMPUSRELAY_SECRET is not configured. "
+                "Refusing to issue tokens with a default secret."
+            )
+        key = config.SECRET.encode()
         return hmac.new(key, instance_id.encode(), hashlib.sha256).hexdigest()
 
     # ── Public API ───────────────────────────────────────────────────────
 
     def register(self, payload: dict, source: str = "direct",
-                 via_relay: str = None) -> str:
+                 via_relay: str = None,
+                 envelope: Optional[dict] = None) -> str:
         """
         Register or refresh an instance. Returns the relay_token.
+        ``envelope`` is the verified signed envelope the payload came from —
+        stored verbatim so we can re-gossip without re-signing.
         """
         iid   = payload["instance_id"]
         token = self._make_token(iid)
@@ -118,6 +137,7 @@ class Registry:
             relay_token = token,
             source      = source,
             via_relay   = via_relay,
+            envelope    = json.dumps(envelope) if envelope else None,
         )
         with self._lock:
             self._live[iid] = rec
@@ -135,37 +155,53 @@ class Registry:
             return list(self._live.values())
 
     def list_for_gossip(self) -> list[dict]:
-        """Return serialisable records for gossip payload."""
-        return [
-            {
-                "instance_id": r.instance_id,
-                "ip":          r.ip,
-                "port":        r.port,
-                "public_key":  r.public_key,
-                "human_name":  r.human_name,
-                "last_seen":   r.last_seen,
-            }
-            for r in self.list_live()
-        ]
+        """Return signed envelopes for gossip. Only records that carry a
+        verifiable envelope are gossipable — plain records (pre-migration
+        rows or legacy peers) are omitted so downstream relays never accept
+        unverifiable data."""
+        out = []
+        for r in self.list_live():
+            if not r.envelope:
+                continue
+            try:
+                out.append(json.loads(r.envelope))
+            except Exception:
+                continue
+        return out
 
-    def merge_gossip(self, records: list[dict], via_relay: str):
+    def merge_gossip(self, envelopes: list[dict], via_relay: str,
+                     verify=None):
         """
         Merge records received from a peer relay.
-        Only updates if the incoming last_seen is more recent.
-        Does NOT re-gossip (depth-1 only).
+        Each ``envelope`` must be a signed heartbeat ({payload, signature}) —
+        unsigned records are rejected. ``verify`` is the verifier function
+        supplied by the app module so this file stays import-clean.
         """
-        for rec in records:
-            iid = rec.get("instance_id")
+        if verify is None:
+            return
+        for env in envelopes:
+            if not isinstance(env, dict) or "payload" not in env:
+                continue
+            if not verify(env, config.MAX_AGE_PAYLOAD):
+                continue
+            payload = env["payload"]
+            iid = payload.get("instance_id")
             if not iid:
+                continue
+            # Binding check: the claimed instance_id must equal the signing
+            # public key. Without this, a valid signer could forge another
+            # instance's record.
+            if payload.get("public_key") != iid:
                 continue
             with self._lock:
                 existing = self._live.get(iid)
-                if existing and existing.last_seen >= rec["last_seen"]:
+                ts = float(payload.get("timestamp", 0))
+                if existing and existing.last_seen >= ts:
                     continue
-                # Don't accept records older than TTL
-                if time.time() - rec["last_seen"] > config.TTL_SECONDS:
+                if time.time() - ts > config.TTL_SECONDS:
                     continue
-                self.register(rec, source="gossip", via_relay=via_relay)
+                self.register(payload, source="gossip",
+                              via_relay=via_relay, envelope=env)
 
     def _expire(self):
         cutoff = time.time() - config.TTL_SECONDS
