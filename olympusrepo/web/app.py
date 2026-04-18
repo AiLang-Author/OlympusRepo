@@ -8,6 +8,7 @@
 #   OLYMPUSREPO_COOKIE_SECURE=1   set secure cookie flag (for HTTPS production)
 
 import os
+import subprocess
 from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Form, File, UploadFile, WebSocket, WebSocketDisconnect
@@ -703,6 +704,160 @@ def new_repo_page(request: Request, conn=Depends(get_db)):
     if not user or user["role"] != "zeus":
         raise HTTPException(403, "Only Zeus can create repositories.")
     return templates.TemplateResponse(request, "new_repo.html", {"user": user})
+
+
+# =========================================================================
+# GIT IMPORT — bring an existing git repository into OlympusRepo
+# =========================================================================
+def _validate_git_source(src: str) -> tuple[bool, str]:
+    """Return (ok, error_message). Allows HTTPS/HTTP/git:// remote URLs,
+    ssh-style 'git@host:path', or an absolute local directory path. Blocks
+    leading-dash sources, RFC1918/loopback/link-local hosts (SSRF), and
+    protocols outside the allowlist."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    if not src or len(src) > 2000:
+        return False, "Git source is empty or too long."
+    if src.startswith("-"):
+        return False, "Git source must not start with '-'."
+
+    # Local path — require absolute + existing directory.
+    if src.startswith("/"):
+        if not os.path.isdir(src):
+            return False, "Local path is not an existing directory."
+        return True, ""
+
+    # ssh-style: git@host:path (no scheme, rely on ssh config for auth).
+    if src.startswith("git@"):
+        # Very conservative: just ensure a colon-separated shape with no
+        # option-like segments. We can't resolve the SSH host without
+        # allowing far too much, so leave it to the operator's ssh config.
+        if ":" not in src or " " in src:
+            return False, "Malformed ssh git URL."
+        return True, ""
+
+    # Scheme-based URL: only http(s)/git. No file://, no ext::, no ssh://.
+    parsed = urlparse(src)
+    if parsed.scheme not in ("http", "https", "git"):
+        return False, "Only https://, http://, git://, or git@host:path URLs are allowed."
+    if not parsed.hostname:
+        return False, "Missing hostname in URL."
+    if parsed.username or parsed.password:
+        return False, "Credentials in URL are not allowed — use ssh or a deploy key."
+
+    # SSRF guard: resolve hostname and reject any private/loopback/link-local
+    # address. Operators who truly need internal mirrors can set
+    # OLYMPUSREPO_IMPORT_ALLOW_PRIVATE=1.
+    if os.environ.get("OLYMPUSREPO_IMPORT_ALLOW_PRIVATE") != "1":
+        try:
+            infos = socket.getaddrinfo(parsed.hostname, None)
+        except socket.gaierror:
+            return False, "Host could not be resolved."
+        for family, _, _, _, sockaddr in infos:
+            ip = sockaddr[0]
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if (addr.is_private or addr.is_loopback or
+                    addr.is_link_local or addr.is_reserved or
+                    addr.is_multicast or addr.is_unspecified):
+                return False, f"Host resolves to a non-routable address ({ip})."
+    return True, ""
+
+
+@app.get("/import", response_class=HTMLResponse)
+def import_git_page(request: Request, conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user or user["role"] not in ("zeus", "olympian"):
+        raise HTTPException(403)
+    return templates.TemplateResponse(request, "import_git.html", {
+        "user": user,
+        "error": None,
+        "success": None,
+    })
+
+
+@app.post("/import", response_class=HTMLResponse)
+async def import_git_submit(
+    request: Request,
+    git_url: str = Form(...),
+    repo_name: str = Form(...),
+    branch: str = Form(""),
+    conn=Depends(get_db),
+):
+    user = get_current_user(request, conn)
+    if not user or user["role"] not in ("zeus", "olympian"):
+        raise HTTPException(403)
+
+    git_url   = git_url.strip()
+    repo_name = repo_name.strip()
+    branch    = branch.strip()
+
+    def _render(error=None, success=None):
+        return templates.TemplateResponse(request, "import_git.html", {
+            "user":      user,
+            "error":     error,
+            "success":   success,
+            "git_url":   git_url if error else "",
+            "repo_name": repo_name if error else "",
+        })
+
+    if not re.match(r'^[a-zA-Z0-9_\-]+$', repo_name):
+        return _render(
+            "Repository name may only contain letters, numbers, "
+            "hyphens, and underscores."
+        )
+    if repo.get_repo(conn, repo_name):
+        return _render(
+            f"Repository '{repo_name}' already exists. Choose a different name."
+        )
+
+    ok, reason = _validate_git_source(git_url)
+    if not ok:
+        return _render(reason)
+
+    if branch and not re.match(r'^[A-Za-z0-9][A-Za-z0-9/_.\-]{0,199}$', branch):
+        return _render("Invalid branch name.")
+
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    )
+
+    from ..core import import_git as ig
+    try:
+        result = ig.import_git_repo(
+            conn=conn,
+            git_source=git_url,
+            repo_name=repo_name,
+            user_id=user["user_id"],
+            objects_dir=objects_dir,
+            branch=branch or None,
+        )
+        db.audit_log(conn, "git_import", user_id=user["user_id"],
+                     target_type="repo", target_id=repo_name,
+                     details={"source": git_url, "branch": branch or ""})
+        return _render(success=result)
+    except subprocess.TimeoutExpired:
+        return _render("Git clone timed out. Try a smaller repo or local path.")
+    except subprocess.CalledProcessError as e:
+        # Surface git's actual stderr so the user can see 'repo not found',
+        # 'auth required', cert issues, etc. — not just the opaque rc.
+        detail = (getattr(e, "stderr", "") or "").strip()
+        if detail:
+            # Trim long diagnostic chatter to one screenful.
+            detail = detail.replace("\r", "").strip()
+            if len(detail) > 400:
+                detail = detail[:400] + "…"
+            return _render(f"Git command failed (rc {e.returncode}): {detail}")
+        return _render(f"Git command failed with exit code {e.returncode} (no stderr captured — check server console).")
+    except ValueError as e:
+        return _render(str(e))
+    except Exception as e:
+        return _render(f"Import failed: {e}")
 
 
 @app.post("/api/repos")

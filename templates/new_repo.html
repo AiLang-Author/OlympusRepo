@@ -5,8 +5,47 @@
 <style>
     main {
         background:
-            linear-gradient(to bottom, rgba(13,17,23,0.82), rgba(13,17,23,0.96)),
+            linear-gradient(to bottom, rgba(13,17,23,0.60), rgba(13,17,23,0.80)),
             url('/static/forge-room.png') center center / cover no-repeat fixed;
+    }
+
+    /* Whole-card link that takes you to /import. Gold accent so it
+       visually connects to the marquee on the /import page itself. */
+    .import-link-card {
+        display: block;
+        margin-top: 32px;
+        padding: 20px 24px;
+        border-radius: 10px;
+        background: linear-gradient(180deg, rgba(255,215,0,0.05), rgba(255,215,0,0.02));
+        border: 1px solid #b8860b;
+        box-shadow: 0 0 24px rgba(255,215,0,0.08);
+        text-decoration: none;
+        color: inherit;
+        transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease;
+    }
+    .import-link-card:hover,
+    .import-link-card:focus {
+        transform: translateY(-2px);
+        border-color: #ffd700;
+        box-shadow: 0 0 32px rgba(255,215,0,0.22);
+        text-decoration: none;
+    }
+    .import-link-card h2 {
+        margin: 0 0 6px 0;
+        color: #ffd700;
+        font-size: 1.15em;
+    }
+    .import-link-card p {
+        margin: 0;
+        color: #8b949e;
+        font-size: 0.9em;
+    }
+    .import-link-card .arrow {
+        float: right;
+        color: #ffd700;
+        font-size: 1.4em;
+        line-height: 1;
+        margin-top: 4px;
     }
 </style>
 {% endblock %}
@@ -46,6 +85,13 @@
             <button id="create-btn" class="btn btn-primary">Create Repository</button>
             <a href="/" class="btn">Cancel</a>
         </div>
+
+        <!-- IMPORT FROM GIT — whole card is a link -->
+        <a href="/import" class="import-link-card">
+            <span class="arrow">&rarr;</span>
+            <h2>Import Git Repos Here</h2>
+            <p>Already have a git repository? Bring over the full commit history from a URL or local path.</p>
+        </a>
     </div>
 
     <!-- STEP 2: Seed Files -->

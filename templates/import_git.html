@@ -1,0 +1,253 @@
+{% extends "base.html" %}
+{% block title %}Import Git Repository — OlympusRepo{% endblock %}
+
+{% block extra_css %}
+<style>
+main {
+    background:
+        linear-gradient(to bottom, rgba(13,17,23,0.60), rgba(13,17,23,0.80)),
+        url('/static/forge-room.png') center center / cover no-repeat fixed;
+}
+
+/* ============================================================
+   BILLBOARD — chaser-light marquee wrapping the import form.
+   Old-timey theater sign: gold bulbs running around the border
+   in a continuous clockwise chase.
+   ============================================================ */
+.billboard {
+    position: relative;
+    padding: 18px;
+    border-radius: 14px;
+    isolation: isolate;
+    background: rgba(13,17,23,0.35);
+    box-shadow: 0 0 60px rgba(255,215,0,0.18);
+}
+
+/* Four perimeter tracks, each a strip of bulbs that slides. Direction
+   alternates so the bulbs appear to circulate clockwise:
+     top    → right
+     right  ↓ down
+     bottom ← left
+     left   ↑ up
+*/
+.billboard::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 14px;
+    padding: 0;
+    pointer-events: none;
+    z-index: 1;
+    background:
+        radial-gradient(circle, #ffd700 2.4px, rgba(255,215,0,0.15) 3px, transparent 3.6px)
+            top / 22px 8px repeat-x,
+        radial-gradient(circle, #ffd700 2.4px, rgba(255,215,0,0.15) 3px, transparent 3.6px)
+            bottom / 22px 8px repeat-x,
+        radial-gradient(circle, #ffd700 2.4px, rgba(255,215,0,0.15) 3px, transparent 3.6px)
+            left / 8px 22px repeat-y,
+        radial-gradient(circle, #ffd700 2.4px, rgba(255,215,0,0.15) 3px, transparent 3.6px)
+            right / 8px 22px repeat-y;
+    filter: drop-shadow(0 0 5px #ffd700) drop-shadow(0 0 10px rgba(255,165,0,0.6));
+    animation: chaser 1.1s linear infinite;
+}
+
+/* Second offset layer — adds a second, brighter bulb running half a
+   phase behind. Makes the chase look layered like a real marquee. */
+.billboard::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 14px;
+    pointer-events: none;
+    z-index: 1;
+    background:
+        radial-gradient(circle, #fff3a0 1.4px, transparent 2px)
+            top / 22px 8px repeat-x,
+        radial-gradient(circle, #fff3a0 1.4px, transparent 2px)
+            bottom / 22px 8px repeat-x,
+        radial-gradient(circle, #fff3a0 1.4px, transparent 2px)
+            left / 8px 22px repeat-y,
+        radial-gradient(circle, #fff3a0 1.4px, transparent 2px)
+            right / 8px 22px repeat-y;
+    animation: chaser 1.1s linear infinite;
+    animation-delay: -0.55s;
+    mix-blend-mode: screen;
+}
+
+@keyframes chaser {
+    0%   { background-position:
+             0   top,    0   bottom,
+             left 0,     right 0; }
+    100% { background-position:
+             22px top,  -22px bottom,
+             left 22px,  right -22px; }
+}
+
+/* Interior card sits on top of the bulb ring */
+.billboard > .card {
+    position: relative;
+    z-index: 2;
+    border: 1px solid #30363d;
+    box-shadow: inset 0 0 40px rgba(255,215,0,0.06);
+}
+
+/* Pulsing "IMPORT NOW" button — deep gold glow that breathes */
+.btn-billboard {
+    background: linear-gradient(180deg, #ffd700 0%, #e6b800 100%);
+    color: #1a1a1a;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    border: 1px solid #b8860b;
+    box-shadow:
+        0 0 0 0 rgba(255,215,0,0.9),
+        0 2px 10px rgba(255,165,0,0.4);
+    animation: btn-pulse 1.8s ease-in-out infinite;
+    transition: transform 0.1s ease;
+}
+.btn-billboard:hover {
+    background: linear-gradient(180deg, #fff380 0%, #ffd700 100%);
+    transform: translateY(-1px);
+}
+.btn-billboard:disabled {
+    animation: none;
+    opacity: 0.7;
+}
+@keyframes btn-pulse {
+    0%, 100% { box-shadow:
+        0 0 0 0 rgba(255,215,0,0.6),
+        0 2px 10px rgba(255,165,0,0.35); }
+    50%      { box-shadow:
+        0 0 0 8px rgba(255,215,0,0),
+        0 2px 18px rgba(255,165,0,0.65); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .billboard::before,
+    .billboard::after,
+    .btn-billboard {
+        animation: none;
+    }
+}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+
+    <div class="row-between" style="margin-bottom:24px;">
+        <h1 style="margin-bottom:0;">⚡ Import Git Repository</h1>
+        <a href="/zeus" class="btn">&larr; The Throne</a>
+    </div>
+
+    {% if success %}
+    <div class="card" style="border-color:#3fb950; margin-bottom:24px;">
+        <h2 style="color:#3fb950; margin-top:0;">✓ Import Complete</h2>
+        <table style="width:100%;">
+            <tr>
+                <td style="color:#8b949e; width:160px;">Repository</td>
+                <td><strong>{{ success.repo_name }}</strong></td>
+            </tr>
+            <tr>
+                <td style="color:#8b949e;">Commits imported</td>
+                <td>{{ success.commits_imported }}</td>
+            </tr>
+            <tr>
+                <td style="color:#8b949e;">Files imported</td>
+                <td>{{ success.files_imported }}</td>
+            </tr>
+            <tr>
+                <td style="color:#8b949e;">Branch</td>
+                <td><code>{{ success.branch }}</code></td>
+            </tr>
+        </table>
+        <div style="margin-top:16px;">
+            <a href="/repo/{{ success.repo_name }}" class="btn btn-primary">
+                View Repository →
+            </a>
+        </div>
+    </div>
+    {% endif %}
+
+    {% if error %}
+    <div class="card" style="border-color:#f85149; color:#f85149; margin-bottom:24px; padding:12px 16px;">
+        ✗ {{ error }}
+    </div>
+    {% endif %}
+
+    <div class="billboard">
+    <div class="card">
+        <h2 style="margin-top:0;">Import from Git</h2>
+        <p style="color:#8b949e;">
+            Imports the full commit history from a git repository — local path or remote URL.
+            Large repos with many commits will take a moment.
+        </p>
+
+        <form method="post" action="/import" id="import-form">
+
+            <div class="form-group">
+                <label>Git Source</label>
+                <input type="text" name="git_url"
+                       value="{{ git_url or '' }}"
+                       placeholder="https://github.com/user/repo.git  or  /path/to/local/repo"
+                       required>
+                <div class="card-meta" style="margin-top:4px;">
+                    HTTP/HTTPS URLs, SSH URLs, or absolute local paths all work.
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>OlympusRepo Name</label>
+                <input type="text" name="repo_name"
+                       value="{{ repo_name or '' }}"
+                       placeholder="my-imported-repo"
+                       pattern="[a-zA-Z0-9_\-]+"
+                       required>
+                <div class="card-meta" style="margin-top:4px;">
+                    Letters, numbers, hyphens, underscores only. Must be unique.
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>Branch <span style="color:#8b949e;">(optional)</span></label>
+                <input type="text" name="branch"
+                       value=""
+                       placeholder="main  (default: repo's default branch)">
+            </div>
+
+            <button type="submit" class="btn btn-billboard" id="import-btn">
+                ★ Import Repository ★
+            </button>
+            <span class="card-meta" style="margin-left:12px;" id="import-status"></span>
+
+        </form>
+    </div>
+    </div>
+
+    <div class="card" style="margin-top:24px; background:#0d1117;">
+        <h3 style="margin-top:0; color:#8b949e;">Examples</h3>
+        <pre style="color:#c9d1d9; font-size:0.85em; margin:0;">
+# Import from GitHub
+https://github.com/torvalds/linux.git
+
+# Import a local git repo
+/home/sean/projects/myapp
+
+# Import specific branch
+URL: https://github.com/user/repo.git
+Branch: develop</pre>
+    </div>
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.getElementById('import-form').addEventListener('submit', function() {
+    var btn = document.getElementById('import-btn');
+    var status = document.getElementById('import-status');
+    btn.disabled = true;
+    btn.textContent = 'Importing...';
+    status.textContent = 'This may take a moment for large repositories.';
+});
+</script>
+{% endblock %}

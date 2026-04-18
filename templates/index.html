@@ -5,9 +5,32 @@
 <style>
     main {
         background:
-            linear-gradient(to bottom, rgba(13,17,23,0.7), rgba(13,17,23,0.9)),
+            linear-gradient(to bottom, rgba(13,17,23,0.60), rgba(13,17,23,0.80)),
             url('/static/repo-room.png') center center / cover no-repeat fixed;
     }
+
+    /* Gateway CTA banner — matches the gold accent on /new and /import */
+    .import-banner {
+        display: block;
+        margin: 0 0 24px 0;
+        padding: 14px 20px;
+        border-radius: 10px;
+        background: linear-gradient(180deg, rgba(255,215,0,0.06), rgba(255,215,0,0.02));
+        border: 1px solid #b8860b;
+        box-shadow: 0 0 18px rgba(255,215,0,0.08);
+        text-decoration: none;
+        color: inherit;
+        transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease;
+    }
+    .import-banner:hover,
+    .import-banner:focus {
+        transform: translateY(-1px);
+        border-color: #ffd700;
+        box-shadow: 0 0 26px rgba(255,215,0,0.22);
+        text-decoration: none;
+    }
+    .import-banner strong { color: #ffd700; }
+    .import-banner .arrow { float: right; color: #ffd700; font-size: 1.2em; }
 </style>
 {% endblock %}
 
@@ -20,6 +43,14 @@
             <a href="/new" class="btn btn-primary">New Repository</a>
         {% endif %}
     </div>
+
+    {% if user and user.role in ('zeus', 'olympian') %}
+    <a href="/import" class="import-banner">
+        <span class="arrow">&rarr;</span>
+        <strong>New to Olympus?</strong>
+        Import your GitHub repo here &mdash; full commit history, one click.
+    </a>
+    {% endif %}
 
     {% if repos %}
         {% for r in repos %}
