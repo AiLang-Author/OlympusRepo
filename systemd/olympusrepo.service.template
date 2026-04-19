@@ -1,0 +1,47 @@
+[Unit]
+Description=OlympusRepo — sovereign version control
+Documentation=https://github.com/AiLang-Author/OlympusRepo
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=__INSTALL_DIR__
+
+# Load OLYMPUSREPO_* vars from the generated .env.
+# Without this, psycopg2 gets no DB_PASS and fails with:
+#   fe_sendauth: no password supplied
+EnvironmentFile=__INSTALL_DIR__/.env
+
+ExecStart=__INSTALL_DIR__/.venv/bin/uvicorn olympusrepo.web.app:app \
+    --host 0.0.0.0 \
+    --port __APP_PORT__
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=olympusrepo
+
+# --- Hardening ------------------------------------------------------------
+# Defense in depth. If the app is ever exploited, these limit blast radius.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# The app needs to write to its own install dir (objects store, .olympusrepo,
+# potentially uploaded blobs). Grant exactly that and nothing more.
+ReadWritePaths=__INSTALL_DIR__
+
+[Install]
+WantedBy=multi-user.target

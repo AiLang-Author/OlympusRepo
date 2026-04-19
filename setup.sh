@@ -781,6 +781,42 @@ ALTER TABLE repo_offers ALTER COLUMN from_rev DROP NOT NULL;
 ALTER TABLE repo_offers ALTER COLUMN base_rev DROP NOT NULL;
 SQL
 
+
+
+
+# =============================================================================
+# STEP 10b — Optional systemd unit install (Linux only, not WSL2)
+# =============================================================================
+if [[ "$OS" == "linux" ]] && [[ "$MODE" != "contributor" ]]; then
+  divider
+  echo -e "${BOLD}  STEP 10b — systemd service (optional)${RESET}"
+  divider
+
+  read -rp "  Install as a systemd service so it starts on boot? [y/N]: " inst_svc
+  if [[ "${inst_svc:-N}" =~ ^[Yy]$ ]]; then
+    if [[ ! -f "systemd/olympusrepo.service.template" ]]; then
+      warn "systemd/olympusrepo.service.template not found in repo. Skipping."
+    else
+      UNIT_FILE="/etc/systemd/system/olympusrepo.service"
+      info "Writing ${UNIT_FILE}..."
+      sudo bash -c "sed \
+        -e 's|__USER__|${USER}|g' \
+        -e 's|__INSTALL_DIR__|${INSTALL_ABS}|g' \
+        -e 's|__APP_PORT__|${APP_PORT}|g' \
+        systemd/olympusrepo.service.template > ${UNIT_FILE}"
+      sudo chmod 644 "$UNIT_FILE"
+      sudo systemctl daemon-reload
+      sudo systemctl enable olympusrepo.service
+      success "Service installed and enabled"
+      info "Start it with: sudo systemctl start olympusrepo"
+      info "Check status:  sudo systemctl status olympusrepo"
+      info "View logs:     sudo journalctl -u olympusrepo -f"
+    fi
+  fi
+  echo ""
+fi
+
+
 # =============================================================================
 # STEP 11 — Contributor remote config
 # =============================================================================
