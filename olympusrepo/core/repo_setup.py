@@ -12,13 +12,18 @@ import json
 from . import db, worktree
 
 
-def ensure_local_user(conn, username: str = None) -> dict:
+def ensure_local_user(conn, username: str = None,
+                      commit: bool = True) -> dict:
     """
     Find or create a local user account.
     Uses $USER env var if username not provided.
     Falls back to hostname if $USER not set.
     Creates with role='titan' and a random password if not found.
     Returns the full user dict.
+
+    When called inside a larger transaction (e.g. from post_clone_setup),
+    pass commit=False so the caller can batch the commit with later work.
+    Default remains True for standalone use.
     """
     username = username or os.getenv("USER") or os.getenv("USERNAME") or socket.gethostname()
     username = username.lower().strip()
@@ -31,11 +36,13 @@ def ensure_local_user(conn, username: str = None) -> dict:
     random_pw = secrets.token_urlsafe(16)
     try:
         user_id = db.create_user(conn, username, random_pw, role="titan")
-        conn.commit()
+        if commit:
+            conn.commit()
         print(f"  Created local user '{username}' (titan)")
         return db.get_user(conn, user_id)
     except Exception as e:
-        conn.rollback()
+        if commit:
+            conn.rollback()
         # If creation failed, try get again (race condition)
         user = db.get_user_by_name(conn, username)
         if user:
@@ -51,9 +58,7 @@ def write_config_user(repo_root: str, user: dict):
     config = worktree.load_config(repo_root)
     config["user"]    = user["username"]
     config["user_id"] = user["user_id"]
-    config_path = os.path.join(repo_root, ".olympusrepo", "config.json")
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
+    worktree.save_config(repo_root, config)
 
 
 def ensure_origin_remote(repo_root: str, base_url: str):
@@ -65,9 +70,7 @@ def ensure_origin_remote(repo_root: str, base_url: str):
     remotes = config.setdefault("remotes", {})
     if "origin" not in remotes:
         remotes["origin"] = {"url": base_url.rstrip("/"), "role": "canonical"}
-        config_path = os.path.join(repo_root, ".olympusrepo", "config.json")
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
+        worktree.save_config(repo_root, config)
         print(f"  Added remote 'origin' → {base_url}")
 
 
@@ -118,9 +121,15 @@ def post_clone_setup(repo_root: str, base_url: str, conn,
     """
     print("  Setting up local environment...")
 
-    user = ensure_local_user(conn, username)
+    # Batch the user-creation commit with any later DB work the caller
+    # (cmd_clone) might do — prevents half-committed state if a later
+    # step fails.
+    user = ensure_local_user(conn, username, commit=False)
     write_config_user(repo_root, user)
     ensure_origin_remote(repo_root, base_url)
+
+    # Commit the user-creation (if any) now that on-disk setup succeeded.
+    conn.commit()
 
     print(f"  Local user:  {user['username']} (id={user['user_id']})")
     print(f"  Remote:      origin → {base_url}")

@@ -37,6 +37,38 @@ RELAY_PORT       = int(os.environ.get("PORT", os.environ.get("OLYMPUSREPO_PORT",
 HEARTBEAT_INTERVAL = 300  # 5 minutes
 
 
+# =============================================================================
+# In-process rate limiter for auth endpoints.
+# Simple IP+route token bucket — no external dependency. Sufficient for
+# single-process uvicorn; multi-process or multi-host deployments should
+# front this with a real limiter (nginx, traefik, redis-backed slowapi).
+# =============================================================================
+_rate_lock    = threading.Lock()
+_rate_buckets: dict = {}  # (route_key, ip) -> list[unix_timestamp_float]
+
+def _rate_limit(request: Request, route_key: str,
+                max_hits: int, window_sec: int) -> None:
+    """Raise 429 if the caller has exceeded max_hits for this route
+    inside the trailing window_sec seconds. Sets a Retry-After header."""
+    ip = request.client.host if request.client else "unknown"
+    key = (route_key, ip)
+    now = time.time()
+    cutoff = now - window_sec
+    with _rate_lock:
+        bucket = [t for t in _rate_buckets.get(key, ()) if t >= cutoff]
+        if len(bucket) >= max_hits:
+            oldest = bucket[0]
+            retry_after = max(1, int(oldest + window_sec - now))
+            _rate_buckets[key] = bucket  # keep the pruned list for next try
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many attempts. Try again in {retry_after}s.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        bucket.append(now)
+        _rate_buckets[key] = bucket
+
+
 def _register_with_relay(relay_url: str, identity: dict,
                          port: int) -> bool:
     """
@@ -211,6 +243,10 @@ mana_manager = ManaConnectionManager()
 @app.post("/api/auth/login")
 def login(request: Request, username: str = Form(...), password: str = Form(...),
           conn=Depends(get_db)):
+    # Rate limit: 5 attempts per IP per 15 minutes. Protects against
+    # brute-force password guessing and credential-stuffing.
+    _rate_limit(request, "login", max_hits=5, window_sec=900)
+
     user_id = db.verify_password(conn, username, password)
     if not user_id:
         raise HTTPException(401, "Invalid credentials")
@@ -233,9 +269,14 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
 
 
 @app.post("/api/auth/signup")
-def signup(username: str = Form(...), password: str = Form(...),
+def signup(request: Request,
+           username: str = Form(...), password: str = Form(...),
            email: str = Form(None), full_name: str = Form(None),
            conn=Depends(get_db)):
+    # Rate limit: 3 signups per IP per hour. Slows user-enumeration via
+    # "username already taken" errors and prevents automated account farms.
+    _rate_limit(request, "signup", max_hits=3, window_sec=3600)
+
     policy = db.query_scalar(conn,
         "SELECT value FROM repo_server_config WHERE key = 'registration_policy'") or "open"
 
@@ -1367,10 +1408,43 @@ def set_config_value(request: Request,
     user = get_current_user(request, conn)
     if not user or user["role"] != "zeus":
         raise HTTPException(403, "Only Zeus can update config.")
-    allowed_keys = ("registration_policy", "default_repo_visibility",
-                    "instance_name", "instance_url", "max_pack_size_mb")
-    if key not in allowed_keys:
+
+    # Per-key value validation — the old version allowlisted the key but
+    # accepted any value, which meant e.g. registration_policy could be
+    # set to an arbitrary string and the rest of the codebase would
+    # silently fall through to defaults or behave oddly.
+    value = value.strip()
+    if key == "registration_policy":
+        if value not in ("open", "invite_only", "closed"):
+            raise HTTPException(400,
+                "registration_policy must be one of: open, invite_only, closed")
+    elif key == "default_repo_visibility":
+        if value not in ("public", "private", "internal"):
+            raise HTTPException(400,
+                "default_repo_visibility must be one of: public, private, internal")
+    elif key == "max_pack_size_mb":
+        try:
+            mb = int(value)
+        except ValueError:
+            raise HTTPException(400, "max_pack_size_mb must be an integer")
+        if mb < 1 or mb > 10240:
+            raise HTTPException(400, "max_pack_size_mb must be between 1 and 10240")
+        value = str(mb)
+    elif key == "instance_url":
+        # Require scheme + host; rely on urlparse since we're not enforcing
+        # strict spec compliance, just a sanity gate.
+        from urllib.parse import urlparse
+        parsed = urlparse(value)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise HTTPException(400,
+                "instance_url must be a full http/https URL")
+    elif key == "instance_name":
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,62}$", value):
+            raise HTTPException(400,
+                "instance_name: 1-63 chars, alphanumeric + space/_/./- ")
+    else:
         raise HTTPException(400, f"Unknown config key: {key}")
+
     db.execute(conn,
         "UPDATE repo_server_config SET value = %s, updated_at = NOW(), updated_by = %s WHERE key = %s",
         (value, user["user_id"], key), commit=False)
@@ -1745,7 +1819,12 @@ def reset_password_page(request: Request, token: str = ""):
                                       {"token": token})
 
 @app.post("/api/auth/request-reset")
-def request_password_reset(email: str = Form(...), conn=Depends(get_db)):
+def request_password_reset(request: Request,
+                           email: str = Form(...), conn=Depends(get_db)):
+    # Rate limit: 3 reset requests per IP per hour. Limits email-based
+    # user enumeration (attacker checking whether an email is registered).
+    _rate_limit(request, "request_reset", max_hits=3, window_sec=3600)
+
     # Find user by email
     user = db.query_one(conn,
         "SELECT * FROM repo_users WHERE email = %s AND is_active = TRUE",
@@ -1776,9 +1855,14 @@ def request_password_reset(email: str = Form(...), conn=Depends(get_db)):
     }
 
 @app.post("/api/auth/reset-password")
-def do_password_reset(token: str = Form(...),
+def do_password_reset(request: Request,
+                      token: str = Form(...),
                       new_password: str = Form(...),
                       conn=Depends(get_db)):
+    # Rate limit: 5 attempts per IP per 15 minutes. Same class of brute-
+    # force protection as login — reset tokens shouldn't be guessable.
+    _rate_limit(request, "reset_password", max_hits=5, window_sec=900)
+
     if len(new_password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters.")
 
@@ -2188,6 +2272,12 @@ def post_commit_comment(name: str, commit_hash: str,
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
+
+    # Visibility gate — without this, any authenticated user could comment
+    # on commits in private repos they can't even browse. Matches the
+    # /api/repos/{name}/comments endpoint's gate at line 2148.
+    if not repo.check_visibility(conn, r["repo_id"], user["user_id"]):
+        raise HTTPException(403)
 
     try:
         msg_id = db.query_scalar(conn, """

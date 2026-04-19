@@ -744,7 +744,6 @@ def cmd_remote(args):
         print("ERROR: Not in a repository.")
         return 1
 
-    config_path = os.path.join(repo_root, ".olympusrepo", "config.json")
     config = worktree.load_config(repo_root)
     remotes = config.setdefault("remotes", {})
 
@@ -753,15 +752,13 @@ def cmd_remote(args):
             print("ERROR: 'add' requires remote_name and url")
             return 1
         remotes[args.remote_name] = {"url": args.url, "role": args.role}
-        with open(config_path, "w") as f:
-            json_mod.dump(config, f, indent=2)
+        worktree.save_config(repo_root, config)
         print(f"Added remote '{args.remote_name}' ({args.url})")
-        
+
     elif args.remote_action == "remove":
         if args.remote_name in remotes:
             del remotes[args.remote_name]
-            with open(config_path, "w") as f:
-                json_mod.dump(config, f, indent=2)
+            worktree.save_config(repo_root, config)
             print(f"Removed remote '{args.remote_name}'")
         else:
             print(f"ERROR: Remote '{args.remote_name}' not found.")
@@ -877,10 +874,7 @@ def cmd_pull(args):
             latest_pulled_rev = max((c.get("rev") or 0) for c in commits)
             if latest_pulled_rev:
                 config["last_synced_rev"] = latest_pulled_rev
-                config_path = os.path.join(repo_root, ".olympusrepo", "config.json")
-                import json as _json
-                with open(config_path, "w") as _f:
-                    _json.dump(config, _f, indent=2)
+                worktree.save_config(repo_root, config)
         
         latest_tree_hash = commits[-1]["tree_hash"]
         tree_data = objects.retrieve_blob(latest_tree_hash, objects_dir)
@@ -1136,21 +1130,21 @@ def cmd_delete_repo(args):
                 return 0
 
         try:
-            # Delete in correct order respecting FK constraints
-            cur = conn.cursor()
+            # Cascade deletes handle refs, commits, changesets, staging,
+            # staging_changes, promotions, messages, permissions, access,
+            # file_revisions (migration 010_fix_fk_cascades added the
+            # missing CASCADEs; anything transitively hanging off
+            # repo_commits cascades via repo_commits.repo_id).
+            #
+            # repo_audit_log uses ON DELETE SET NULL so history is retained
+            # with repo_id nulled — intentional for compliance/investigation.
             repo_id = r["repo_id"]
-            cur.execute("DELETE FROM repo_audit_log WHERE repo_id = %s", (repo_id,))
-            cur.execute("DELETE FROM repo_file_revisions WHERE repo_id = %s", (repo_id,))
-            cur.execute("DELETE FROM repo_messages WHERE repo_id = %s", (repo_id,))
-            cur.execute("DELETE FROM repo_staging_changes WHERE staging_id IN (SELECT staging_id FROM repo_staging WHERE repo_id = %s)", (repo_id,))
-            cur.execute("DELETE FROM repo_staging WHERE repo_id = %s", (repo_id,))
-            cur.execute("DELETE FROM repo_promotions WHERE repo_id = %s", (repo_id,))
-            cur.execute("DELETE FROM repo_changesets WHERE commit_hash IN (SELECT commit_hash FROM repo_commits WHERE repo_id = %s)", (repo_id,))
-            cur.execute("DELETE FROM repo_refs WHERE repo_id = %s", (repo_id,))
-            cur.execute("DELETE FROM repo_commits WHERE repo_id = %s", (repo_id,))
-            cur.execute("DELETE FROM repo_permissions WHERE repo_id = %s", (repo_id,))
-            cur.execute("DELETE FROM repo_access WHERE repo_id = %s", (repo_id,))
-            cur.execute("DELETE FROM repo_repositories WHERE repo_id = %s", (repo_id,))
+            db.execute(conn,
+                "DELETE FROM repo_repositories WHERE repo_id = %s",
+                (repo_id,), commit=False)
+            db.audit_log(conn, "repo_delete", user_id=user["user_id"],
+                         target_type="repo", target_id=args.name,
+                         details={"repo_id": repo_id}, commit=False)
             conn.commit()
             print(f"Repository '{args.name}' deleted.")
             return 0

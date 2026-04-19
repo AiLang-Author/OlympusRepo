@@ -71,10 +71,9 @@ def init_local(repo_root: str, config: dict):
     os.makedirs(os.path.join(repo_dir, PENDING_DIR), exist_ok=True)
     os.makedirs(os.path.join(repo_dir, CACHE_DIR), exist_ok=True)
 
-    # Write config
-    config_path = os.path.join(repo_dir, CONFIG_FILE)
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
+    # Write config atomically (tmp+rename) so a mid-init crash doesn't
+    # leave a half-written config.json that breaks future CLI calls.
+    save_config(repo_root, config)
 
     head_path = os.path.join(repo_dir, HEAD_FILE)
     with open(head_path, "w") as f:
@@ -97,6 +96,21 @@ def load_config(repo_root: str) -> dict:
         return {}
     with open(path, "r") as f:
         return json.load(f)
+
+
+def save_config(repo_root: str, config: dict):
+    """Save .olympusrepo/config.json atomically via tmp+rename.
+
+    A mid-write crash (Ctrl+C, OOM, power loss) previously left config.json
+    truncated, which bricked every subsequent CLI invocation in that repo.
+    Using tmp+rename ensures the file is either the old content or the new
+    content — never partial — because rename is atomic on POSIX filesystems.
+    """
+    path = os.path.join(repo_root, REPO_DIR, CONFIG_FILE)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(config, f, indent=2)
+    os.replace(tmp, path)
 
 
 def get_current_branch(repo_root: str) -> str:
