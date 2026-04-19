@@ -216,7 +216,7 @@ bcrypt via pgcrypto, 64-char hex session tokens from `gen_random_bytes`, `httpon
 
 MIT. See [LICENSE](LICENSE).
 
-Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering.
+Copyright (c) 2 Paws Machine and Engineering.
 
 ---
 
