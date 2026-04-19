@@ -17,7 +17,7 @@
         content: '';
         position: absolute;
         inset: 0;
-        background: linear-gradient(to bottom, rgba(0,0,0,0.3) 0%, rgba(13,17,23,0.85) 60%, #0d1117 100%);
+        background: linear-gradient(to bottom, rgba(0,0,0,0.25) 0%, rgba(13,17,23,0.65) 60%, #0d1117 100%);
     }
 
     .login-wrapper {
@@ -98,9 +98,28 @@
     .fate-tagline {
         text-align: center;
         margin-top: 28px;
-        color: #484f58;
-        font-size: 0.8em;
-        text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+        font-size: 1.15em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        /* Gold-into-gunmetal vertical gradient — highlight at the top,
+           dulls into deep bronze/slate at the bottom. */
+        background: linear-gradient(180deg,
+            #fff3a0 0%,
+            #ffd700 30%,
+            #b8860b 60%,
+            #4a4a52 100%);
+        -webkit-background-clip: text;
+                background-clip: text;
+        color: transparent;
+        /* Stacked drop-shadows give the letters depth, like cast metal
+           lifted off the page. Bottom shadow is the soft ambient. */
+        text-shadow:
+            0 1px 0 #8b6914,
+            0 2px 0 #6b5210,
+            0 3px 0 #4a3a0c,
+            0 4px 0 #2a2108,
+            0 5px 6px rgba(0,0,0,0.65),
+            0 8px 14px rgba(0,0,0,0.45);
     }
 
     .auth-card {
@@ -110,6 +129,34 @@
         padding: 24px;
         backdrop-filter: blur(8px);
     }
+
+    /* Fleeing-git banner — gold accent matches /import, /new, and /. */
+    .flee-banner {
+        display: block;
+        margin: 28px auto 0 auto;
+        max-width: 440px;
+        padding: 12px 18px;
+        text-align: center;
+        border-radius: 10px;
+        background: linear-gradient(180deg, rgba(255,215,0,0.08), rgba(255,215,0,0.02));
+        border: 1px solid #b8860b;
+        box-shadow: 0 0 22px rgba(255,215,0,0.12);
+        color: #c9d1d9;
+        text-decoration: none;
+        font-size: 0.95em;
+        line-height: 1.4;
+        transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease;
+        text-shadow: 0 1px 6px rgba(0,0,0,0.8);
+    }
+    .flee-banner:hover,
+    .flee-banner:focus {
+        transform: translateY(-1px);
+        border-color: #ffd700;
+        box-shadow: 0 0 32px rgba(255,215,0,0.25);
+        text-decoration: none;
+    }
+    .flee-banner strong { color: #ffd700; letter-spacing: 0.02em; }
+    .flee-banner .sub { display: block; color: #8b949e; font-size: 0.85em; margin-top: 2px; }
 </style>
 {% endblock %}
 
@@ -133,6 +180,11 @@
                 <button class="fate-btn-browse" id="browse-btn">Browse the Archives</button>
             </div>
             <p class="fate-tagline">The Thunderer watches all.</p>
+
+            <a href="#" id="flee-banner" class="flee-banner">
+                <strong>Fleeing git?</strong> We've got you covered.
+                <span class="sub">Import your full commit history &mdash; sign up and bring it with you.</span>
+            </a>
         </div>
 
         <!-- LOGIN FORM -->
@@ -238,6 +290,10 @@
     document.getElementById('browse-btn').addEventListener('click', function() {
     window.location = '/browse';
 });
+    document.getElementById('flee-banner').addEventListener('click', function(e) {
+        e.preventDefault();
+        showSignup();
+    });
 
     // Back links
     document.getElementById('back-to-fate').addEventListener('click', function(e) { e.preventDefault(); showFate(); });
