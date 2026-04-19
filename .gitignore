@@ -24,3 +24,12 @@ start-relay.sh
 current.zip
 nohup.out
 *.log
+olympuscodereview.md
+
+# Build/runtime artifacts
+current.zip
+nohup.out
+*.log
+
+# Local worklog, not for upstream
+olympuscodereview.md
