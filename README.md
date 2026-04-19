@@ -185,7 +185,7 @@ The contributor can never push directly. They can only offer. Zeus decides what 
 
 ## Status
 
-**Alpha — v0.3.** Core workflow proven end to end. Two instances talking. Offers flowing. Zeus promoting.
+**Beta 1.0** Core workflow proven end to end. Two instances talking. Offers flowing. Zeus promoting.
 
 **Known gaps (good first contributions):**
 - Promote route needs applying (code written, see `docs/CONTRIBUTING.md`)
