@@ -1,0 +1,218 @@
+{% extends "base.html" %}
+{% block title %}Pay Tribute &mdash; {{ repo.name }}{% endblock %}
+
+{% block extra_css %}
+<style>
+main {
+    background:
+        linear-gradient(to bottom, rgba(13,17,23,0.60), rgba(13,17,23,0.80)),
+        url('/static/offering-room.png') center center / cover no-repeat fixed;
+}
+.tribute-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px;
+    margin-top: 24px;
+}
+@media (max-width: 780px) {
+    .tribute-grid { grid-template-columns: 1fr; }
+}
+.tribute-card {
+    display: block;
+    padding: 20px;
+    background: linear-gradient(180deg,
+        rgba(22,27,34,0.9), rgba(13,17,23,0.9));
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    text-decoration: none;
+    color: #c9d1d9;
+    transition: transform 0.12s ease, border-color 0.12s ease,
+                box-shadow 0.12s ease;
+}
+.tribute-card:hover {
+    transform: translateY(-2px);
+    border-color: #ffd700;
+    box-shadow: 0 0 24px rgba(255,215,0,0.15);
+    text-decoration: none;
+}
+.tribute-card.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+.tribute-card h3 {
+    margin: 0 0 6px 0;
+    color: #ffd700;
+    font-size: 1.15em;
+    letter-spacing: 0.02em;
+}
+.tribute-card p {
+    margin: 0;
+    color: #8b949e;
+    font-size: 0.92em;
+    line-height: 1.45;
+}
+.tribute-hero {
+    text-align: center;
+    padding: 32px 16px 8px 16px;
+}
+.tribute-hero h1 {
+    margin: 0 0 8px 0;
+    background: linear-gradient(180deg,
+        #fff3a0 0%, #ffd700 40%, #b8860b 80%);
+    -webkit-background-clip: text;
+            background-clip: text;
+    color: transparent;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+}
+.tribute-hero p {
+    color: #8b949e;
+    font-size: 1.02em;
+}
+.login-prompt {
+    margin-top: 20px;
+    padding: 14px 18px;
+    background: rgba(255,215,0,0.06);
+    border: 1px solid #b8860b;
+    border-radius: 8px;
+    color: #c9d1d9;
+    text-align: center;
+}
+.login-prompt a { color: #ffd700; text-decoration: underline; }
+.edit-picker {
+    margin-top: 12px;
+    padding: 14px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+}
+.edit-picker select {
+    width: 100%;
+    padding: 8px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    color: #c9d1d9;
+    border-radius: 6px;
+    font-family: monospace;
+    font-size: 0.9em;
+}
+.edit-picker button {
+    margin-top: 10px;
+}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="tribute-hero">
+        <h1>⚡ Pay Tribute</h1>
+        <p>
+            Found a bug? Got a patch? Want to help <strong>{{ repo.name }}</strong>?
+            Step inside.
+        </p>
+    </div>
+
+    {% if needs_login %}
+    <div class="login-prompt">
+        You need to
+        <a href="/login?next=/repo/{{ repo.name }}/tribute">log in</a>
+        or <a href="/login?next=/repo/{{ repo.name }}/tribute">create an account</a>
+        to make an offering. Reading is always free.
+    </div>
+    {% endif %}
+
+    <div class="tribute-grid">
+
+        <!-- 1. Report a bug -->
+        <a class="tribute-card {% if needs_login %}disabled{% endif %}"
+           href="/repo/{{ repo.name }}/issues/new?type=bug">
+            <h3>🐛 Report a bug</h3>
+            <p>
+                Something's broken. Tell us what you saw, what you expected,
+                and how to reproduce it. A good bug report is already half
+                a fix.
+            </p>
+        </a>
+
+        <!-- 2. Start a discussion -->
+        <a class="tribute-card {% if needs_login %}disabled{% endif %}"
+           href="/repo/{{ repo.name }}/mana#mana-content">
+            <h3>💬 Start a discussion</h3>
+            <p>
+                Got an idea but no code yet? Want to argue about design?
+                Mana is the village square &mdash; post your thought and
+                let the Olympians respond.
+            </p>
+        </a>
+
+        <!-- 3. Suggest an edit (single file) -->
+        <div class="tribute-card {% if needs_login %}disabled{% endif %}"
+             style="cursor: default;">
+            <h3>📝 Suggest an edit</h3>
+            <p>
+                Fix a typo, tweak a doc, small change to one file &mdash;
+                edit it right here in the browser. Pick a file:
+            </p>
+            <div class="edit-picker">
+                <select id="edit-file-picker" {% if needs_login %}disabled{% endif %}>
+                    <option value="">-- choose a file --</option>
+                    {% for f in edit_candidates %}
+                    <option value="{{ f.path }}">{{ f.path }}</option>
+                    {% endfor %}
+                </select>
+                <button id="edit-go-btn" class="btn btn-gold"
+                        {% if needs_login %}disabled{% endif %}>
+                    Open in editor &rarr;
+                </button>
+            </div>
+        </div>
+
+        <!-- 4. Offer a patch -->
+        <a class="tribute-card {% if needs_login %}disabled{% endif %}"
+           href="/repo/{{ repo.name }}/tribute/patch">
+            <h3>📦 Offer a patch</h3>
+            <p>
+                Have multiple modified files? Zip them up (paths relative
+                to repo root) and upload. We'll diff against canonical and
+                stage it for review.
+            </p>
+        </a>
+
+    </div>
+
+    <div style="text-align:center; margin-top:32px; color:#8b949e;
+                font-size:0.85em;">
+        Serious contributor? The CLI is stronger:
+        <code style="color:#ffd700;">olympusrepo clone</code>,
+        <code style="color:#ffd700;">olympusrepo offer</code>.
+        See <a href="/docs" style="color:#ffd700;">the docs</a>.
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    var repoName = {{ repo.name | tojson }};
+    var picker = document.getElementById('edit-file-picker');
+    var goBtn  = document.getElementById('edit-go-btn');
+    if (!picker || !goBtn) return;
+
+    goBtn.addEventListener('click', function() {
+        var path = picker.value;
+        if (!path) {
+            picker.focus();
+            return;
+        }
+        window.location = '/repo/' + encodeURIComponent(repoName) +
+                          '/tribute/edit/' + path;
+    });
+
+    picker.addEventListener('change', function() {
+        // Enable button once a selection is made
+        goBtn.disabled = !picker.value;
+    });
+})();
+</script>
+{% endblock %}

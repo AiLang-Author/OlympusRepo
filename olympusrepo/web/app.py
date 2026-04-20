@@ -3331,6 +3331,449 @@ def promote_staging(name: str, staging_id: int,
 
 
 # =========================================================================
+# TRIBUTE — Web-based contribution entry point
+#
+# Discoverable path for drive-by contributors: bug report, discussion,
+# single-file edit, or multi-file patch upload. All four terminate in
+# existing tables (repo_issues, repo_messages/mana, repo_staging).
+# =============================================================================
+
+import time
+import zipfile
+import io
+
+
+# --- Limits (tune to taste) ---------------------------------------------
+TRIBUTE_MAX_FILE_BYTES    = 1 * 1024 * 1024     # 1 MB per file in a patch
+TRIBUTE_MAX_PATCH_BYTES   = 5 * 1024 * 1024     # 5 MB total zip upload
+TRIBUTE_MAX_PATCH_FILES   = 50                  # max files in one patch
+TRIBUTE_MIN_REASON_CHARS  = 10
+
+
+def _tribute_visibility_check(conn, r, user):
+    """Tribute requires repo-visible + logged in. Mortals may tribute."""
+    if not user:
+        raise HTTPException(401, "Login required to pay tribute.")
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 user["user_id"]):
+        raise HTTPException(403)
+
+
+# =========================================================================
+# TRIBUTE JUNCTION PAGE — choose your path
+# =========================================================================
+
+@app.get("/repo/{name}/tribute", response_class=HTMLResponse)
+def tribute_page(name: str, request: Request, conn=Depends(get_db)):
+    """The tribute junction. Four paths, one screen."""
+    user = get_current_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 user["user_id"] if user else None):
+        raise HTTPException(403)
+
+    # List files for the edit picker (top-level and nested)
+    branch = r.get("default_branch", "main")
+    files = _load_file_tree(conn, r["repo_id"], branch)
+
+    # Only text-ish files are edit candidates
+    edit_candidates = [f for f in files if f["type"] == "file"]
+
+    return templates.TemplateResponse(request, "tribute.html", {
+        "user": user, "repo": r,
+        "edit_candidates": edit_candidates,
+        "needs_login": user is None,
+    })
+
+
+# =========================================================================
+# EDIT — single file web editor
+# =========================================================================
+
+@app.get("/repo/{name}/tribute/edit/{path:path}", response_class=HTMLResponse)
+def tribute_edit_page(name: str, path: str, request: Request,
+                      conn=Depends(get_db)):
+    """Render the in-browser edit page for one file."""
+    user = get_current_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    _tribute_visibility_check(conn, r, user)
+
+    branch = r.get("default_branch", "main")
+    ref_name = f"refs/heads/{branch}"
+
+    row = db.query_one(conn, """
+        SELECT cs.blob_after FROM repo_changesets cs
+          JOIN repo_commits c ON c.commit_hash = cs.commit_hash
+          JOIN repo_refs rf ON rf.commit_hash = c.commit_hash
+         WHERE c.repo_id = %s
+           AND rf.ref_name = %s
+           AND cs.path = %s
+           AND cs.change_type != 'delete'
+         ORDER BY c.rev DESC LIMIT 1
+    """, (r["repo_id"], ref_name, path))
+
+    if not row or not row["blob_after"]:
+        raise HTTPException(404, "File not found on this branch.")
+
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    )
+    from ..core import objects as obj_store
+    content_bytes = obj_store.retrieve_blob(row["blob_after"], objects_dir)
+    if content_bytes is None:
+        raise HTTPException(404, "Blob missing from object store.")
+
+    try:
+        content = content_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "Binary files can't be edited in the browser.")
+
+    return templates.TemplateResponse(request, "tribute_edit.html", {
+        "user": user, "repo": r, "path": path, "branch": branch,
+        "content": content,
+    })
+
+
+@app.post("/api/repos/{name}/tribute/edit")
+async def tribute_edit_api(name: str, request: Request,
+                           conn=Depends(get_db)):
+    """Submit a single-file edit as a staging offer."""
+    user = get_current_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    _tribute_visibility_check(conn, r, user)
+
+    body = await request.json()
+    path        = str(body.get("path", "")).strip()
+    new_content = body.get("new_content", "")
+    reason      = str(body.get("reason", "")).strip()
+
+    if not path:
+        raise HTTPException(400, "Missing path.")
+    if not isinstance(new_content, str):
+        raise HTTPException(400, "Content must be a string.")
+    if len(reason) < TRIBUTE_MIN_REASON_CHARS:
+        raise HTTPException(400,
+            f"Reason must be at least {TRIBUTE_MIN_REASON_CHARS} characters.")
+    if len(new_content.encode("utf-8")) > TRIBUTE_MAX_FILE_BYTES:
+        raise HTTPException(413, "File too large for web edit.")
+
+    # Fetch current canonical blob to detect no-op
+    branch = r.get("default_branch", "main")
+    ref_name = f"refs/heads/{branch}"
+    row = db.query_one(conn, """
+        SELECT cs.blob_after FROM repo_changesets cs
+          JOIN repo_commits c ON c.commit_hash = cs.commit_hash
+          JOIN repo_refs rf ON rf.commit_hash = c.commit_hash
+         WHERE c.repo_id = %s AND rf.ref_name = %s
+           AND cs.path = %s AND cs.change_type != 'delete'
+         ORDER BY c.rev DESC LIMIT 1
+    """, (r["repo_id"], ref_name, path))
+
+    if not row or not row["blob_after"]:
+        raise HTTPException(404, "File not found on this branch.")
+
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    )
+    from ..core import objects as obj_store
+    from ..core import diff as diff_mod
+
+    old_bytes = obj_store.retrieve_blob(row["blob_after"], objects_dir)
+    if old_bytes is None:
+        raise HTTPException(500, "Canonical blob missing from store.")
+
+    try:
+        old_text = old_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "Binary files can't be edited in the browser.")
+
+    if old_text == new_content:
+        raise HTTPException(400, "No changes detected.")
+
+    # Store the new blob
+    new_bytes = new_content.encode("utf-8")
+    new_hash = obj_store.store_blob(new_bytes, objects_dir)
+
+    # Count line deltas for display
+    summary = diff_mod.diff_summary(old_text, new_content)
+
+    try:
+        branch_name = f"tribute-{user['username']}-{int(time.time())}"
+
+        staging_id = db.query_scalar(conn, """
+            INSERT INTO repo_staging
+                (repo_id, user_id, branch_name, status)
+            VALUES (%s, %s, %s, 'active')
+            RETURNING staging_id
+        """, (r["repo_id"], user["user_id"], branch_name))
+
+        db.execute(conn, """
+            INSERT INTO repo_staging_changes
+                (staging_id, path, change_type, blob_hash,
+                 lines_added, lines_removed)
+            VALUES (%s, %s, 'modify', %s, %s, %s)
+        """, (staging_id, path, new_hash,
+              summary["added"], summary["removed"]), commit=False)
+
+        # Notify zeus/olympians
+        reviewers = db.query(conn,
+            "SELECT user_id FROM repo_users "
+            "WHERE role IN ('zeus', 'olympian') AND is_active = TRUE")
+        for rev in reviewers:
+            db.create_notification(
+                conn, user_id=rev["user_id"],
+                notif_type="offer_received",
+                message=f"Web tribute from {user['username']} on {name}: "
+                        f"{reason[:80]}",
+                link=f"/repo/{name}/staging/{staging_id}",
+                repo_id=r["repo_id"],
+                commit=False
+            )
+
+        # Audit
+        db.audit_log(conn, "tribute_edit",
+                     user_id=user["user_id"], repo_id=r["repo_id"],
+                     target_type="staging", target_id=str(staging_id),
+                     details={"path": path, "reason": reason[:200]},
+                     commit=False)
+
+        # Attach reason as a mana post on the staging realm
+        db.execute(conn, """
+            INSERT INTO repo_messages
+                (repo_id, channel, username, sender_id, content,
+                 context_type, context_id)
+            VALUES (%s, %s, %s, %s, %s, 'staging', %s)
+        """, (r["repo_id"], f"staging-{staging_id}",
+              user["username"], user["user_id"],
+              reason, str(staging_id)), commit=False)
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, f"Could not create offer: {e}")
+
+    return {"staging_id": staging_id,
+            "redirect": f"/repo/{name}/staging/{staging_id}"}
+
+
+# =========================================================================
+# PATCH — multi-file zip upload
+# =========================================================================
+
+@app.get("/repo/{name}/tribute/patch", response_class=HTMLResponse)
+def tribute_patch_page(name: str, request: Request, conn=Depends(get_db)):
+    """Render the patch upload page."""
+    user = get_current_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    _tribute_visibility_check(conn, r, user)
+    return templates.TemplateResponse(request, "tribute_patch.html", {
+        "user": user, "repo": r,
+        "max_file_mb":  TRIBUTE_MAX_FILE_BYTES  // (1024 * 1024),
+        "max_patch_mb": TRIBUTE_MAX_PATCH_BYTES // (1024 * 1024),
+        "max_files":    TRIBUTE_MAX_PATCH_FILES,
+    })
+
+
+@app.post("/api/repos/{name}/tribute/patch")
+async def tribute_patch_api(name: str, request: Request,
+                            conn=Depends(get_db)):
+    """
+    Accept a ZIP of modified/new files as a staging offer.
+
+    Form fields:
+      reason  — why this change should be accepted (required)
+      archive — application/zip file upload
+
+    Inside the zip, file paths are relative to repo root. Files present
+    in the zip become 'add' or 'modify'. Deletions are not supported in
+    patch upload for now — use CLI for that.
+    """
+    user = get_current_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    _tribute_visibility_check(conn, r, user)
+
+    form = await request.form()
+    reason = str(form.get("reason", "")).strip()
+    archive = form.get("archive")
+
+    if len(reason) < TRIBUTE_MIN_REASON_CHARS:
+        raise HTTPException(400,
+            f"Reason must be at least {TRIBUTE_MIN_REASON_CHARS} characters.")
+    if archive is None or not hasattr(archive, "read"):
+        raise HTTPException(400, "No archive uploaded.")
+
+    zip_bytes = await archive.read()
+    if len(zip_bytes) > TRIBUTE_MAX_PATCH_BYTES:
+        raise HTTPException(413, "Patch archive too large.")
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "Uploaded file is not a valid zip.")
+
+    entries = [e for e in zf.infolist() if not e.is_dir()]
+    if len(entries) == 0:
+        raise HTTPException(400, "Archive is empty.")
+    if len(entries) > TRIBUTE_MAX_PATCH_FILES:
+        raise HTTPException(400,
+            f"Too many files (max {TRIBUTE_MAX_PATCH_FILES}).")
+
+    # Collect (path, bytes) with safety checks
+    submitted = []
+    for e in entries:
+        # Reject path traversal
+        p = e.filename.replace("\\", "/")
+        if p.startswith("/") or ".." in p.split("/"):
+            raise HTTPException(400, f"Unsafe path in archive: {e.filename}")
+        if e.file_size > TRIBUTE_MAX_FILE_BYTES:
+            raise HTTPException(413,
+                f"File '{p}' exceeds size limit.")
+        submitted.append((p, zf.read(e)))
+
+    # Compare each submitted file to current canonical; build change list
+    objects_dir = os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
+    )
+    from ..core import objects as obj_store
+    from ..core import diff as diff_mod
+
+    branch = r.get("default_branch", "main")
+    ref_name = f"refs/heads/{branch}"
+
+    # Get current tree: {path -> blob_hash}
+    tree_rows = db.query(conn, """
+        SELECT cs.path, cs.change_type, cs.blob_after,
+               c.rev
+          FROM repo_changesets cs
+          JOIN repo_commits c ON c.commit_hash = cs.commit_hash
+         WHERE c.repo_id = %s
+         ORDER BY c.rev ASC
+    """, (r["repo_id"],))
+
+    tree = {}
+    for tr in tree_rows:
+        if tr["change_type"] in ("add", "modify"):
+            tree[tr["path"]] = tr["blob_after"]
+        elif tr["change_type"] == "delete":
+            tree.pop(tr["path"], None)
+
+    changes = []
+    for path, content_bytes in submitted:
+        new_hash = obj_store.hash_content(content_bytes)
+
+        # Text check for line counts
+        try:
+            new_text = content_bytes.decode("utf-8")
+            is_binary = False
+        except UnicodeDecodeError:
+            new_text = ""
+            is_binary = True
+
+        if path in tree:
+            existing_hash = tree[path]
+            if existing_hash == new_hash:
+                continue  # identical, skip
+            change_type = "modify"
+            if not is_binary:
+                old_bytes = obj_store.retrieve_blob(existing_hash, objects_dir)
+                old_text = old_bytes.decode("utf-8", errors="replace") \
+                           if old_bytes else ""
+                summary = diff_mod.diff_summary(old_text, new_text)
+                la, lr = summary["added"], summary["removed"]
+            else:
+                la = lr = 0
+        else:
+            change_type = "add"
+            la = 0 if is_binary else len(new_text.splitlines())
+            lr = 0
+
+        # Store blob
+        obj_store.store_blob(content_bytes, objects_dir)
+        changes.append({
+            "path": path, "change_type": change_type,
+            "blob_hash": new_hash,
+            "lines_added": la, "lines_removed": lr,
+        })
+
+    if not changes:
+        raise HTTPException(400, "No actual changes detected in archive.")
+
+    try:
+        branch_name = f"tribute-patch-{user['username']}-{int(time.time())}"
+        staging_id = db.query_scalar(conn, """
+            INSERT INTO repo_staging
+                (repo_id, user_id, branch_name, status)
+            VALUES (%s, %s, %s, 'active')
+            RETURNING staging_id
+        """, (r["repo_id"], user["user_id"], branch_name))
+
+        for c in changes:
+            db.execute(conn, """
+                INSERT INTO repo_staging_changes
+                    (staging_id, path, change_type, blob_hash,
+                     lines_added, lines_removed)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (staging_id, c["path"], c["change_type"],
+                  c["blob_hash"], c["lines_added"],
+                  c["lines_removed"]), commit=False)
+
+        # Notify reviewers
+        reviewers = db.query(conn,
+            "SELECT user_id FROM repo_users "
+            "WHERE role IN ('zeus', 'olympian') AND is_active = TRUE")
+        for rev in reviewers:
+            db.create_notification(
+                conn, user_id=rev["user_id"],
+                notif_type="offer_received",
+                message=f"Web patch from {user['username']} on {name}: "
+                        f"{reason[:80]}",
+                link=f"/repo/{name}/staging/{staging_id}",
+                repo_id=r["repo_id"],
+                commit=False
+            )
+
+        db.audit_log(conn, "tribute_patch",
+                     user_id=user["user_id"], repo_id=r["repo_id"],
+                     target_type="staging", target_id=str(staging_id),
+                     details={"files": len(changes),
+                              "reason": reason[:200]},
+                     commit=False)
+
+        db.execute(conn, """
+            INSERT INTO repo_messages
+                (repo_id, channel, username, sender_id, content,
+                 context_type, context_id)
+            VALUES (%s, %s, %s, %s, %s, 'staging', %s)
+        """, (r["repo_id"], f"staging-{staging_id}",
+              user["username"], user["user_id"],
+              reason, str(staging_id)), commit=False)
+
+        conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, f"Could not create patch offer: {e}")
+
+    return {"staging_id": staging_id,
+            "files": len(changes),
+            "redirect": f"/repo/{name}/staging/{staging_id}"}
+
+
+# =========================================================================
 # RUN
 # =========================================================================
 if __name__ == "__main__":

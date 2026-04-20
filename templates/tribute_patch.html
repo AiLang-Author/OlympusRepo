@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+{% block title %}Offer a Patch &mdash; {{ repo.name }}{% endblock %}
+
+{% block extra_css %}
+<style>
+main {
+    background:
+        linear-gradient(to bottom, rgba(13,17,23,0.60), rgba(13,17,23,0.80)),
+        url('/static/offering-room.png') center center / cover no-repeat fixed;
+}
+.upload-wrap {
+    margin-top: 16px;
+    padding: 20px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+}
+.upload-wrap label {
+    display: block;
+    margin: 0 0 6px 0;
+    color: #c9d1d9;
+    font-weight: 600;
+}
+.upload-wrap input[type="file"] {
+    width: 100%;
+    padding: 10px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #c9d1d9;
+    margin-bottom: 16px;
+}
+.upload-wrap textarea {
+    width: 100%;
+    min-height: 100px;
+    padding: 10px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #c9d1d9;
+    font-family: inherit;
+    font-size: 0.95em;
+    resize: vertical;
+    margin-bottom: 16px;
+}
+.constraints {
+    background: rgba(255,215,0,0.04);
+    border-left: 3px solid #b8860b;
+    padding: 12px 14px;
+    border-radius: 4px;
+    margin-bottom: 16px;
+    color: #c9d1d9;
+    font-size: 0.9em;
+    line-height: 1.55;
+}
+.constraints strong { color: #ffd700; }
+.action-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+.status-line {
+    margin-left: auto;
+    color: #8b949e;
+    font-size: 0.88em;
+}
+.error { color: #f85149; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div style="margin-bottom:16px;">
+        <h1 style="margin-bottom:4px;">📦 Offer a Patch</h1>
+        <div class="card-meta">
+            <a href="/repo/{{ repo.name }}">{{ repo.name }}</a> /
+            <a href="/repo/{{ repo.name }}/tribute">Tribute</a> /
+            Patch
+        </div>
+    </div>
+
+    <div class="constraints">
+        <strong>How to prepare your patch:</strong>
+        <ol style="margin:8px 0 0 20px;">
+            <li>Zip up just the files you changed or added.</li>
+            <li>Paths inside the zip must be relative to the repo root
+                (e.g. <code>docs/README.md</code>, not
+                <code>/home/you/project/docs/README.md</code>).</li>
+            <li>Deletions aren't supported via web upload. Use the CLI
+                for that.</li>
+        </ol>
+        <div style="margin-top:10px;">
+            <strong>Limits:</strong>
+            max {{ max_file_mb }} MB per file,
+            {{ max_patch_mb }} MB total,
+            {{ max_files }} files.
+        </div>
+    </div>
+
+    <div class="upload-wrap">
+        <label for="archive">Patch archive (.zip)</label>
+        <input type="file" id="archive" accept=".zip,application/zip" />
+
+        <label for="reason">Why this change? (required, min 10 chars)</label>
+        <textarea id="reason"
+                  placeholder="What does this patch do? What did you test?"></textarea>
+
+        <div class="action-row">
+            <button id="submit-btn" class="btn btn-gold">
+                ⚡ Submit Patch
+            </button>
+            <a href="/repo/{{ repo.name }}/tribute" class="btn">Cancel</a>
+            <span id="status" class="status-line"></span>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    var repoName   = {{ repo.name | tojson }};
+    var fileInput  = document.getElementById('archive');
+    var reason     = document.getElementById('reason');
+    var submitBtn  = document.getElementById('submit-btn');
+    var statusEl   = document.getElementById('status');
+
+    submitBtn.addEventListener('click', async function() {
+        statusEl.textContent = '';
+        statusEl.className = 'status-line';
+
+        if (!fileInput.files || fileInput.files.length === 0) {
+            statusEl.textContent = 'Pick a zip file first.';
+            statusEl.className = 'status-line error';
+            return;
+        }
+        if (reason.value.trim().length < 10) {
+            statusEl.textContent = 'Reason must be at least 10 characters.';
+            statusEl.className = 'status-line error';
+            reason.focus();
+            return;
+        }
+
+        var fd = new FormData();
+        fd.append('archive', fileInput.files[0]);
+        fd.append('reason', reason.value.trim());
+
+        submitBtn.disabled = true;
+        statusEl.textContent = 'Uploading...';
+
+        try {
+            var res = await fetch(
+                '/api/repos/' + encodeURIComponent(repoName) + '/tribute/patch',
+                { method: 'POST', credentials: 'include', body: fd }
+            );
+            var data = await res.json();
+            if (!res.ok) {
+                throw new Error(data.detail || 'Upload failed');
+            }
+            statusEl.textContent = 'Submitted ' + data.files +
+                                   ' file(s). Redirecting...';
+            window.location = data.redirect;
+        } catch (err) {
+            statusEl.textContent = err.message;
+            statusEl.className = 'status-line error';
+            submitBtn.disabled = false;
+        }
+    });
+})();
+</script>
+{% endblock %}

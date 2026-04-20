@@ -1,0 +1,205 @@
+{% extends "base.html" %}
+{% block title %}Edit {{ path }} &mdash; {{ repo.name }}{% endblock %}
+
+{% block extra_css %}
+<style>
+main {
+    background:
+        linear-gradient(to bottom, rgba(13,17,23,0.60), rgba(13,17,23,0.80)),
+        url('/static/offering-room.png') center center / cover no-repeat fixed;
+}
+.editor-wrap {
+    margin-top: 16px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    overflow: hidden;
+}
+.editor-header {
+    padding: 10px 14px;
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+    font-family: monospace;
+    color: #c9d1d9;
+    font-size: 0.9em;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.editor-textarea {
+    width: 100%;
+    min-height: 480px;
+    padding: 14px;
+    background: #0d1117;
+    color: #c9d1d9;
+    border: 0;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.88em;
+    line-height: 1.5;
+    resize: vertical;
+    outline: none;
+    white-space: pre;
+    tab-size: 4;
+}
+.reason-wrap {
+    margin-top: 16px;
+    padding: 16px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+}
+.reason-wrap label {
+    display: block;
+    margin-bottom: 6px;
+    color: #c9d1d9;
+    font-weight: 600;
+}
+.reason-wrap textarea {
+    width: 100%;
+    min-height: 80px;
+    padding: 10px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #c9d1d9;
+    font-family: inherit;
+    font-size: 0.95em;
+    resize: vertical;
+}
+.action-row {
+    margin-top: 16px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+.status-line {
+    margin-left: auto;
+    color: #8b949e;
+    font-size: 0.88em;
+}
+.error {
+    color: #f85149;
+}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div style="margin-bottom:16px;">
+        <h1 style="margin-bottom:4px;">Edit File</h1>
+        <div class="card-meta">
+            <a href="/repo/{{ repo.name }}">{{ repo.name }}</a> /
+            <a href="/repo/{{ repo.name }}/tribute">Tribute</a> /
+            <code>{{ path }}</code>
+            <span style="margin-left:8px;">on branch
+                <code style="color:#3fb950;">{{ branch }}</code>
+            </span>
+        </div>
+    </div>
+
+    <div class="editor-wrap">
+        <div class="editor-header">
+            <span>{{ path }}</span>
+            <span id="line-count">&mdash;</span>
+        </div>
+        <textarea id="editor" class="editor-textarea"
+                  spellcheck="false">{{ content }}</textarea>
+    </div>
+
+    <div class="reason-wrap">
+        <label for="reason">
+            Why this change? (required, min 10 chars)
+        </label>
+        <textarea id="reason"
+                  placeholder="What are you changing and why should it be accepted?"></textarea>
+    </div>
+
+    <div class="action-row">
+        <button id="submit-btn" class="btn btn-gold">
+            ⚡ Submit Offering
+        </button>
+        <a href="/repo/{{ repo.name }}/tribute" class="btn">Cancel</a>
+        <span id="status" class="status-line"></span>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    var repoName   = {{ repo.name | tojson }};
+    var path       = {{ path | tojson }};
+    var editor     = document.getElementById('editor');
+    var reason     = document.getElementById('reason');
+    var submitBtn  = document.getElementById('submit-btn');
+    var statusEl   = document.getElementById('status');
+    var lineCount  = document.getElementById('line-count');
+    var originalContent = editor.value;
+
+    function updateLineCount() {
+        var lines = editor.value.split('\n').length;
+        lineCount.textContent = lines + ' line' + (lines === 1 ? '' : 's');
+    }
+    editor.addEventListener('input', updateLineCount);
+    updateLineCount();
+
+    // Tab key = insert tab, not change focus
+    editor.addEventListener('keydown', function(e) {
+        if (e.key === 'Tab') {
+            e.preventDefault();
+            var s = editor.selectionStart, end = editor.selectionEnd;
+            editor.value = editor.value.substring(0, s) + '\t' +
+                           editor.value.substring(end);
+            editor.selectionStart = editor.selectionEnd = s + 1;
+        }
+    });
+
+    submitBtn.addEventListener('click', async function() {
+        statusEl.textContent = '';
+        statusEl.className = 'status-line';
+
+        if (editor.value === originalContent) {
+            statusEl.textContent = 'No changes to submit.';
+            statusEl.className = 'status-line error';
+            return;
+        }
+        if (reason.value.trim().length < 10) {
+            statusEl.textContent = 'Reason must be at least 10 characters.';
+            statusEl.className = 'status-line error';
+            reason.focus();
+            return;
+        }
+
+        submitBtn.disabled = true;
+        statusEl.textContent = 'Submitting...';
+
+        try {
+            var res = await fetch(
+                '/api/repos/' + encodeURIComponent(repoName) + '/tribute/edit',
+                {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        path: path,
+                        new_content: editor.value,
+                        reason: reason.value.trim()
+                    })
+                }
+            );
+            var data = await res.json();
+            if (!res.ok) {
+                throw new Error(data.detail || 'Submit failed');
+            }
+            statusEl.textContent = 'Submitted! Redirecting...';
+            statusEl.className = 'status-line';
+            window.location = data.redirect;
+        } catch (err) {
+            statusEl.textContent = err.message;
+            statusEl.className = 'status-line error';
+            submitBtn.disabled = false;
+        }
+    });
+})();
+</script>
+{% endblock %}

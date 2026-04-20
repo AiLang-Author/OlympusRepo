@@ -42,6 +42,55 @@
         text-align: right;
         min-width: 80px;
     }
+    .pay-tribute-box {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        margin: 20px 0 24px 0;
+        padding: 14px 20px;
+        background: linear-gradient(180deg,
+            rgba(255,215,0,0.08), rgba(255,215,0,0.02));
+        border: 1px solid #b8860b;
+        border-radius: 10px;
+        color: #c9d1d9;
+        text-decoration: none;
+        transition: transform 0.12s ease, box-shadow 0.12s ease,
+                    border-color 0.12s ease;
+        box-shadow: 0 0 22px rgba(255,215,0,0.1);
+    }
+    .pay-tribute-box:hover {
+        transform: translateY(-1px);
+        border-color: #ffd700;
+        box-shadow: 0 0 32px rgba(255,215,0,0.22);
+        text-decoration: none;
+    }
+    .pay-tribute-box .pt-icon {
+        font-size: 1.8em;
+        line-height: 1;
+        color: #ffd700;
+    }
+    .pay-tribute-box .pt-body {
+        flex: 1;
+        line-height: 1.4;
+    }
+    .pay-tribute-box .pt-body strong {
+        color: #ffd700;
+        display: block;
+        font-size: 1em;
+        letter-spacing: 0.02em;
+    }
+    .pay-tribute-box .pt-sub {
+        display: block;
+        color: #8b949e;
+        font-size: 0.88em;
+        margin-top: 2px;
+    }
+    .pay-tribute-box .pt-arrow {
+        color: #ffd700;
+        font-size: 1.4em;
+        font-weight: 700;
+        margin-left: 4px;
+    }
 </style>
 {% endblock %}
 
@@ -86,6 +135,18 @@
         {% endfor %}
     </div>
     {% endif %}
+
+    <a href="/repo/{{ repo.name }}/tribute" class="pay-tribute-box">
+        <div class="pt-icon">⚡</div>
+        <div class="pt-body">
+            <strong>Found a bug? Got a patch? Pay tribute.</strong>
+            <span class="pt-sub">
+                Report a bug, start a discussion, suggest an edit, or offer a
+                patch &mdash; all from the browser.
+            </span>
+        </div>
+        <div class="pt-arrow">&rarr;</div>
+    </a>
 
     <!-- Tabs -->
     <div style="display:flex; gap:4px; border-bottom:1px solid #30363d; margin-bottom:24px; flex-wrap:wrap;">
