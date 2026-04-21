@@ -1103,10 +1103,12 @@ def repo_mana_page(name: str, request: Request, conn=Depends(get_db)):
 
     branches = repo.get_branches(conn, r["repo_id"])
 
+    # Only root messages — replies are visible inside the thread view
+    # at /repo/{name}/mana/{message_id}.
     messages = db.query(conn, """
         SELECT m.*, u.username FROM repo_messages m
           LEFT JOIN repo_users u ON u.user_id = m.sender_id
-         WHERE m.repo_id = %s
+         WHERE m.repo_id = %s AND m.parent_id IS NULL
          ORDER BY m.created_at DESC LIMIT 100
     """, (r["repo_id"],))
 
@@ -1119,9 +1121,15 @@ def repo_mana_page(name: str, request: Request, conn=Depends(get_db)):
 
 
 @app.post("/api/repos/{name}/mana")
-def send_mana(name: str, request: Request, content: str = Form(...),
-              context_type: str = Form("general"), context_id: str = Form(""),
-              conn=Depends(get_db)):
+async def send_mana(name: str, request: Request, content: str = Form(...),
+                    context_type: str = Form("general"),
+                    context_id: str = Form(""),
+                    conn=Depends(get_db)):
+    # Async-def is mandatory: this handler awaits the WebSocket broadcast.
+    # Earlier sync version called asyncio.create_task() from the threadpool
+    # worker thread, which has no running event loop — that raised
+    # RuntimeError AFTER the row was committed, producing the
+    # "message saved but UI says 'not sent'" symptom users were hitting.
     user = get_current_user(request, conn)
     if not user:
         raise HTTPException(401)
@@ -1133,25 +1141,135 @@ def send_mana(name: str, request: Request, content: str = Form(...),
     if not repo.check_visibility(conn, r["repo_id"], user["user_id"]):
         raise HTTPException(403)
 
-    db.execute(conn, """
+    msg_id = db.query_scalar(conn, """
         INSERT INTO repo_messages
             (repo_id, channel, username, sender_id, content, context_type, context_id)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING message_id
     """, (r["repo_id"], f"repo-{name}", user["username"], user["user_id"],
           content, context_type, context_id or None))
+    # query_scalar does not commit; get_db closes without committing,
+    # which would implicitly rollback the INSERT and leave the WS-broadcast
+    # message_id pointing at a phantom row.
+    conn.commit()
 
-    # Broadcast to WebSocket subscribers
-    import asyncio
     message = {
+        "message_id": msg_id,
         "username": user["username"],
         "content": content,
         "context_type": context_type,
         "context_id": context_id or "",
-        "created_at": str(__import__("datetime").datetime.now().strftime("%b %d %H:%M")),
+        "created_at": __import__("datetime").datetime.now().strftime("%b %d %H:%M"),
     }
-    asyncio.create_task(mana_manager.broadcast(f"repo-{name}", message))
+    # Broadcast failures must NOT poison the response — the row is already
+    # committed and the user's "send" succeeded by every meaningful measure.
+    try:
+        await mana_manager.broadcast(f"repo-{name}", message)
+    except Exception:
+        pass
 
-    return {"status": "sent"}
+    return {"status": "sent", "message_id": msg_id}
+
+
+@app.get("/repo/{name}/mana/{message_id}", response_class=HTMLResponse)
+def repo_mana_thread_page(name: str, message_id: int, request: Request,
+                          conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 user["user_id"] if user else None):
+        raise HTTPException(403)
+
+    root = db.query_one(conn, """
+        SELECT m.*, u.username as sender_name FROM repo_messages m
+          LEFT JOIN repo_users u ON u.user_id = m.sender_id
+         WHERE m.message_id = %s AND m.repo_id = %s
+    """, (message_id, r["repo_id"]))
+    if not root:
+        raise HTTPException(404)
+
+    # If the URL points at a reply, redirect to the root so threads always
+    # render in canonical form.
+    if root.get("parent_id"):
+        target = root.get("thread_id") or root["parent_id"]
+        return RedirectResponse(
+            url=f"/repo/{name}/mana/{target}", status_code=302)
+
+    replies = db.query(conn, """
+        SELECT m.*, u.username as sender_name FROM repo_messages m
+          LEFT JOIN repo_users u ON u.user_id = m.sender_id
+         WHERE m.repo_id = %s
+           AND (m.thread_id = %s OR m.parent_id = %s)
+         ORDER BY m.created_at ASC
+    """, (r["repo_id"], message_id, message_id))
+
+    branches = repo.get_branches(conn, r["repo_id"])
+    return templates.TemplateResponse(request, "repo_mana_thread.html", {
+        "user": user, "repo": r, "branches": branches,
+        "current_branch": r.get("default_branch", "main"),
+        "tab": "mana",
+        "root": root, "replies": replies,
+    })
+
+
+@app.post("/api/repos/{name}/mana/{message_id}/reply")
+async def repo_mana_reply(name: str, message_id: int, request: Request,
+                          content: str = Form(...),
+                          conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+
+    if not repo.check_visibility(conn, r["repo_id"], user["user_id"]):
+        raise HTTPException(403)
+
+    # The root (or any message in this repo) must exist before we attach.
+    root = db.query_one(conn, """
+        SELECT message_id, thread_id, parent_id FROM repo_messages
+         WHERE message_id = %s AND repo_id = %s
+    """, (message_id, r["repo_id"]))
+    if not root:
+        raise HTTPException(404)
+
+    # Always thread under the canonical root, even if the caller passed a
+    # reply's message_id by mistake.
+    thread_root = root.get("thread_id") or root.get("parent_id") or message_id
+
+    reply_id = db.query_scalar(conn, """
+        INSERT INTO repo_messages
+            (repo_id, channel, username, sender_id, content,
+             context_type, parent_id, thread_id)
+        VALUES (%s, %s, %s, %s, %s, 'general', %s, %s)
+        RETURNING message_id
+    """, (r["repo_id"], f"repo-{name}", user["username"], user["user_id"],
+          content, thread_root, thread_root))
+
+    db.execute(conn, """
+        UPDATE repo_messages
+           SET reply_count = reply_count + 1
+         WHERE message_id = %s
+    """, (thread_root,))
+
+    try:
+        await mana_manager.broadcast(f"repo-{name}", {
+            "message_id": reply_id,
+            "parent_id": thread_root,
+            "thread_id": thread_root,
+            "username": user["username"],
+            "content": content,
+            "created_at": __import__("datetime").datetime.now().strftime("%b %d %H:%M"),
+        })
+    except Exception:
+        pass
+
+    return {"status": "sent", "message_id": reply_id, "thread_id": thread_root}
 
 
 @app.post("/api/repos/{name}/upload")

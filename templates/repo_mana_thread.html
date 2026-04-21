@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+{% block title %}{{ repo.name }} mana &mdash; OlympusRepo{% endblock %}
+
+{% block extra_css %}
+<style>
+    main {
+        background:
+            linear-gradient(to bottom, rgba(13,17,23,0.60), rgba(13,17,23,0.80)),
+            url('/static/chat-room.png') center center / cover no-repeat fixed;
+    }
+    .mana-bubble {
+        border-radius: 6px;
+        padding: 14px 16px;
+        margin-bottom: 12px;
+        background: #161b22;
+        border: 1px solid #30363d;
+    }
+    .mana-bubble.mine {
+        background: #1c2d1e;
+        border-color: #238636;
+    }
+    .mana-meta {
+        font-size: 0.8em;
+        color: #8b949e;
+        margin-bottom: 6px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .mana-content {
+        color: #c9d1d9;
+        white-space: pre-wrap;
+        word-break: break-word;
+        line-height: 1.6;
+    }
+    .mana-context {
+        margin-top: 6px;
+        font-size: 0.8em;
+        color: #8b949e;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container" style="max-width: 760px;">
+
+    <div class="row-between" style="margin-bottom: 24px;">
+        <a href="/repo/{{ repo.name }}/mana" class="btn">&larr; Back to mana</a>
+        <div class="card-meta">
+            {% if root.created_at %}
+                Started {{ root.created_at.strftime('%b %d, %Y %H:%M') }}
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- ROOT MESSAGE -->
+    <div class="mana-bubble {% if user and root.sender_id == user.user_id %}mine{% endif %}">
+        <div class="mana-meta">
+            <strong style="color:#f0f6fc;">{{ root.sender_name or root.username }}</strong>
+            {% if root.created_at %}
+            <span style="margin-left:auto;">
+                {{ root.created_at.strftime('%b %d %H:%M') }}
+            </span>
+            {% endif %}
+        </div>
+        <div class="mana-content">{{ root.content }}</div>
+        {% if root.context_type and root.context_type != 'general' %}
+        <div class="mana-context">
+            {{ root.context_type }}: <code>{{ root.context_id }}</code>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- REPLIES -->
+    {% if replies %}
+    <div style="margin: 16px 0 8px 0; color: #8b949e; font-size: 0.85em;">
+        {{ replies|length }} repl{% if replies|length != 1 %}ies{% else %}y{% endif %}
+    </div>
+    {% endif %}
+
+    <div id="thread-replies">
+        {% for r in replies %}
+        <div class="mana-bubble {% if user and r.sender_id == user.user_id %}mine{% endif %}">
+            <div class="mana-meta">
+                <strong style="color:#f0f6fc;">{{ r.sender_name or r.username }}</strong>
+                {% if r.created_at %}
+                <span style="margin-left:auto;">
+                    {{ r.created_at.strftime('%b %d %H:%M') }}
+                </span>
+                {% endif %}
+            </div>
+            <div class="mana-content">{{ r.content }}</div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <!-- REPLY FORM -->
+    {% if user %}
+    <div class="card" style="margin-top: 24px;">
+        <h3 style="margin-top:0;">Reply</h3>
+        <div id="reply-error" class="flash flash-error" style="display:none;"></div>
+        <textarea id="reply-content"
+                  placeholder="Add to this thread..."
+                  style="min-height:90px; width:100%;"></textarea>
+        <div style="margin-top:8px;">
+            <button id="reply-send-btn" class="btn btn-primary">Send reply</button>
+        </div>
+    </div>
+    {% else %}
+    <div class="card-meta" style="margin-top: 16px;">
+        <a href="/login">Log in</a> to reply.
+    </div>
+    {% endif %}
+
+</div>
+
+<script>
+(function() {
+    var repoName = {{ repo.name | tojson }};
+    var rootId = {{ root.message_id | tojson }};
+
+    function escapeHtml(s) {
+        return String(s)
+            .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+            .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    // Live updates from WebSocket — filter to just this thread.
+    var proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var ws = null;
+    function connectWS() {
+        ws = new WebSocket(proto + '//' + window.location.host +
+                           '/ws/mana/repo-' + encodeURIComponent(repoName));
+        ws.onmessage = function(event) {
+            var msg = JSON.parse(event.data);
+            // Only show messages that belong to this thread.
+            var belongs = (msg.thread_id && msg.thread_id == rootId) ||
+                          (msg.parent_id && msg.parent_id == rootId);
+            if (!belongs) return;
+            var container = document.getElementById('thread-replies');
+            if (!container) return;
+            var div = document.createElement('div');
+            div.className = 'mana-bubble';
+            div.innerHTML =
+                '<div class="mana-meta">' +
+                '<strong style="color:#f0f6fc;">' + escapeHtml(msg.username) + '</strong>' +
+                '<span style="margin-left:auto;">' + escapeHtml(msg.created_at || '') + '</span>' +
+                '</div>' +
+                '<div class="mana-content">' + escapeHtml(msg.content) + '</div>';
+            container.appendChild(div);
+        };
+        ws.onclose = function() { setTimeout(connectWS, 3000); };
+    }
+    connectWS();
+
+    var btn = document.getElementById('reply-send-btn');
+    if (btn) {
+        btn.addEventListener('click', async function() {
+            var contentEl = document.getElementById('reply-content');
+            var errEl = document.getElementById('reply-error');
+            errEl.style.display = 'none';
+            var content = contentEl.value.trim();
+            if (!content) {
+                errEl.textContent = 'Reply cannot be empty.';
+                errEl.style.display = 'block';
+                return;
+            }
+            btn.disabled = true;
+            try {
+                var form = new FormData();
+                form.append('content', content);
+                var res = await fetch(
+                    '/api/repos/' + encodeURIComponent(repoName) +
+                    '/mana/' + encodeURIComponent(rootId) + '/reply',
+                    { method: 'POST', body: form }
+                );
+                if (res.ok) {
+                    contentEl.value = '';
+                } else {
+                    var data = {};
+                    try { data = await res.json(); } catch (e) {}
+                    errEl.textContent = data.detail || 'Could not send reply.';
+                    errEl.style.display = 'block';
+                }
+            } catch (err) {
+                errEl.textContent = 'Network error.';
+                errEl.style.display = 'block';
+            } finally {
+                btn.disabled = false;
+            }
+        });
+    }
+})();
+</script>
+{% endblock %}

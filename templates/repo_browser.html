@@ -250,10 +250,16 @@
         </div>
         {% endif %}
 
+        <style>
+            .mana-card-link { text-decoration: none; color: inherit; display: block; }
+            .mana-card { padding: 12px; transition: border-color 0.1s; }
+            .mana-card-link:hover .mana-card { border-color: #58a6ff; }
+        </style>
         <div id="mana-messages">
             {% if messages %}
                 {% for m in messages %}
-            <div class="card" style="padding:12px;">
+            <a href="/repo/{{ repo.name }}/mana/{{ m.message_id }}" class="mana-card-link">
+              <div class="card mana-card">
                 <div class="row-between" style="margin-bottom:4px;">
                     <span style="font-weight:600; color:#f0f6fc;">{{ m.username }}</span>
                     <span class="card-meta">
@@ -266,7 +272,13 @@
                         {{ m.context_type }}: <code>{{ m.context_id }}</code>
                     </div>
                 {% endif %}
-            </div>
+                {% if m.reply_count and m.reply_count > 0 %}
+                    <div class="card-meta" style="margin-top:6px;">
+                        💬 {{ m.reply_count }} repl{% if m.reply_count != 1 %}ies{% else %}y{% endif %}
+                    </div>
+                {% endif %}
+              </div>
+            </a>
             {% endfor %}
             {% else %}
                 <div class="empty-state"><p>No mana yet. Start a discussion.</p></div>
@@ -395,16 +407,22 @@ olympusrepo commit -m "Initial commit"</pre>
             var msg = JSON.parse(event.data);
             var container = document.getElementById('mana-messages');
             if (!container) return;
+            // Replies belong inside the thread view, not the list. Skip them.
+            if (msg.parent_id) return;
+            var a = document.createElement('a');
+            a.href = '/repo/' + encodeURIComponent(repoName) + '/mana/' +
+                     encodeURIComponent(msg.message_id || '');
+            a.className = 'mana-card-link';
             var div = document.createElement('div');
-            div.className = 'card';
-            div.style.padding = '12px';
+            div.className = 'card mana-card';
             div.innerHTML =
                 '<div class="row-between" style="margin-bottom:4px;">' +
                 '<span style="font-weight:600;color:#f0f6fc;">' + escapeHtml(msg.username) + '</span>' +
                 '<span class="card-meta">' + escapeHtml(msg.created_at) + '</span>' +
                 '</div>' +
                 '<p style="margin:0;white-space:pre-wrap;">' + escapeHtml(msg.content) + '</p>';
-            container.insertBefore(div, container.firstChild);
+            a.appendChild(div);
+            container.insertBefore(a, container.firstChild);
         };
 
         ws.onclose = function() {
