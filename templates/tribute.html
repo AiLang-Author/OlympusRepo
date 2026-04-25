@@ -114,11 +114,26 @@ main {
     </div>
 
     {% if needs_login %}
-    <div class="login-prompt">
-        You need to
+    <div class="login-prompt" style="text-align:left; line-height:1.6;">
+        <strong>You're not logged in (anonymous).</strong>
+        Most of these tributes need an account &mdash;
         <a href="/login?next=/repo/{{ repo.name }}/tribute">log in</a>
-        or <a href="/login?next=/repo/{{ repo.name }}/tribute">create an account</a>
-        to make an offering. Reading is always free.
+        or <a href="/login?next=/repo/{{ repo.name }}/tribute">create one</a> if you'd like the full set.
+        <br><br>
+        <strong>But you can still send a drive-by-fix patch &mdash; no signup required.</strong>
+        Here's how (works on any public repo):
+        <ol style="margin:10px 0 4px 22px; padding:0;">
+            <li>Click the <a href="/repo/{{ repo.name }}">Files</a> tab.</li>
+            <li>Browse the tree and click the file you want to edit.</li>
+            <li>Hit the blue <strong>✎ Edit / patch</strong> button at the top right of the file view.</li>
+            <li>Make your change in the editor.</li>
+            <li>Fill in your name, email, and a short reason. Click <strong>Send Anonymous Offering</strong>.</li>
+            <li>Save the bookmark URL it gives you &mdash; that's how you check whether a maintainer accepts the patch.</li>
+        </ol>
+        <span style="font-size:0.85em; color:#8b949e;">
+            Limit: 5 anon offerings per hour per IP. 50 KB max per file.
+            Bigger contributions need an account.
+        </span>
     </div>
     {% endif %}
 
