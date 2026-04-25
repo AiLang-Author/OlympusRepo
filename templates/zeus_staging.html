@@ -35,9 +35,25 @@
                     <tr>
                         <td><a href="/repo/{{ s.repo_name }}" class="text-decoration-none">{{ s.repo_name }}</a></td>
                         <td>
-                            <strong>{{ s.username }}</strong>
-                            {% if s.role == 'titan' %}
-                            <span class="badge bg-secondary ms-1">Remote</span>
+                            {% if s.username %}
+                                <strong>{{ s.username }}</strong>
+                                {% if s.role == 'titan' %}
+                                <span class="badge bg-secondary ms-1">Remote</span>
+                                {% endif %}
+                            {% else %}
+                                <strong>{{ s.anon_name or '(no name)' }}</strong>
+                                <span class="badge ms-1"
+                                      style="background:#9e6a03; color:#ffd700;">
+                                    ANON
+                                </span>
+                                {% if s.anon_email %}
+                                <div class="text-secondary" style="font-size:0.8em;">
+                                    &lt;{{ s.anon_email }}&gt;
+                                    {% if s.anon_ip %}
+                                    · IP {{ s.anon_ip }}
+                                    {% endif %}
+                                </div>
+                                {% endif %}
                             {% endif %}
                         </td>
                         <td><span class="badge bg-dark border font-monospace">{{ s.branch_name }}</span></td>

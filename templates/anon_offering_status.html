@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block title %}Your offering — OlympusRepo{% endblock %}
+
+{% block extra_css %}
+<style>
+main {
+    background:
+        linear-gradient(to bottom, rgba(13,17,23,0.65), rgba(13,17,23,0.85)),
+        url('/static/forge-room.png') center center / cover no-repeat fixed;
+}
+.status-banner {
+    padding: 16px 18px;
+    border-radius: 8px;
+    margin-bottom: 18px;
+    border-width: 2px;
+    border-style: solid;
+}
+.status-active   { border-color: #1f6feb; background: rgba(31,111,235,0.08); color: #c9d1d9; }
+.status-promoted { border-color: #238636; background: rgba(35,134,54,0.10); color: #c9d1d9; }
+.status-abandoned, .status-archived { border-color: #6e7681; background: rgba(110,118,129,0.10); color: #8b949e; }
+.bookmark-url {
+    background: #0a0d12;
+    color: #ffd700;
+    padding: 8px 12px;
+    border-radius: 4px;
+    font-family: monospace;
+    word-break: break-all;
+    cursor: pointer;
+    margin-top: 8px;
+}
+.changes-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9em;
+}
+.changes-table th, .changes-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid #21262d;
+    text-align: left;
+}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container" style="max-width:760px;">
+
+    <h1>📜 Your Offering</h1>
+    <div class="card-meta" style="margin-bottom:14px;">
+        Anonymous offering submitted to <strong><a href="/repo/{{ offering.repo_name }}">{{ offering.repo_name }}</a></strong>.
+    </div>
+
+    <div class="status-banner status-{{ offering.status }}">
+        {% if offering.status == 'active' %}
+            ⏳ <strong>Awaiting review.</strong> Zeus or an Olympian will look at this
+            offering and decide whether to promote it. You'll see the status update
+            here when they do.
+        {% elif offering.status == 'promoted' %}
+            ✅ <strong>Promoted!</strong> Your edit is now part of the canonical tree.
+            Thanks for the contribution.
+        {% elif offering.status == 'abandoned' %}
+            ✗ <strong>Rejected.</strong> A maintainer chose not to merge this offering.
+            They may have left a reason in the staging discussion (mana).
+        {% else %}
+            <strong>{{ offering.status | title }}.</strong> No further action.
+        {% endif %}
+    </div>
+
+    <div class="card" style="margin-bottom:18px;">
+        <h3 style="margin-top:0;">Submission details</h3>
+        <table style="width:100%;">
+            <tr><td style="color:#8b949e; padding:4px 0; width:140px;">Submitted</td>
+                <td>{{ offering.created_at.strftime('%b %d, %Y %H:%M UTC') }}</td></tr>
+            <tr><td style="color:#8b949e; padding:4px 0;">Updated</td>
+                <td>{{ offering.updated_at.strftime('%b %d, %Y %H:%M UTC') }}</td></tr>
+            <tr><td style="color:#8b949e; padding:4px 0;">Branch</td>
+                <td><code>{{ offering.branch_name }}</code></td></tr>
+            <tr><td style="color:#8b949e; padding:4px 0;">Submitter</td>
+                <td>{{ offering.anon_name }} &lt;{{ offering.anon_email }}&gt;</td></tr>
+            {% if offering.anon_reason %}
+            <tr><td style="color:#8b949e; padding:4px 0; vertical-align:top;">Reason</td>
+                <td style="white-space:pre-wrap;">{{ offering.anon_reason }}</td></tr>
+            {% endif %}
+        </table>
+    </div>
+
+    <div class="card" style="margin-bottom:18px;">
+        <h3 style="margin-top:0;">Files in this offering</h3>
+        {% if changes %}
+        <table class="changes-table">
+            <thead><tr><th>Path</th><th>Change</th><th>Blob</th></tr></thead>
+            <tbody>
+                {% for c in changes %}
+                <tr>
+                    <td><code>{{ c.path }}</code></td>
+                    <td>{{ c.change_type }}</td>
+                    <td><code>{{ c.blob_hash[:12] if c.blob_hash else '—' }}</code></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="card-meta">No file changes recorded — that's a bug.</div>
+        {% endif %}
+    </div>
+
+    <div class="card">
+        <h3 style="margin-top:0;">Bookmark this URL</h3>
+        <div class="card-meta">
+            This is your only way back to check status. Save it now.
+        </div>
+        <div class="bookmark-url" id="bookmark-url" title="click to copy">{{ request.url }}</div>
+    </div>
+
+</div>
+
+<script>
+(function() {
+    var url = document.getElementById('bookmark-url');
+    if (url) {
+        url.addEventListener('click', function() {
+            navigator.clipboard.writeText(url.textContent.trim()).then(function() {
+                var orig = url.style.background;
+                url.style.background = '#1a3a1a';
+                setTimeout(function() { url.style.background = orig; }, 600);
+            });
+        });
+    }
+})();
+</script>
+{% endblock %}

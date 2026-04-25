@@ -539,11 +539,14 @@ def zeus_staging_page(request: Request, conn=Depends(get_db)):
     if not user or user["role"] not in ("zeus", "olympian"):
         raise HTTPException(403, "The Throne is reserved for Zeus and the Olympian council.")
 
+    # LEFT JOIN repo_users — anonymous offerings have NULL user_id and
+    # would be excluded by an INNER JOIN. The template falls back to the
+    # anon_name / anon_email columns when username is NULL.
     staging = db.query(conn, """
         SELECT s.*, u.username, u.role, r.name as repo_name,
                COUNT(sc.change_id) as change_count
           FROM repo_staging s
-          JOIN repo_users u ON u.user_id = s.user_id
+          LEFT JOIN repo_users u ON u.user_id = s.user_id
           JOIN repo_repositories r ON r.repo_id = s.repo_id
           LEFT JOIN repo_staging_changes sc ON sc.staging_id = s.staging_id
          WHERE s.status = 'active'
@@ -1073,6 +1076,227 @@ def test_remote_api(name: str, remote_name: str, request: Request,
         "head_count": len(remote_heads),
         "branches":   branches,
     }
+
+
+# =========================================================================
+# ANONYMOUS OFFERINGS — drive-by-fix path on public repos
+# =========================================================================
+# Lets contributors edit a file in the browser and submit an "anon
+# offering" without an account. Maintainer reviews via /zeus/staging
+# the same way they review logged-in offerings; promotion attributes
+# the resulting commit to the contributor's submitted name + email.
+
+import secrets as _secrets
+
+_ANON_RATE_LIMIT_PER_HOUR = 5
+_ANON_MAX_DIFF_BYTES = 50 * 1024
+
+
+def _client_ip(request: Request) -> str:
+    """Return the client's IP. Trusts X-Forwarded-For only when this
+    server is configured to sit behind a proxy (env var)."""
+    if os.environ.get("OLYMPUSREPO_TRUST_FORWARDED_FOR") == "1":
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            return xff.split(",")[0].strip()
+    return request.client.host if request.client else "0.0.0.0"
+
+
+def _anon_rate_check(conn, ip: str) -> bool:
+    """True if this IP is under its hourly anon-submission limit."""
+    row = db.query_one(conn, """
+        SELECT count(*) AS n
+          FROM repo_anon_rate_log
+         WHERE ip = %s AND occurred_at > NOW() - INTERVAL '1 hour'
+    """, (ip,))
+    return (row and row["n"] < _ANON_RATE_LIMIT_PER_HOUR)
+
+
+def _anon_rate_record(conn, ip: str) -> None:
+    db.execute(conn,
+        "INSERT INTO repo_anon_rate_log (ip) VALUES (%s)", (ip,))
+
+
+@app.get("/repo/{name}/edit/{branch}/{path:path}", response_class=HTMLResponse)
+def edit_blob_page(name: str, branch: str, path: str, request: Request,
+                   conn=Depends(get_db)):
+    """Edit a file in the browser. Open to logged-in users on any visible
+    repo; open to anonymous viewers only when the repo is public AND has
+    anon_offerings_enabled."""
+    user = get_current_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 user["user_id"] if user else None):
+        raise HTTPException(403)
+
+    is_public = (r.get("visibility") == "public")
+    anon_ok = bool(r.get("anon_offerings_enabled", True)) and is_public
+    if not user and not anon_ok:
+        raise HTTPException(403, "This repo doesn't accept anonymous edits. "
+                                  "Log in or ask Zeus to enable anonymous offerings.")
+
+    ref_row = db.query_one(conn, """
+        SELECT commit_hash FROM repo_refs
+         WHERE repo_id = %s AND ref_name = %s
+    """, (r["repo_id"], f"refs/heads/{branch}"))
+    if not ref_row or not ref_row["commit_hash"]:
+        raise HTTPException(404, f"Branch '{branch}' not found.")
+
+    from ..core import materialize as mat
+    from ..core import objects as obj_store
+    try:
+        tree = mat.materialize_tree(conn, r["repo_id"], ref_row["commit_hash"])
+    except ValueError:
+        raise HTTPException(404, "Branch tip commit missing.")
+    if path not in tree:
+        raise HTTPException(404, f"{path} not in tree at {branch}.")
+    blob_hash = tree[path][0]
+    content_bytes = obj_store.retrieve_blob(blob_hash, _get_objects_dir())
+    if content_bytes is None:
+        raise HTTPException(404, "Blob not found.")
+    try:
+        content = content_bytes.decode("utf-8")
+        is_binary = False
+    except UnicodeDecodeError:
+        content = ""
+        is_binary = True
+
+    return templates.TemplateResponse(request, "edit_blob.html", {
+        "user": user, "repo": r, "branch": branch, "path": path,
+        "content": content, "is_binary": is_binary,
+        "anon_ok": (not user) and anon_ok,
+        "logged_in": bool(user),
+    })
+
+
+@app.post("/api/repos/{name}/offer-anon")
+async def submit_anon_offering(name: str, request: Request,
+                               path: str = Form(...),
+                               branch: str = Form(...),
+                               new_content: str = Form(...),
+                               anon_name: str = Form(...),
+                               anon_email: str = Form(...),
+                               anon_reason: str = Form(""),
+                               website: str = Form(""),  # honeypot
+                               conn=Depends(get_db)):
+    """Receive an anonymous edit. Stores it as a staging entry that the
+    maintainer can promote or reject from /zeus/staging.
+
+    Anti-abuse:
+      * Public repo only (anon_offerings_enabled gate)
+      * Honeypot 'website' field — must be blank, kills 95% of bots
+      * Per-IP hourly rate limit
+      * Hard cap on diff bytes
+      * Email format checked but not verified (cheap; v2 if needed)
+    """
+    if website.strip():
+        raise HTTPException(400, "Spam check failed.")
+
+    if len(new_content.encode("utf-8", errors="replace")) > _ANON_MAX_DIFF_BYTES:
+        raise HTTPException(413,
+            f"Edit too large (>{_ANON_MAX_DIFF_BYTES} bytes). Drive-by-fixes only — "
+            "create an account for larger contributions.")
+
+    anon_name  = (anon_name or "").strip()
+    anon_email = (anon_email or "").strip()
+    if not anon_name or len(anon_name) > 100:
+        raise HTTPException(400, "Name is required (1-100 chars).")
+    if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', anon_email) or len(anon_email) > 200:
+        raise HTTPException(400, "Email looks malformed.")
+
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if r.get("visibility") != "public" or not r.get("anon_offerings_enabled", True):
+        raise HTTPException(403, "This repo doesn't accept anonymous offerings.")
+
+    ip = _client_ip(request)
+    if not _anon_rate_check(conn, ip):
+        raise HTTPException(429,
+            f"You've submitted {_ANON_RATE_LIMIT_PER_HOUR} offerings in the last hour "
+            "from this IP. Wait a bit, or sign up for an account.")
+
+    from ..core import objects as obj_store
+    objects_dir = _get_objects_dir()
+    new_blob = obj_store.store_blob(new_content.encode("utf-8"), objects_dir)
+
+    public_token = _secrets.token_hex(16)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO repo_objects
+                    (object_hash, repo_id, byte_offset, size_bytes, obj_type)
+                VALUES (%s, %s, NULL, %s, 'blob')
+                ON CONFLICT (object_hash) DO NOTHING
+            """, (new_blob, r["repo_id"], len(new_content.encode("utf-8"))))
+
+            cur.execute("""
+                INSERT INTO repo_staging
+                    (repo_id, user_id, branch_name, status,
+                     anon_name, anon_email, anon_reason, anon_ip,
+                     public_token)
+                VALUES (%s, NULL, %s, 'active',
+                        %s, %s, %s, %s, %s)
+                RETURNING staging_id
+            """, (r["repo_id"], f"anon/{branch}",
+                  anon_name, anon_email, anon_reason, ip, public_token))
+            staging_id = cur.fetchone()[0]
+
+            cur.execute("""
+                INSERT INTO repo_staging_changes
+                    (staging_id, path, change_type, blob_hash,
+                     lines_added, lines_removed)
+                VALUES (%s, %s, 'modify', %s, 0, 0)
+            """, (staging_id, path, new_blob))
+
+            _anon_rate_record(conn, ip)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    db.audit_log(conn, "offer_anon", user_id=None,
+                 repo_id=r["repo_id"], target_type="staging",
+                 target_id=str(staging_id),
+                 details={"name": anon_name, "email": anon_email,
+                          "ip": ip, "path": path})
+    return {"status": "received",
+            "staging_id": staging_id,
+            "public_token": public_token,
+            "bookmark_url": f"/offering/{public_token}"}
+
+
+@app.get("/offering/{token}", response_class=HTMLResponse)
+def anon_offering_status_page(token: str, request: Request,
+                              conn=Depends(get_db)):
+    """Public bookmark URL the anon contributor uses to check status.
+    No auth — knowing the unguessable 32-hex token is the credential."""
+    row = db.query_one(conn, """
+        SELECT s.staging_id, s.repo_id, s.branch_name, s.status,
+               s.anon_name, s.anon_email, s.anon_reason, s.created_at,
+               s.updated_at, r.name AS repo_name
+          FROM repo_staging s
+          JOIN repo_repositories r ON r.repo_id = s.repo_id
+         WHERE s.public_token = %s
+    """, (token,))
+    if not row:
+        raise HTTPException(404, "Offering not found (or token expired).")
+
+    changes = db.query(conn, """
+        SELECT path, change_type, blob_hash, lines_added, lines_removed
+          FROM repo_staging_changes
+         WHERE staging_id = %s
+         ORDER BY path
+    """, (row["staging_id"],))
+
+    return templates.TemplateResponse(request, "anon_offering_status.html", {
+        "user": get_current_user(request, conn),
+        "offering": row,
+        "changes": changes,
+    })
 
 
 # =========================================================================

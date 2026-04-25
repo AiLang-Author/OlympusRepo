@@ -61,6 +61,14 @@
                class="btn" style="font-size:0.85em;">
                 File Issue
             </a>
+            {% if not is_historical and not is_binary %}
+            <a href="/repo/{{ repo.name }}/edit/{{ branch }}/{{ path }}"
+               class="btn"
+               style="font-size:0.85em; background:#1f6feb; color:#fff;"
+               title="Edit this file in the browser{% if not user %} (anonymous offering — no signup needed){% endif %}">
+                ✎ Edit / patch
+            </a>
+            {% endif %}
             <a href="/api/repos/{{ repo.name }}/raw/{{ branch }}/{{ path }}" class="btn btn-primary" target="_blank">Raw</a>
         </div>
     </div>

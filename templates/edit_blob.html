@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+{% block title %}Edit {{ path }} — {{ repo.name }}{% endblock %}
+
+{% block extra_css %}
+<style>
+main {
+    background:
+        linear-gradient(to bottom, rgba(13,17,23,0.65), rgba(13,17,23,0.85)),
+        url('/static/repo-room.png') center center / cover no-repeat fixed;
+}
+.editor {
+    width: 100%;
+    min-height: 480px;
+    background: #0a0d12;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 12px 14px;
+    font-family: monospace;
+    font-size: 0.92em;
+    line-height: 1.5;
+    resize: vertical;
+    tab-size: 4;
+}
+.anon-block {
+    margin-top: 18px;
+    padding: 14px 16px;
+    border: 1px solid #1f6feb;
+    border-radius: 8px;
+    background: rgba(31,111,235,0.06);
+}
+.anon-block h3 { margin-top: 0; }
+.anon-block .form-group { margin-bottom: 12px; }
+.anon-block input, .anon-block textarea {
+    width: 100%;
+    padding: 6px 10px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    color: #c9d1d9;
+    border-radius: 4px;
+}
+/* Honeypot — never visible, never tabbable. Bots fill it; humans never see it. */
+.honeypot {
+    position: absolute !important;
+    left: -10000px !important;
+    width: 1px !important; height: 1px !important;
+    opacity: 0 !important; pointer-events: none;
+}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container" style="max-width:1000px;">
+
+    <div class="row-between" style="margin-bottom:14px;">
+        <div>
+            <h1 style="margin-bottom:4px;">
+                ✎ Edit {{ path }}
+            </h1>
+            <div class="card-meta">
+                On branch <code>{{ branch }}</code> of <strong>{{ repo.name }}</strong>.
+            </div>
+        </div>
+        <a href="/repo/{{ repo.name }}/blob/{{ branch }}/{{ path }}" class="btn">
+            &larr; Cancel
+        </a>
+    </div>
+
+    {% if anon_ok %}
+    <div class="card" style="
+        margin-bottom:18px; padding:10px 14px;
+        border-color:#9e6a03;
+        background:rgba(158,106,3,0.08);">
+        ⓘ You're editing <strong>anonymously</strong>. No account needed.
+        Your name + email will be attached to the offering and used as the
+        commit author if Zeus promotes it. Drive-by-fixes welcome — for
+        bigger contributions, <a href="/login" style="color:#58a6ff;">log in</a>.
+    </div>
+    {% elif logged_in %}
+    <div class="card-meta" style="margin-bottom:14px;">
+        Logged in as <strong>{{ user.username }}</strong>. Saving creates a
+        staging offering for your account.
+    </div>
+    {% endif %}
+
+    {% if is_binary %}
+    <div class="empty-state" style="background:#161b22; border:1px solid #30363d;">
+        <p>Binary file — cannot edit in the browser.</p>
+    </div>
+    {% else %}
+    <form id="edit-form">
+        <textarea class="editor" id="content-area"
+                  spellcheck="false" autocomplete="off">{{ content }}</textarea>
+
+        <div class="anon-block">
+            <h3>{% if anon_ok %}Submit Anonymous Offering{% else %}Submit Offering{% endif %}</h3>
+            <div id="edit-error" class="flash flash-error" style="display:none;"></div>
+
+            {% if anon_ok %}
+            <div class="form-group">
+                <label>Your name <span style="color:#f85149;">*</span></label>
+                <input type="text" name="anon_name" required maxlength="100"
+                       placeholder="Casey Contributor">
+            </div>
+            <div class="form-group">
+                <label>Your email <span style="color:#f85149;">*</span></label>
+                <input type="email" name="anon_email" required maxlength="200"
+                       placeholder="casey@example.com">
+                <div class="card-meta" style="margin-top:4px;">
+                    Used as the commit author if your offering is promoted.
+                    Won't be displayed publicly until then.
+                </div>
+            </div>
+            {% endif %}
+
+            <div class="form-group">
+                <label>Reason / context <span style="color:#8b949e;">(optional)</span></label>
+                <textarea name="anon_reason" rows="3" maxlength="2000"
+                          placeholder="Fixed a typo / dead link / outdated example, etc."></textarea>
+            </div>
+
+            <!-- Honeypot field — humans never see it, bots almost always fill it. -->
+            <div class="honeypot" aria-hidden="true">
+                <label>Website (leave blank)</label>
+                <input type="text" name="website" tabindex="-1" autocomplete="off">
+            </div>
+
+            <button type="submit" class="btn btn-primary">
+                {% if anon_ok %}Send Anonymous Offering{% else %}Send Offering{% endif %}
+                <span style="font-family:monospace; font-size:0.85em; opacity:0.6;">/ patch</span>
+            </button>
+        </div>
+    </form>
+    {% endif %}
+
+</div>
+
+<script>
+(function() {
+    var repoName = {{ repo.name | tojson }};
+    var branch   = {{ branch    | tojson }};
+    var path     = {{ path      | tojson }};
+
+    var form = document.getElementById('edit-form');
+    if (!form) return;
+
+    form.addEventListener('submit', async function(e) {
+        e.preventDefault();
+        var err = document.getElementById('edit-error');
+        err.style.display = 'none';
+
+        var fd = new FormData(form);
+        fd.append('path', path);
+        fd.append('branch', branch);
+        fd.append('new_content', document.getElementById('content-area').value);
+
+        // Anonymous endpoint vs (future) logged-in endpoint:
+        // for now both go to /api/repos/<name>/offer-anon since the
+        // logged-in CLI flow is the existing federation offer command.
+        // If/when an in-browser logged-in offer endpoint exists, branch
+        // here on whether the anon name/email were provided.
+        var url = '/api/repos/' + encodeURIComponent(repoName) + '/offer-anon';
+
+        try {
+            var res = await fetch(url, { method: 'POST', body: fd });
+            if (res.ok) {
+                var data = await res.json();
+                location.href = data.bookmark_url || ('/offering/' + data.public_token);
+                return;
+            }
+            var d = {};
+            try { d = await res.json(); } catch(_) {}
+            err.textContent = d.detail || ('Submission failed (HTTP ' + res.status + ')');
+            err.style.display = 'block';
+        } catch (e2) {
+            err.textContent = 'Network error: ' + e2;
+            err.style.display = 'block';
+        }
+    });
+})();
+</script>
+{% endblock %}
