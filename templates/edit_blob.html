@@ -144,6 +144,23 @@ main {
     var form = document.getElementById('edit-form');
     if (!form) return;
 
+    function fmtErr(d, status) {
+        // FastAPI returns string detail OR an array of validation
+        // objects ({loc, msg, type}). Render both readably so users
+        // never see "[object Object]".
+        if (!d || !d.detail) return 'Submission failed (HTTP ' + status + ')';
+        if (typeof d.detail === 'string') return d.detail;
+        if (Array.isArray(d.detail)) {
+            return d.detail.map(function(e) {
+                var field = (e.loc && e.loc.length)
+                    ? e.loc[e.loc.length - 1] + ': '
+                    : '';
+                return field + (e.msg || JSON.stringify(e));
+            }).join('\n');
+        }
+        return JSON.stringify(d.detail);
+    }
+
     form.addEventListener('submit', async function(e) {
         e.preventDefault();
         var err = document.getElementById('edit-error');
@@ -154,23 +171,24 @@ main {
         fd.append('branch', branch);
         fd.append('new_content', document.getElementById('content-area').value);
 
-        // Anonymous endpoint vs (future) logged-in endpoint:
-        // for now both go to /api/repos/<name>/offer-anon since the
-        // logged-in CLI flow is the existing federation offer command.
-        // If/when an in-browser logged-in offer endpoint exists, branch
-        // here on whether the anon name/email were provided.
+        // Both anon + logged-in submissions go through the same endpoint.
+        // The server inspects the session: anonymous -> require name/email
+        // + token-bookmark flow; logged-in -> attribute to the user
+        // record + redirect to the existing staging review URL.
         var url = '/api/repos/' + encodeURIComponent(repoName) + '/offer-anon';
 
         try {
             var res = await fetch(url, { method: 'POST', body: fd });
             if (res.ok) {
                 var data = await res.json();
-                location.href = data.bookmark_url || ('/offering/' + data.public_token);
+                location.href = data.review_url
+                             || data.bookmark_url
+                             || ('/offering/' + data.public_token);
                 return;
             }
             var d = {};
             try { d = await res.json(); } catch(_) {}
-            err.textContent = d.detail || ('Submission failed (HTTP ' + res.status + ')');
+            err.textContent = fmtErr(d, res.status);
             err.style.display = 'block';
         } catch (e2) {
             err.textContent = 'Network error: ' + e2;

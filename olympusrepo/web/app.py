@@ -1176,53 +1176,80 @@ async def submit_anon_offering(name: str, request: Request,
                                path: str = Form(...),
                                branch: str = Form(...),
                                new_content: str = Form(...),
-                               anon_name: str = Form(...),
-                               anon_email: str = Form(...),
+                               anon_name: str = Form(""),
+                               anon_email: str = Form(""),
                                anon_reason: str = Form(""),
                                website: str = Form(""),  # honeypot
                                conn=Depends(get_db)):
-    """Receive an anonymous edit. Stores it as a staging entry that the
-    maintainer can promote or reject from /zeus/staging.
+    """Receive an edit and store it as a staging entry. Used for both
+    the anonymous drive-by-fix path on public repos and the in-browser
+    edit-and-offer path for logged-in users.
 
-    Anti-abuse:
-      * Public repo only (anon_offerings_enabled gate)
-      * Honeypot 'website' field — must be blank, kills 95% of bots
+    Auth handling:
+      * Logged in  -> staging row gets user_id; anon_name/email/token
+                      not required (template hides those fields).
+      * Anonymous  -> staging row gets NULL user_id + anon_* +
+                      public_token; only allowed on public repos with
+                      anon_offerings_enabled.
+
+    Anti-abuse (anon path only):
+      * Honeypot 'website' field — must be blank
       * Per-IP hourly rate limit
       * Hard cap on diff bytes
-      * Email format checked but not verified (cheap; v2 if needed)
+      * Email format checked
     """
+    user = get_current_user(request, conn)
+    is_anon = user is None
+
     if website.strip():
         raise HTTPException(400, "Spam check failed.")
 
     if len(new_content.encode("utf-8", errors="replace")) > _ANON_MAX_DIFF_BYTES:
         raise HTTPException(413,
-            f"Edit too large (>{_ANON_MAX_DIFF_BYTES} bytes). Drive-by-fixes only — "
-            "create an account for larger contributions.")
-
-    anon_name  = (anon_name or "").strip()
-    anon_email = (anon_email or "").strip()
-    if not anon_name or len(anon_name) > 100:
-        raise HTTPException(400, "Name is required (1-100 chars).")
-    if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', anon_email) or len(anon_email) > 200:
-        raise HTTPException(400, "Email looks malformed.")
+            f"Edit too large (>{_ANON_MAX_DIFF_BYTES} bytes). "
+            "Drive-by-fixes only — for larger contributions use the "
+            "olympusrepo CLI offer flow.")
 
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
-    if r.get("visibility") != "public" or not r.get("anon_offerings_enabled", True):
-        raise HTTPException(403, "This repo doesn't accept anonymous offerings.")
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 user["user_id"] if user else None):
+        raise HTTPException(403)
 
-    ip = _client_ip(request)
-    if not _anon_rate_check(conn, ip):
-        raise HTTPException(429,
-            f"You've submitted {_ANON_RATE_LIMIT_PER_HOUR} offerings in the last hour "
-            "from this IP. Wait a bit, or sign up for an account.")
+    if is_anon:
+        if r.get("visibility") != "public" or not r.get("anon_offerings_enabled", True):
+            raise HTTPException(403, "This repo doesn't accept anonymous offerings.")
+        anon_name  = (anon_name or "").strip()
+        anon_email = (anon_email or "").strip()
+        if not anon_name or len(anon_name) > 100:
+            raise HTTPException(400, "Name is required (1-100 chars).")
+        if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', anon_email) \
+                or len(anon_email) > 200:
+            raise HTTPException(400, "Email looks malformed.")
+
+        ip = _client_ip(request)
+        if not _anon_rate_check(conn, ip):
+            raise HTTPException(429,
+                f"You've submitted {_ANON_RATE_LIMIT_PER_HOUR} offerings in the "
+                "last hour from this IP. Wait a bit, or sign up for an account.")
+    else:
+        # Logged-in path — name/email come from the user record. Token
+        # not generated (logged-in users find their offerings via the
+        # normal staging UI; the bookmark URL is for anons who can't log
+        # in to find theirs).
+        anon_name  = user.get("username") or user.get("display_name") or ""
+        anon_email = user.get("email") or ""
+        ip = _client_ip(request)
 
     from ..core import objects as obj_store
     objects_dir = _get_objects_dir()
     new_blob = obj_store.store_blob(new_content.encode("utf-8"), objects_dir)
 
-    public_token = _secrets.token_hex(16)
+    public_token = _secrets.token_hex(16) if is_anon else None
+    user_id_for_row = None if is_anon else user["user_id"]
+    branch_for_row = (f"anon/{branch}" if is_anon
+                      else f"web-edit/{user['username']}/{branch}")
 
     try:
         with conn.cursor() as cur:
@@ -1238,10 +1265,10 @@ async def submit_anon_offering(name: str, request: Request,
                     (repo_id, user_id, branch_name, status,
                      anon_name, anon_email, anon_reason, anon_ip,
                      public_token)
-                VALUES (%s, NULL, %s, 'active',
+                VALUES (%s, %s, %s, 'active',
                         %s, %s, %s, %s, %s)
                 RETURNING staging_id
-            """, (r["repo_id"], f"anon/{branch}",
+            """, (r["repo_id"], user_id_for_row, branch_for_row,
                   anon_name, anon_email, anon_reason, ip, public_token))
             staging_id = cur.fetchone()[0]
 
@@ -1252,21 +1279,28 @@ async def submit_anon_offering(name: str, request: Request,
                 VALUES (%s, %s, 'modify', %s, 0, 0)
             """, (staging_id, path, new_blob))
 
-            _anon_rate_record(conn, ip)
+            if is_anon:
+                _anon_rate_record(conn, ip)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
 
-    db.audit_log(conn, "offer_anon", user_id=None,
+    db.audit_log(conn, ("offer_anon" if is_anon else "offer_web_edit"),
+                 user_id=user_id_for_row,
                  repo_id=r["repo_id"], target_type="staging",
                  target_id=str(staging_id),
                  details={"name": anon_name, "email": anon_email,
                           "ip": ip, "path": path})
+
+    if is_anon:
+        return {"status": "received",
+                "staging_id": staging_id,
+                "public_token": public_token,
+                "bookmark_url": f"/offering/{public_token}"}
     return {"status": "received",
             "staging_id": staging_id,
-            "public_token": public_token,
-            "bookmark_url": f"/offering/{public_token}"}
+            "review_url": f"/repo/{r['name']}/staging/{staging_id}/review"}
 
 
 @app.get("/offering/{token}", response_class=HTMLResponse)
