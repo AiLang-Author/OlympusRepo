@@ -418,19 +418,39 @@ def _stream_fast_import(
             fi.stdin.write(b"\n")
 
         fi.stdin.write(b"done\n")
+        fi.stdin.flush()
         fi.stdin.close()
-        _, err = fi.communicate(timeout=GIT_TIMEOUT)
+        # NOTE: don't call fi.communicate() here — it tries to flush
+        # stdin again and raises ValueError because we already closed
+        # it. Use wait() + manual stderr drain instead.
+        fi.wait(timeout=GIT_TIMEOUT)
+        err = fi.stderr.read() if fi.stderr else b""
         if fi.returncode != 0:
             raise RuntimeError(
                 f"git fast-import failed ({fi.returncode}): "
                 f"{err.decode('utf-8', errors='replace')[:500]}"
             )
-    except Exception:
+    except Exception as exc:
+        # If fast-import died mid-stream we get e.g. ValueError on the
+        # next stdin write/flush. Capture whatever it managed to print
+        # before exiting so the operator sees the actual rejection
+        # reason instead of a generic Python exception.
+        stderr_msg = ""
+        try:
+            if fi.stderr:
+                stderr_msg = fi.stderr.read(4096).decode(
+                    "utf-8", errors="replace")
+        except Exception:
+            pass
         try:
             fi.kill()
         except Exception:
             pass
-        raise
+        raise RuntimeError(
+            f"fast-import streaming aborted: {exc.__class__.__name__}: {exc}"
+            + (f"\nfast-import stderr: {stderr_msg.strip()[:500]}"
+               if stderr_msg.strip() else "")
+        ) from exc
 
     return blobs_emitted, bytes_emitted
 

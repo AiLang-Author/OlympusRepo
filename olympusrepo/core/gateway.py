@@ -117,6 +117,27 @@ def ensure_gateway_synced(
             WHERE repo_id = %s
         """, (repo_id, repo_id))
 
+        # Point gateway HEAD at the repo's actual default branch.
+        # Without this, `git init --bare` defaults HEAD to refs/heads/master
+        # (or refs/heads/main depending on init.defaultBranch). When the
+        # actual ref lives elsewhere (e.g. imports default to 'main' but
+        # git was configured with master), `git clone` follows HEAD into
+        # an empty namespace and returns an empty working tree.
+        cur.execute("""
+            SELECT default_branch FROM repo_repositories WHERE repo_id = %s
+        """, (repo_id,))
+        row = cur.fetchone()
+        default_branch = (row[0] if row else None) or "main"
+
+    subprocess.run(
+        [import_git.GIT_BIN, *import_git.GIT_SAFE_ARGS,
+         "-C", path, "symbolic-ref", "HEAD",
+         f"refs/heads/{default_branch}"],
+        check=True, env=import_git.GIT_ENV,
+        timeout=import_git.GIT_TIMEOUT_SECONDS,
+        capture_output=True,
+    )
+
     return {"synced": synced_total, "gateway_path": path}
 
 
