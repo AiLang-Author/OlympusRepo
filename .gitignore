@@ -33,3 +33,10 @@ nohup.out
 
 # Local worklog, not for upstream
 olympuscodereview.md
+/gateways/
+/mirrors/
+/patch *.py
+/patch *.md
+/patch *.0
+/patch sql *.sql
+/materialize.py
