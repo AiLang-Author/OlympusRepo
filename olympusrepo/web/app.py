@@ -939,6 +939,31 @@ def repo_remotes_page(name: str, request: Request, conn=Depends(get_db)):
     can_write = bool(user) and repo.check_can_write(
         conn, r["repo_id"], user["user_id"])
 
+    # Pull recent push + pull log entries per remote so the page can
+    # show "what happened last and was it ok" without a second
+    # roundtrip. Cheap query — indexed on (repo_id, started_at DESC).
+    push_log_by_remote = {}
+    pull_log_by_remote = {}
+    for rem in remotes:
+        push_log_by_remote[rem["remote_id"]] = db.query(conn, """
+            SELECT ref_name, from_sha, to_sha,
+                   commits_pushed, blobs_pushed, bytes_pushed,
+                   status, error_message, started_at, finished_at
+              FROM repo_git_push_log
+             WHERE repo_id = %s AND remote_id = %s
+             ORDER BY started_at DESC
+             LIMIT 5
+        """, (r["repo_id"], rem["remote_id"]))
+        pull_log_by_remote[rem["remote_id"]] = db.query(conn, """
+            SELECT ref_name, from_sha, to_sha,
+                   commits_fetched,
+                   status, error_message, started_at, finished_at
+              FROM repo_git_pull_log
+             WHERE repo_id = %s AND remote_id = %s
+             ORDER BY started_at DESC
+             LIMIT 5
+        """, (r["repo_id"], rem["remote_id"]))
+
     return templates.TemplateResponse(request, "git_remotes.html", {
         "user": user,
         "repo": r,
@@ -947,7 +972,55 @@ def repo_remotes_page(name: str, request: Request, conn=Depends(get_db)):
         "tab": "remotes",
         "remotes": remotes,
         "can_write": can_write,
+        "push_log_by_remote": push_log_by_remote,
+        "pull_log_by_remote": pull_log_by_remote,
     })
+
+
+@app.post("/api/repos/{name}/remotes/{remote_name}/test")
+def test_remote_api(name: str, remote_name: str, request: Request,
+                    conn=Depends(get_db)):
+    """Lightweight reachability check. Runs `git ls-remote --heads <url>`
+    and returns the remote's branch list (or the error). Used by the
+    'Test Connection' button in the remotes UI so users find creds /
+    URL problems before triggering a full push or pull."""
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_can_write(conn, r["repo_id"], user["user_id"]):
+        raise HTTPException(403)
+
+    from ..core import git_remotes as gr
+    from ..core import import_git as ig
+    remote = gr.get_remote(conn, r["repo_id"], remote_name)
+    if not remote:
+        raise HTTPException(404, "Remote not found.")
+    url = gr.build_authenticated_url(remote)
+    try:
+        result = subprocess.run(
+            [ig.GIT_BIN, *ig.GIT_SAFE_ARGS,
+             "ls-remote", "--heads", url],
+            capture_output=True, text=True,
+            env=ig.GIT_ENV,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return {
+                "ok": False,
+                "error": (result.stderr or "").strip()[:400],
+            }
+        # ls-remote output: "<sha>\t<refname>" per line
+        heads = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                heads.append({"sha": parts[0], "ref": parts[1]})
+        return {"ok": True, "heads": heads[:50], "head_count": len(heads)}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "Connection timed out (30s)."}
 
 
 @app.post("/api/repos/{name}/remotes")

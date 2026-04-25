@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}{{ repo.name }} — Git Remotes — OlympusRepo{% endblock %}
+{% block title %}{{ repo.name }} — Remotes — OlympusRepo{% endblock %}
 
 {% block extra_css %}
 <style>
@@ -8,38 +8,175 @@ main {
         linear-gradient(to bottom, rgba(13,17,23,0.60), rgba(13,17,23,0.85)),
         url('/static/forge-room.png') center center / cover no-repeat fixed;
 }
-.remote-row { padding: 10px 12px; border-bottom: 1px solid #21262d; }
-.remote-row:last-child { border-bottom: none; }
-.remote-meta { color: #8b949e; font-size: 0.85em; }
-.auth-pill {
-    display: inline-block;
-    padding: 1px 8px;
-    border-radius: 10px;
-    font-size: 0.75em;
-    background: #21262d;
+
+/* ---- Dual-named buttons (Olympus / git equivalent) -------------------- */
+/* The smaller second word teaches users the standard git term without
+   shouting over the Olympus vocabulary. */
+.btn-dual {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 6px 14px;
+    font-weight: 600;
+    border-radius: 6px;
+}
+.btn-dual .git-name {
+    font-weight: 400;
+    font-size: 0.8em;
+    opacity: 0.7;
+    font-family: monospace;
+}
+.btn-dual .git-name::before { content: "/ "; opacity: 0.5; }
+
+/* ---- Remote card ------------------------------------------------------ */
+.remote-card {
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    margin-bottom: 14px;
+    background: #0d1117;
+    overflow: hidden;
+}
+.remote-head {
+    padding: 12px 16px;
+    border-bottom: 1px solid #21262d;
+    background: linear-gradient(180deg, #161b22 0%, #0d1117 100%);
+}
+.remote-name {
+    font-size: 1.05em;
+    font-weight: 700;
+    color: #f0f6fc;
+}
+.remote-url {
+    font-family: monospace;
+    font-size: 0.85em;
     color: #8b949e;
-    margin-left: 6px;
+    word-break: break-all;
+}
+.remote-body { padding: 14px 16px; }
+
+.pill {
+    display: inline-block;
+    padding: 1px 9px;
+    border-radius: 11px;
+    font-size: 0.72em;
+    font-weight: 600;
+    letter-spacing: 0.02em;
     vertical-align: middle;
 }
-.auth-pill.token  { background: #1c3a52; color: #58a6ff; }
-.auth-pill.ssh_key { background: #2d2b4a; color: #b392f0; }
-.action-row {
-    display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px;
+.pill-none    { background: #21262d; color: #8b949e; }
+.pill-token   { background: #1c3a52; color: #58a6ff; }
+.pill-ssh_key { background: #2d2b4a; color: #b392f0; }
+.pill-success { background: #1a3a1a; color: #3fb950; }
+.pill-failed  { background: #4a1a1a; color: #f85149; }
+.pill-running { background: #3a3a1a; color: #ffd700; }
+.pill-pending { background: #21262d; color: #8b949e; }
+
+/* ---- Action panel (push / pull) -------------------------------------- */
+.action-panel {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin-top: 12px;
 }
-.action-row button {
-    font-size: 0.85em; padding: 3px 10px;
+@media (max-width: 700px) {
+    .action-panel { grid-template-columns: 1fr; }
 }
-.row-status {
-    margin-top: 6px;
+.action-block {
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 12px;
+    background: #161b22;
+}
+.action-block h4 {
+    margin: 0 0 8px 0;
+    color: #c9d1d9;
+    font-size: 0.95em;
+}
+.action-block .controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}
+.action-block select, .action-block input[type=text] {
     font-family: monospace;
-    font-size: 0.8em;
+    font-size: 0.85em;
+    padding: 4px 8px;
+}
+
+/* Force-push inline confirmation block (replaces browser confirm()). */
+.danger-confirm {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border-left: 3px solid #f85149;
+    background: rgba(248,81,73,0.08);
+    color: #f0d0d0;
+    font-size: 0.85em;
+}
+.danger-confirm label { color: #f0d0d0; cursor: pointer; }
+
+/* Per-action live status output */
+.action-status {
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: #0a0d12;
+    border: 1px solid #21262d;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 0.78em;
     color: #8b949e;
     white-space: pre-wrap;
-    max-height: 200px;
+    word-break: break-word;
+    max-height: 220px;
     overflow-y: auto;
 }
-.row-status.ok    { color: #3fb950; }
-.row-status.fail  { color: #f85149; }
+.action-status.ok    { border-color: #1a3a1a; color: #3fb950; }
+.action-status.fail  { border-color: #4a1a1a; color: #f85149; }
+.action-status.muted { color: #8b949e; }
+.action-status.empty { display: none; }
+
+/* ---- History panel --------------------------------------------------- */
+.history-toggle {
+    margin-top: 10px;
+    color: #58a6ff;
+    cursor: pointer;
+    font-size: 0.85em;
+    user-select: none;
+}
+.history-toggle:hover { text-decoration: underline; }
+.history-panel { display: none; margin-top: 10px; }
+.history-panel.open { display: block; }
+.log-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78em;
+}
+.log-table th {
+    text-align: left;
+    padding: 4px 8px;
+    color: #8b949e;
+    font-weight: 500;
+    border-bottom: 1px solid #21262d;
+}
+.log-table td {
+    padding: 4px 8px;
+    border-bottom: 1px solid #161b22;
+    color: #c9d1d9;
+    vertical-align: top;
+}
+.log-table .sha { font-family: monospace; }
+
+/* ---- Add-remote form ------------------------------------------------- */
+.add-form .form-group { margin-bottom: 10px; }
+.add-form input, .add-form select {
+    width: 100%;
+    padding: 6px 10px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    color: #c9d1d9;
+    border-radius: 4px;
+}
 </style>
 {% endblock %}
 
@@ -48,70 +185,215 @@ main {
 
     <div class="row-between" style="margin-bottom:18px;">
         <div>
-            <h1 style="margin-bottom:4px;">⇄ Git Remotes — {{ repo.name }}</h1>
+            <h1 style="margin-bottom:4px;">⇄ Realms — {{ repo.name }}</h1>
             <div class="card-meta">
-                Push to / pull from external git repositories. Connector
-                preserves SHAs on round-trip when import-side metadata is intact.
+                Bind external git repositories. <strong>Olympus</strong> uses its own
+                vocabulary <em>(realm, offering, tribute)</em>; the equivalent git terms
+                appear next to each control so the mapping is always visible.
             </div>
         </div>
         <a href="/repo/{{ repo.name }}" class="btn">&larr; Repo</a>
     </div>
 
-    <!-- LIST -->
-    <div class="card" style="margin-bottom:24px;">
-        <h2 style="margin-top:0;">Configured Remotes</h2>
-        {% if remotes %}
-        <div id="remote-list">
-            {% for rem in remotes %}
-            <div class="remote-row" data-remote="{{ rem.name }}">
+    <!-- =================================================================
+         REMOTE LIST
+         ================================================================= -->
+    {% if remotes %}
+    <div id="remote-list">
+        {% for rem in remotes %}
+        {% set push_log = push_log_by_remote.get(rem.remote_id, []) %}
+        {% set pull_log = pull_log_by_remote.get(rem.remote_id, []) %}
+        {% set last_push = push_log[0] if push_log else None %}
+        {% set last_pull = pull_log[0] if pull_log else None %}
+        <div class="remote-card" data-remote="{{ rem.name }}">
+            <div class="remote-head">
                 <div class="row-between">
                     <div>
-                        <strong style="color:#f0f6fc;">{{ rem.name }}</strong>
-                        <span class="auth-pill {{ rem.auth_type }}">{{ rem.auth_type }}</span>
+                        <span class="remote-name">{{ rem.name }}</span>
+                        <span class="pill pill-{{ rem.auth_type }}">
+                            {% if rem.auth_type == 'none' %}no auth
+                            {% elif rem.auth_type == 'token' %}token configured
+                            {% elif rem.auth_type == 'ssh_key' %}ssh key{% endif %}
+                        </span>
                     </div>
                     {% if can_write %}
-                    <button class="btn delete-remote-btn"
-                            data-name="{{ rem.name }}"
-                            style="font-size:0.8em; padding:2px 10px;
-                                   background:#21262d; color:#f85149;">
-                        Delete
-                    </button>
+                    <div class="row" style="gap:6px;">
+                        <button class="btn test-btn" data-name="{{ rem.name }}"
+                                style="font-size:0.8em; padding:3px 10px;">
+                            Test Connection
+                            <span class="git-name" style="font-family:monospace;font-size:0.85em;opacity:0.6;">/ ls-remote</span>
+                        </button>
+                        <button class="btn delete-btn" data-name="{{ rem.name }}"
+                                style="font-size:0.8em; padding:3px 10px;
+                                       background:#21262d; color:#f85149;">
+                            Sever <span class="git-name" style="font-family:monospace;font-size:0.85em;opacity:0.6;">/ remote rm</span>
+                        </button>
+                    </div>
                     {% endif %}
                 </div>
-                <div class="remote-meta">
-                    <code>{{ rem.url }}</code>
-                </div>
-                <div class="remote-meta">
-                    {% if rem.last_push_at %}last push {{ rem.last_push_at.strftime('%b %d %H:%M') }}{% else %}never pushed{% endif %} ·
-                    {% if rem.last_pull_at %}last pull {{ rem.last_pull_at.strftime('%b %d %H:%M') }}{% else %}never pulled{% endif %}
-                </div>
-                {% if can_write %}
-                <div class="action-row">
-                    <input type="text" class="ref-input" data-name="{{ rem.name }}"
-                           value="refs/heads/{{ current_branch }}"
-                           style="width:240px; font-family:monospace; font-size:0.85em;">
-                    <button class="btn btn-primary push-btn"
-                            data-name="{{ rem.name }}">Push</button>
-                    <input type="text" class="branch-input" data-name="{{ rem.name }}"
-                           value="{{ current_branch }}" placeholder="branch"
-                           style="width:120px; font-family:monospace; font-size:0.85em;">
-                    <button class="btn pull-btn"
-                            data-name="{{ rem.name }}">Pull</button>
-                </div>
-                <div class="row-status" data-name="{{ rem.name }}"></div>
-                {% endif %}
-            </div>
-            {% endfor %}
-        </div>
-        {% else %}
-        <div class="empty-state"><p>No remotes configured. Add one below to push/pull.</p></div>
-        {% endif %}
-    </div>
+                <div class="remote-url" style="margin-top:4px;">{{ rem.url }}</div>
 
+                <div class="card-meta" style="margin-top:6px;">
+                    {% if last_push %}
+                        Last <strong>offering</strong> ({% if last_push.status == 'success' %}<span class="pill pill-success">{{ last_push.status }}</span>{% else %}<span class="pill pill-{{ last_push.status }}">{{ last_push.status }}</span>{% endif %})
+                        on {{ last_push.started_at.strftime('%b %d %H:%M') }} —
+                        {{ last_push.commits_pushed or 0 }} commit{{ '' if last_push.commits_pushed == 1 else 's' }},
+                        {{ last_push.bytes_pushed or 0 }} bytes
+                    {% else %}
+                        No offerings sent yet
+                    {% endif %}
+                    &nbsp;·&nbsp;
+                    {% if last_pull %}
+                        Last <strong>tribute</strong> ({% if last_pull.status == 'success' %}<span class="pill pill-success">{{ last_pull.status }}</span>{% else %}<span class="pill pill-{{ last_pull.status }}">{{ last_pull.status }}</span>{% endif %})
+                        on {{ last_pull.started_at.strftime('%b %d %H:%M') }} —
+                        {{ last_pull.commits_fetched or 0 }} commit{{ '' if last_pull.commits_fetched == 1 else 's' }}
+                    {% else %}
+                        No tributes received yet
+                    {% endif %}
+                </div>
+            </div>
+
+            {% if can_write %}
+            <div class="remote-body">
+                <!-- Test-connection result lands here. -->
+                <div class="action-status muted empty" data-status="test"
+                     data-name="{{ rem.name }}"></div>
+
+                <div class="action-panel">
+
+                    <!-- ============ OFFERING / PUSH ================== -->
+                    <div class="action-block">
+                        <h4>Offering <span style="font-family:monospace;font-size:0.85em;opacity:0.6;font-weight:400;">/ git push</span></h4>
+                        <div class="controls">
+                            <label style="font-size:0.85em;color:#8b949e;">Branch</label>
+                            <select class="push-branch" data-name="{{ rem.name }}">
+                                {% for b in branches %}
+                                <option value="{{ b.ref_name }}"
+                                        {% if b.ref_name == 'refs/heads/' ~ current_branch %}selected{% endif %}>
+                                    {{ b.ref_name | replace('refs/heads/', '') }}
+                                </option>
+                                {% endfor %}
+                            </select>
+                            <button class="btn btn-primary push-btn btn-dual"
+                                    data-name="{{ rem.name }}">
+                                Send Offering
+                                <span class="git-name">git push</span>
+                            </button>
+                        </div>
+                        <div class="danger-confirm" style="display:none;"
+                             data-confirm-for="{{ rem.name }}-push">
+                            <label>
+                                <input type="checkbox" class="force-push"
+                                       data-name="{{ rem.name }}">
+                                Force overwrite remote (a.k.a. <code>git push --force</code>) —
+                                rewrites history on the destination. Use only if you know why.
+                            </label>
+                        </div>
+                        <div class="action-status muted empty" data-status="push"
+                             data-name="{{ rem.name }}"></div>
+                    </div>
+
+                    <!-- ============ TRIBUTE / PULL =================== -->
+                    <div class="action-block">
+                        <h4>Tribute <span style="font-family:monospace;font-size:0.85em;opacity:0.6;font-weight:400;">/ git pull</span></h4>
+                        <div class="controls">
+                            <label style="font-size:0.85em;color:#8b949e;">Branch</label>
+                            <select class="pull-branch" data-name="{{ rem.name }}">
+                                {% for b in branches %}
+                                <option value="{{ b.ref_name | replace('refs/heads/', '') }}"
+                                        {% if b.ref_name == 'refs/heads/' ~ current_branch %}selected{% endif %}>
+                                    {{ b.ref_name | replace('refs/heads/', '') }}
+                                </option>
+                                {% endfor %}
+                            </select>
+                            <button class="btn pull-btn btn-dual"
+                                    data-name="{{ rem.name }}">
+                                Receive Tribute
+                                <span class="git-name">git pull</span>
+                            </button>
+                        </div>
+                        <div class="action-status muted empty" data-status="pull"
+                             data-name="{{ rem.name }}"></div>
+                    </div>
+
+                </div><!-- /action-panel -->
+
+                <!-- ============ HISTORY ============================== -->
+                <div class="history-toggle" data-name="{{ rem.name }}">
+                    ▸ Show last 5 offerings + tributes
+                </div>
+                <div class="history-panel" data-name="{{ rem.name }}">
+                    {% if push_log %}
+                    <div style="margin-top:10px; color:#c9d1d9; font-size:0.85em;">
+                        <strong>Offerings (push)</strong>
+                    </div>
+                    <table class="log-table">
+                        <thead><tr><th>When</th><th>Ref</th><th>To SHA</th><th>Commits</th><th>Status</th></tr></thead>
+                        <tbody>
+                            {% for p in push_log %}
+                            <tr>
+                                <td>{{ p.started_at.strftime('%b %d %H:%M') }}</td>
+                                <td><code>{{ p.ref_name | replace('refs/heads/', '') }}</code></td>
+                                <td class="sha">{{ (p.to_sha or '')[:8] }}</td>
+                                <td>{{ p.commits_pushed or 0 }}</td>
+                                <td>
+                                    <span class="pill pill-{{ p.status }}">{{ p.status }}</span>
+                                    {% if p.error_message %}<br><span style="color:#f85149;font-size:0.8em;">{{ p.error_message[:120] }}</span>{% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                    {% endif %}
+
+                    {% if pull_log %}
+                    <div style="margin-top:14px; color:#c9d1d9; font-size:0.85em;">
+                        <strong>Tributes (pull)</strong>
+                    </div>
+                    <table class="log-table">
+                        <thead><tr><th>When</th><th>Ref</th><th>To SHA</th><th>Commits</th><th>Status</th></tr></thead>
+                        <tbody>
+                            {% for p in pull_log %}
+                            <tr>
+                                <td>{{ p.started_at.strftime('%b %d %H:%M') }}</td>
+                                <td><code>{{ p.ref_name | replace('refs/heads/', '') }}</code></td>
+                                <td class="sha">{{ (p.to_sha or '')[:8] }}</td>
+                                <td>{{ p.commits_fetched or 0 }}</td>
+                                <td>
+                                    <span class="pill pill-{{ p.status }}">{{ p.status }}</span>
+                                    {% if p.error_message %}<br><span style="color:#f85149;font-size:0.8em;">{{ p.error_message[:120] }}</span>{% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                    {% endif %}
+
+                    {% if not push_log and not pull_log %}
+                    <div class="card-meta" style="margin-top:8px;">No history yet.</div>
+                    {% endif %}
+                </div><!-- /history-panel -->
+            </div><!-- /remote-body -->
+            {% endif %}
+
+        </div><!-- /remote-card -->
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="card" style="margin-bottom:24px;">
+        <div class="empty-state"><p>No realms bound. Add one below to start sending offerings.</p></div>
+    </div>
+    {% endif %}
+
+    <!-- =================================================================
+         ADD REMOTE
+         ================================================================= -->
     {% if can_write %}
-    <!-- ADD -->
-    <div class="card">
-        <h2 style="margin-top:0;">Add Remote</h2>
+    <div class="card add-form" style="margin-top:24px;">
+        <h2 style="margin-top:0;">
+            Bind New Realm
+            <span style="font-family:monospace;font-size:0.65em;opacity:0.6;font-weight:400;">/ git remote add</span>
+        </h2>
         <div id="add-error" class="flash flash-error" style="display:none;"></div>
         <form id="add-remote-form">
             <div class="form-group">
@@ -144,12 +426,15 @@ main {
                     Encrypted at rest with the server's git_creds_key.
                 </div>
             </div>
-            <button type="submit" class="btn btn-primary">Add Remote</button>
+            <button type="submit" class="btn btn-primary btn-dual">
+                Bind Realm
+                <span class="git-name">git remote add</span>
+            </button>
         </form>
     </div>
     {% else %}
     <div class="card-meta" style="margin-top:12px;">
-        Read-only view. Write access required to add or modify remotes.
+        Read-only view. Write access required to bind realms or send offerings.
     </div>
     {% endif %}
 
@@ -159,14 +444,36 @@ main {
 (function() {
     var repoName = {{ repo.name | tojson }};
 
-    function setStatus(name, msg, ok) {
-        var el = document.querySelector('.row-status[data-name="' + name + '"]');
+    function $$(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
+    function $(sel, name) {
+        return document.querySelector(sel + '[data-name="' + name + '"]');
+    }
+    function setStatus(name, kind, msg, ok) {
+        var el = document.querySelector('[data-status="' + kind + '"][data-name="' + name + '"]');
         if (!el) return;
-        el.className = 'row-status ' + (ok ? 'ok' : 'fail');
+        el.classList.remove('empty', 'ok', 'fail', 'muted');
+        if (!msg) {
+            el.classList.add('empty');
+            el.textContent = '';
+            return;
+        }
+        el.classList.add(ok === true ? 'ok' : (ok === false ? 'fail' : 'muted'));
         el.textContent = msg;
     }
 
-    // Auth field show/hide
+    /* History toggle */
+    $$('.history-toggle').forEach(function(el) {
+        el.addEventListener('click', function() {
+            var name = el.dataset.name;
+            var panel = document.querySelector('.history-panel[data-name="' + name + '"]');
+            if (!panel) return;
+            panel.classList.toggle('open');
+            el.textContent = (panel.classList.contains('open') ? '▾' : '▸') +
+                             ' ' + el.textContent.slice(2);
+        });
+    });
+
+    /* Auth field show/hide */
     var authSel = document.getElementById('auth-select');
     var credGroup = document.getElementById('cred-group');
     if (authSel) {
@@ -175,7 +482,14 @@ main {
         });
     }
 
-    // Add remote
+    /* Force-push checkbox toggles the danger panel */
+    $$('.push-btn').forEach(function(btn) {
+        var name = btn.dataset.name;
+        var dangerPanel = document.querySelector('[data-confirm-for="' + name + '-push"]');
+        if (dangerPanel) dangerPanel.style.display = 'block';
+    });
+
+    /* Add remote */
     var addForm = document.getElementById('add-remote-form');
     if (addForm) {
         addForm.addEventListener('submit', async function(e) {
@@ -201,57 +515,94 @@ main {
         });
     }
 
-    // Delete
-    document.querySelectorAll('.delete-remote-btn').forEach(function(btn) {
+    /* Sever (delete) */
+    $$('.delete-btn').forEach(function(btn) {
         btn.addEventListener('click', async function() {
             var name = btn.dataset.name;
-            if (!confirm('Delete remote "' + name + '"? This won\'t affect the actual git repo, just this configuration.')) return;
+            if (!confirm('Sever realm "' + name + '"? Bindings only — the remote git repo is untouched.')) return;
             try {
                 var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/remotes/' + encodeURIComponent(name),
                     { method: 'DELETE' });
-                if (res.ok) {
-                    location.reload();
-                } else {
-                    alert('Delete failed: HTTP ' + res.status);
-                }
+                if (res.ok) location.reload();
+                else alert('Sever failed: HTTP ' + res.status);
             } catch (e) { alert('Network error: ' + e); }
         });
     });
 
-    // Push
-    document.querySelectorAll('.push-btn').forEach(function(btn) {
+    /* Test connection */
+    $$('.test-btn').forEach(function(btn) {
         btn.addEventListener('click', async function() {
             var name = btn.dataset.name;
-            var ref = document.querySelector('.ref-input[data-name="' + name + '"]').value.trim();
             btn.disabled = true;
-            setStatus(name, 'Pushing ' + ref + ' to ' + name + '…', true);
+            setStatus(name, 'test', 'Probing ' + name + ' (ls-remote)…', null);
             try {
-                var fd = new FormData();
-                fd.append('ref_name', ref);
                 var res = await fetch('/api/repos/' + encodeURIComponent(repoName) +
-                                      '/remotes/' + encodeURIComponent(name) + '/push',
-                                      { method: 'POST', body: fd });
-                var body = await res.text();
-                if (res.ok) {
-                    setStatus(name, '✓ Push complete:\n' + body, true);
+                                      '/remotes/' + encodeURIComponent(name) + '/test',
+                                      { method: 'POST' });
+                var data = await res.json();
+                if (data.ok) {
+                    var lines = (data.heads || []).map(function(h) {
+                        return h.sha.substring(0, 8) + '  ' + h.ref;
+                    });
+                    setStatus(name, 'test',
+                        '✓ Reachable. ' + (data.head_count || 0) + ' branch(es) on remote:\n' +
+                        lines.join('\n'),
+                        true);
                 } else {
-                    setStatus(name, '✗ Push failed (HTTP ' + res.status + '):\n' + body, false);
+                    setStatus(name, 'test', '✗ ' + (data.error || 'Unknown error'), false);
                 }
             } catch (e) {
-                setStatus(name, '✗ Network error: ' + e, false);
+                setStatus(name, 'test', '✗ Network error: ' + e, false);
             } finally {
                 btn.disabled = false;
             }
         });
     });
 
-    // Pull
-    document.querySelectorAll('.pull-btn').forEach(function(btn) {
+    /* Send Offering / Push */
+    $$('.push-btn').forEach(function(btn) {
         btn.addEventListener('click', async function() {
             var name = btn.dataset.name;
-            var br = document.querySelector('.branch-input[data-name="' + name + '"]').value.trim();
+            var sel  = document.querySelector('.push-branch[data-name="' + name + '"]');
+            var ref  = sel ? sel.value : 'refs/heads/main';
+            var force = !!document.querySelector('.force-push[data-name="' + name + '"]:checked');
             btn.disabled = true;
-            setStatus(name, 'Pulling ' + br + ' from ' + name + '…', true);
+            setStatus(name, 'push',
+                (force ? '⚠ FORCE ' : '') + 'Sending offering of ' + ref +
+                ' to ' + name + '…', null);
+            try {
+                var fd = new FormData();
+                fd.append('ref_name', ref);
+                if (force) fd.append('force', '1');
+                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) +
+                                      '/remotes/' + encodeURIComponent(name) + '/push',
+                                      { method: 'POST', body: fd });
+                var body = await res.text();
+                if (res.ok) {
+                    setStatus(name, 'push',
+                        '✓ Offering accepted (git push).\n' + body, true);
+                    setTimeout(function() { location.reload(); }, 1200);
+                } else {
+                    setStatus(name, 'push',
+                        '✗ Offering rejected (HTTP ' + res.status + '):\n' + body, false);
+                }
+            } catch (e) {
+                setStatus(name, 'push', '✗ Network error: ' + e, false);
+            } finally {
+                btn.disabled = false;
+            }
+        });
+    });
+
+    /* Receive Tribute / Pull */
+    $$('.pull-btn').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+            var name = btn.dataset.name;
+            var sel  = document.querySelector('.pull-branch[data-name="' + name + '"]');
+            var br   = sel ? sel.value : 'main';
+            btn.disabled = true;
+            setStatus(name, 'pull',
+                'Receiving tribute of ' + br + ' from ' + name + '…', null);
             try {
                 var fd = new FormData();
                 fd.append('branch', br);
@@ -260,12 +611,15 @@ main {
                                       { method: 'POST', body: fd });
                 var body = await res.text();
                 if (res.ok) {
-                    setStatus(name, '✓ Pull complete:\n' + body, true);
+                    setStatus(name, 'pull',
+                        '✓ Tribute received (git pull).\n' + body, true);
+                    setTimeout(function() { location.reload(); }, 1200);
                 } else {
-                    setStatus(name, '✗ Pull failed (HTTP ' + res.status + '):\n' + body, false);
+                    setStatus(name, 'pull',
+                        '✗ Tribute failed (HTTP ' + res.status + '):\n' + body, false);
                 }
             } catch (e) {
-                setStatus(name, '✗ Network error: ' + e, false);
+                setStatus(name, 'pull', '✗ Network error: ' + e, false);
             } finally {
                 btn.disabled = false;
             }
