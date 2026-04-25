@@ -11,14 +11,51 @@ from . import db, objects, worktree, diff
 
 
 def create_repo(conn, name: str, owner_id: int, visibility: str = "public",
-                description: str = None) -> dict:
-    """Create a new repository in the database (single transaction)."""
+                description: str = None,
+                imported_from: str = None,
+                default_branch: str = None) -> dict:
+    """Create a new repository in the database (single transaction).
+
+    For native repos, leave imported_from/default_branch as None — the
+    table defaults to default_branch='main'. For git imports, pass
+    imported_from=<source URL or path>; imported_at is set to NOW() and
+    imported_by to owner_id automatically. default_branch should be the
+    branch the importer is bringing in (so HEAD-equivalent ref points
+    at the right place).
+
+    Columns imported_from/imported_at/imported_by are added by
+    sql/015_git_import.sql.
+    """
     try:
-        row = db.query_one(conn, """
-            INSERT INTO repo_repositories (name, owner_id, visibility, description)
-            VALUES (%s, %s, %s, %s)
-            RETURNING repo_id, name, visibility, default_branch
-        """, (name, owner_id, visibility, description))
+        # Build INSERT explicitly so import-specific columns only show up
+        # when the caller actually provided them — keeps native repo
+        # creation a no-op against the new columns.
+        if imported_from is not None:
+            row = db.query_one(conn, """
+                INSERT INTO repo_repositories
+                    (name, owner_id, visibility, description,
+                     default_branch,
+                     imported_from, imported_at, imported_by)
+                VALUES (%s, %s, %s, %s,
+                        COALESCE(%s, 'main'),
+                        %s, NOW(), %s)
+                RETURNING repo_id, name, visibility, default_branch
+            """, (name, owner_id, visibility, description,
+                  default_branch,
+                  imported_from, owner_id))
+        elif default_branch is not None:
+            row = db.query_one(conn, """
+                INSERT INTO repo_repositories
+                    (name, owner_id, visibility, description, default_branch)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING repo_id, name, visibility, default_branch
+            """, (name, owner_id, visibility, description, default_branch))
+        else:
+            row = db.query_one(conn, """
+                INSERT INTO repo_repositories (name, owner_id, visibility, description)
+                VALUES (%s, %s, %s, %s)
+                RETURNING repo_id, name, visibility, default_branch
+            """, (name, owner_id, visibility, description))
 
         # Create default branch ref (no commit yet)
         db.execute(conn, """
@@ -42,6 +79,27 @@ def get_repo(conn, name: str) -> dict | None:
     """Get repository by name."""
     return db.query_one(conn,
         "SELECT * FROM repo_repositories WHERE name = %s", (name,))
+
+
+def set_ref(conn, *, repo_id: int, ref_name: str,
+            commit_hash: str, user_id: int = None,
+            commit: bool = True) -> None:
+    """Upsert a ref to point at commit_hash. Used by the git importer
+    to set the imported branch tip after all commits have landed, and
+    by any other code that needs to move a ref atomically.
+
+    The ON CONFLICT clause makes this safe to call whether the ref
+    already exists or not — first set creates the row, subsequent
+    sets update commit_hash + updated_at + updated_by.
+    """
+    db.execute(conn, """
+        INSERT INTO repo_refs (repo_id, ref_name, commit_hash, updated_by)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (repo_id, ref_name)
+        DO UPDATE SET commit_hash = EXCLUDED.commit_hash,
+                      updated_at  = NOW(),
+                      updated_by  = EXCLUDED.updated_by
+    """, (repo_id, ref_name, commit_hash, user_id), commit=commit)
 
 
 def list_repos(conn, user_id: int = None) -> list[dict]:
@@ -800,12 +858,14 @@ def import_commit_row(
     authored_at = datetime.fromtimestamp(authored_at_epoch, tz=timezone.utc)
     committed_at = datetime.fromtimestamp(committed_at_epoch, tz=timezone.utc)
 
-    # 1. Store blobs. objects.write_blob is idempotent on hash collisions
-    #    so re-imports and shared files are cheap.
+    # 1. Store blobs. objects.store_blob is idempotent on hash collisions
+    #    so re-imports and shared files are cheap. (Patch 5 docstring
+    #    referred to it as write_blob; the actual API name is store_blob
+    #    and content is the first positional arg.)
     files_written = 0
     path_to_blob = {}
     for path, content in files:
-        blob_hash = objects.write_blob(objects_dir, content)
+        blob_hash = objects.store_blob(content, objects_dir)
         path_to_blob[path] = blob_hash
         files_written += 1
 
