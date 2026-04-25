@@ -901,6 +901,188 @@ async def import_git_submit(
         return _render(f"Import failed: {e}")
 
 
+# =========================================================================
+# GIT REMOTES — per-repo git push/pull configuration
+# =========================================================================
+# Browse, add, remove, and trigger push/pull against the named git
+# remotes for a repo. Backed by olympusrepo.core.git_remotes / export_git
+# / pull_git. Read access for view; write access (owner / repo_access
+# write|admin) required for any mutation including push/pull.
+
+def _get_objects_dir() -> str:
+    return os.environ.get(
+        "OLYMPUSREPO_OBJECTS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "objects"),
+    )
+
+
+def _get_mirrors_dir() -> str:
+    return os.environ.get(
+        "OLYMPUSREPO_MIRRORS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "mirrors"),
+    )
+
+
+@app.get("/repo/{name}/remotes", response_class=HTMLResponse)
+def repo_remotes_page(name: str, request: Request, conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 user["user_id"] if user else None):
+        raise HTTPException(403)
+
+    from ..core import git_remotes as gr
+    remotes = gr.list_remotes(conn, r["repo_id"])
+    branches = repo.get_branches(conn, r["repo_id"])
+    can_write = bool(user) and repo.check_can_write(
+        conn, r["repo_id"], user["user_id"])
+
+    return templates.TemplateResponse(request, "git_remotes.html", {
+        "user": user,
+        "repo": r,
+        "branches": branches,
+        "current_branch": r.get("default_branch", "main"),
+        "tab": "remotes",
+        "remotes": remotes,
+        "can_write": can_write,
+    })
+
+
+@app.post("/api/repos/{name}/remotes")
+def add_remote_api(name: str, request: Request,
+                   remote_name: str = Form(...),
+                   url: str = Form(...),
+                   auth_type: str = Form("none"),
+                   credential: str = Form(""),
+                   conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_can_write(conn, r["repo_id"], user["user_id"]):
+        raise HTTPException(403, "Write access required to manage remotes.")
+
+    from ..core import git_remotes as gr
+    try:
+        result = gr.add_remote(
+            conn, repo_id=r["repo_id"],
+            name=remote_name.strip(),
+            url=url.strip(),
+            user_id=user["user_id"],
+            auth_type=auth_type,
+            credential=(credential or None) if auth_type != "none" else None,
+        )
+        db.audit_log(conn, "remote_add", user_id=user["user_id"],
+                     repo_id=r["repo_id"], target_type="remote",
+                     target_id=remote_name,
+                     details={"url": url, "auth_type": auth_type})
+        return {"status": "added", "remote_id": result.get("remote_id")}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/api/repos/{name}/remotes/{remote_name}")
+def delete_remote_api(name: str, remote_name: str, request: Request,
+                      conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_can_write(conn, r["repo_id"], user["user_id"]):
+        raise HTTPException(403)
+
+    from ..core import git_remotes as gr
+    gr.delete_remote(conn, r["repo_id"], remote_name)
+    db.audit_log(conn, "remote_delete", user_id=user["user_id"],
+                 repo_id=r["repo_id"], target_type="remote",
+                 target_id=remote_name)
+    return {"status": "deleted"}
+
+
+@app.post("/api/repos/{name}/remotes/{remote_name}/push")
+def push_remote_api(name: str, remote_name: str, request: Request,
+                    ref_name: str = Form("refs/heads/main"),
+                    force: str = Form(""),
+                    conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_can_write(conn, r["repo_id"], user["user_id"]):
+        raise HTTPException(403)
+
+    from ..core import export_git as eg
+    try:
+        result = eg.push_to_git(
+            conn,
+            repo_id=r["repo_id"],
+            remote_name=remote_name,
+            ref_name=ref_name,
+            user_id=user["user_id"],
+            objects_dir=_get_objects_dir(),
+            force=(force == "1" or force.lower() == "true"),
+        )
+        return {"status": "pushed", "result": result}
+    except subprocess.CalledProcessError as e:
+        detail = (getattr(e, "stderr", "") or "").strip()[:600]
+        raise HTTPException(502, f"git push failed (rc {e.returncode}): {detail}")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/repos/{name}/remotes/{remote_name}/pull")
+def pull_remote_api(name: str, remote_name: str, request: Request,
+                    branch: str = Form("main"),
+                    conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_can_write(conn, r["repo_id"], user["user_id"]):
+        raise HTTPException(403)
+
+    from ..core import pull_git as pg
+    try:
+        result = pg.pull_from_git(
+            conn,
+            repo_id=r["repo_id"],
+            remote_name=remote_name,
+            branch=branch,
+            user_id=user["user_id"],
+            objects_dir=_get_objects_dir(),
+            mirrors_root=_get_mirrors_dir(),
+        )
+        return {"status": "pulled", "result": result}
+    except subprocess.CalledProcessError as e:
+        detail = (getattr(e, "stderr", "") or "").strip()[:600]
+        raise HTTPException(502, f"git pull failed (rc {e.returncode}): {detail}")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# =========================================================================
+# GIT SMART-HTTP PROTOCOL — public clone/fetch endpoints
+# =========================================================================
+# Mounts olympusrepo/web/git_protocol.py at the root, exposing:
+#   GET  /<repo_name>.git/info/refs
+#   POST /<repo_name>.git/git-upload-pack    (clone / fetch)
+#   POST /<repo_name>.git/git-receive-pack   (push)
+# Auth via session cookie OR PAT bearer token (see olympusrepo/core/pats.py).
+# This is what makes `git clone http://host/<repo>.git` work from outside.
+from .git_protocol import router as _git_protocol_router
+app.include_router(_git_protocol_router)
+
+
 @app.post("/api/repos")
 def create_repo_api(request: Request,
                     name: str = Form(...),

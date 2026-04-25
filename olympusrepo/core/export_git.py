@@ -232,7 +232,7 @@ def push_to_git(
         )
 
         blobs_pushed, bytes_pushed = _stream_fast_import(
-            conn, bare_repo, marks_file, commits,
+            conn, repo_id, bare_repo, marks_file, commits,
             objects_dir, ref_name, progress_cb,
         )
 
@@ -313,7 +313,7 @@ def push_to_git(
 
 # --- fast-import stream construction ------------------------------------
 def _stream_fast_import(
-    conn, bare_repo: str, marks_file: str,
+    conn, repo_id: int, bare_repo: str, marks_file: str,
     commits: list[dict], objects_dir: str,
     ref_name: str, progress_cb,
 ) -> tuple[int, int]:
@@ -353,7 +353,7 @@ def _stream_fast_import(
             for path, blob_hash in tree:
                 if blob_hash in blob_mark_for:
                     continue
-                content = objects_mod.read_blob(objects_dir, blob_hash)
+                content = objects_mod.retrieve_blob(blob_hash, objects_dir)
                 fi.stdin.write(b"blob\n")
                 fi.stdin.write(f"mark :{next_blob_mark}\n".encode("ascii"))
                 _emit_data(fi.stdin, content)

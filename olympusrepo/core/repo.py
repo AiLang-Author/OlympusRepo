@@ -915,13 +915,16 @@ def import_commit_row(
         # 3. Track blobs per-repo. ON CONFLICT DO NOTHING because the
         #    same blob can appear in many commits (and possibly many
         #    repos that share an object store).
+        # byte_offset = NULL for loose objects per the constraint added
+        # in migration 017 (byte_offset_matches_pack); only packed
+        # objects get a real offset.
         if path_to_blob:
             cur.executemany(
                 """
                 INSERT INTO repo_objects
                     (object_hash, repo_id, byte_offset, size_bytes, obj_type)
                 VALUES
-                    (%s, %s, 0, 0, 'blob')
+                    (%s, %s, NULL, 0, 'blob')
                 ON CONFLICT (object_hash) DO NOTHING
                 """,
                 [(h, repo_id) for h in set(path_to_blob.values())],

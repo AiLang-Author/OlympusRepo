@@ -168,6 +168,10 @@
             {% set open_count = namespace(n=0) %}
             <!-- count shown via badge if > 0 -->
         </a>
+        <a href="/repo/{{ repo.name }}/remotes"
+           class="btn" style="border:none; border-bottom:2px solid {% if tab == 'remotes' %}#58a6ff{% else %}transparent{% endif %}; border-radius:0;">
+            Remotes
+        </a>
         {% if user and user.role in ('zeus', 'olympian') %}
         <a href="/repo/{{ repo.name }}/staging"
            class="btn" style="border:none; border-bottom:2px solid {% if tab == 'staging' %}#58a6ff{% else %}transparent{% endif %}; border-radius:0;">

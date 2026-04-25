@@ -1,0 +1,276 @@
+{% extends "base.html" %}
+{% block title %}{{ repo.name }} — Git Remotes — OlympusRepo{% endblock %}
+
+{% block extra_css %}
+<style>
+main {
+    background:
+        linear-gradient(to bottom, rgba(13,17,23,0.60), rgba(13,17,23,0.85)),
+        url('/static/forge-room.png') center center / cover no-repeat fixed;
+}
+.remote-row { padding: 10px 12px; border-bottom: 1px solid #21262d; }
+.remote-row:last-child { border-bottom: none; }
+.remote-meta { color: #8b949e; font-size: 0.85em; }
+.auth-pill {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 0.75em;
+    background: #21262d;
+    color: #8b949e;
+    margin-left: 6px;
+    vertical-align: middle;
+}
+.auth-pill.token  { background: #1c3a52; color: #58a6ff; }
+.auth-pill.ssh_key { background: #2d2b4a; color: #b392f0; }
+.action-row {
+    display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px;
+}
+.action-row button {
+    font-size: 0.85em; padding: 3px 10px;
+}
+.row-status {
+    margin-top: 6px;
+    font-family: monospace;
+    font-size: 0.8em;
+    color: #8b949e;
+    white-space: pre-wrap;
+    max-height: 200px;
+    overflow-y: auto;
+}
+.row-status.ok    { color: #3fb950; }
+.row-status.fail  { color: #f85149; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+
+    <div class="row-between" style="margin-bottom:18px;">
+        <div>
+            <h1 style="margin-bottom:4px;">⇄ Git Remotes — {{ repo.name }}</h1>
+            <div class="card-meta">
+                Push to / pull from external git repositories. Connector
+                preserves SHAs on round-trip when import-side metadata is intact.
+            </div>
+        </div>
+        <a href="/repo/{{ repo.name }}" class="btn">&larr; Repo</a>
+    </div>
+
+    <!-- LIST -->
+    <div class="card" style="margin-bottom:24px;">
+        <h2 style="margin-top:0;">Configured Remotes</h2>
+        {% if remotes %}
+        <div id="remote-list">
+            {% for rem in remotes %}
+            <div class="remote-row" data-remote="{{ rem.name }}">
+                <div class="row-between">
+                    <div>
+                        <strong style="color:#f0f6fc;">{{ rem.name }}</strong>
+                        <span class="auth-pill {{ rem.auth_type }}">{{ rem.auth_type }}</span>
+                    </div>
+                    {% if can_write %}
+                    <button class="btn delete-remote-btn"
+                            data-name="{{ rem.name }}"
+                            style="font-size:0.8em; padding:2px 10px;
+                                   background:#21262d; color:#f85149;">
+                        Delete
+                    </button>
+                    {% endif %}
+                </div>
+                <div class="remote-meta">
+                    <code>{{ rem.url }}</code>
+                </div>
+                <div class="remote-meta">
+                    {% if rem.last_push_at %}last push {{ rem.last_push_at.strftime('%b %d %H:%M') }}{% else %}never pushed{% endif %} ·
+                    {% if rem.last_pull_at %}last pull {{ rem.last_pull_at.strftime('%b %d %H:%M') }}{% else %}never pulled{% endif %}
+                </div>
+                {% if can_write %}
+                <div class="action-row">
+                    <input type="text" class="ref-input" data-name="{{ rem.name }}"
+                           value="refs/heads/{{ current_branch }}"
+                           style="width:240px; font-family:monospace; font-size:0.85em;">
+                    <button class="btn btn-primary push-btn"
+                            data-name="{{ rem.name }}">Push</button>
+                    <input type="text" class="branch-input" data-name="{{ rem.name }}"
+                           value="{{ current_branch }}" placeholder="branch"
+                           style="width:120px; font-family:monospace; font-size:0.85em;">
+                    <button class="btn pull-btn"
+                            data-name="{{ rem.name }}">Pull</button>
+                </div>
+                <div class="row-status" data-name="{{ rem.name }}"></div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state"><p>No remotes configured. Add one below to push/pull.</p></div>
+        {% endif %}
+    </div>
+
+    {% if can_write %}
+    <!-- ADD -->
+    <div class="card">
+        <h2 style="margin-top:0;">Add Remote</h2>
+        <div id="add-error" class="flash flash-error" style="display:none;"></div>
+        <form id="add-remote-form">
+            <div class="form-group">
+                <label>Name</label>
+                <input type="text" name="remote_name"
+                       placeholder="origin"
+                       pattern="[A-Za-z0-9][A-Za-z0-9._\-/]*"
+                       required>
+            </div>
+            <div class="form-group">
+                <label>URL</label>
+                <input type="text" name="url"
+                       placeholder="https://github.com/user/repo.git"
+                       required>
+            </div>
+            <div class="form-group">
+                <label>Auth</label>
+                <select name="auth_type" id="auth-select">
+                    <option value="none">None (public read-only)</option>
+                    <option value="token">Personal access token</option>
+                    <option value="ssh_key">SSH key (use system ssh config)</option>
+                </select>
+            </div>
+            <div class="form-group" id="cred-group" style="display:none;">
+                <label>Credential</label>
+                <input type="password" name="credential"
+                       placeholder="ghp_… or path to ssh key"
+                       autocomplete="off">
+                <div class="card-meta" style="margin-top:4px;">
+                    Encrypted at rest with the server's git_creds_key.
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary">Add Remote</button>
+        </form>
+    </div>
+    {% else %}
+    <div class="card-meta" style="margin-top:12px;">
+        Read-only view. Write access required to add or modify remotes.
+    </div>
+    {% endif %}
+
+</div>
+
+<script>
+(function() {
+    var repoName = {{ repo.name | tojson }};
+
+    function setStatus(name, msg, ok) {
+        var el = document.querySelector('.row-status[data-name="' + name + '"]');
+        if (!el) return;
+        el.className = 'row-status ' + (ok ? 'ok' : 'fail');
+        el.textContent = msg;
+    }
+
+    // Auth field show/hide
+    var authSel = document.getElementById('auth-select');
+    var credGroup = document.getElementById('cred-group');
+    if (authSel) {
+        authSel.addEventListener('change', function() {
+            credGroup.style.display = (authSel.value === 'none') ? 'none' : 'block';
+        });
+    }
+
+    // Add remote
+    var addForm = document.getElementById('add-remote-form');
+    if (addForm) {
+        addForm.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            var err = document.getElementById('add-error');
+            err.style.display = 'none';
+            var fd = new FormData(addForm);
+            try {
+                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/remotes',
+                    { method: 'POST', body: fd });
+                if (res.ok) {
+                    location.reload();
+                } else {
+                    var data = {};
+                    try { data = await res.json(); } catch (_) {}
+                    err.textContent = data.detail || ('Add failed (HTTP ' + res.status + ')');
+                    err.style.display = 'block';
+                }
+            } catch (e2) {
+                err.textContent = 'Network error: ' + e2;
+                err.style.display = 'block';
+            }
+        });
+    }
+
+    // Delete
+    document.querySelectorAll('.delete-remote-btn').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+            var name = btn.dataset.name;
+            if (!confirm('Delete remote "' + name + '"? This won\'t affect the actual git repo, just this configuration.')) return;
+            try {
+                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/remotes/' + encodeURIComponent(name),
+                    { method: 'DELETE' });
+                if (res.ok) {
+                    location.reload();
+                } else {
+                    alert('Delete failed: HTTP ' + res.status);
+                }
+            } catch (e) { alert('Network error: ' + e); }
+        });
+    });
+
+    // Push
+    document.querySelectorAll('.push-btn').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+            var name = btn.dataset.name;
+            var ref = document.querySelector('.ref-input[data-name="' + name + '"]').value.trim();
+            btn.disabled = true;
+            setStatus(name, 'Pushing ' + ref + ' to ' + name + '…', true);
+            try {
+                var fd = new FormData();
+                fd.append('ref_name', ref);
+                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) +
+                                      '/remotes/' + encodeURIComponent(name) + '/push',
+                                      { method: 'POST', body: fd });
+                var body = await res.text();
+                if (res.ok) {
+                    setStatus(name, '✓ Push complete:\n' + body, true);
+                } else {
+                    setStatus(name, '✗ Push failed (HTTP ' + res.status + '):\n' + body, false);
+                }
+            } catch (e) {
+                setStatus(name, '✗ Network error: ' + e, false);
+            } finally {
+                btn.disabled = false;
+            }
+        });
+    });
+
+    // Pull
+    document.querySelectorAll('.pull-btn').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+            var name = btn.dataset.name;
+            var br = document.querySelector('.branch-input[data-name="' + name + '"]').value.trim();
+            btn.disabled = true;
+            setStatus(name, 'Pulling ' + br + ' from ' + name + '…', true);
+            try {
+                var fd = new FormData();
+                fd.append('branch', br);
+                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) +
+                                      '/remotes/' + encodeURIComponent(name) + '/pull',
+                                      { method: 'POST', body: fd });
+                var body = await res.text();
+                if (res.ok) {
+                    setStatus(name, '✓ Pull complete:\n' + body, true);
+                } else {
+                    setStatus(name, '✗ Pull failed (HTTP ' + res.status + '):\n' + body, false);
+                }
+            } catch (e) {
+                setStatus(name, '✗ Network error: ' + e, false);
+            } finally {
+                btn.disabled = false;
+            }
+        });
+    });
+})();
+</script>
+{% endblock %}

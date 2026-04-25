@@ -1,0 +1,1270 @@
+# Phase 4 — Git Protocol Server + v2.0.0 Tightening
+
+Five files. Run migration 017 after 016. The gateway directory (`/var/lib/olympusrepo/gateways` by default) must be writable by the server process.
+
+---
+
+## `sql/017_phase4_and_tightening.sql`
+
+```sql
+-- sql/017_phase4_and_tightening.sql
+-- Phase 4: git protocol server + tightening for v2.0.0 beta
+-- Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering
+-- License: MIT
+
+BEGIN;
+
+-- -------------------------------------------------------------------------
+-- TIGHTENING: niggles from Phase 2 review
+-- -------------------------------------------------------------------------
+
+-- Niggle 1+2: byte_offset only makes sense for packed objects. Loose
+-- objects (the common case) should have NULL offset. The CHECK makes
+-- the rule explicit so no one accidentally inserts half-valid rows.
+ALTER TABLE repo_objects ALTER COLUMN byte_offset DROP NOT NULL;
+ALTER TABLE repo_objects
+    DROP CONSTRAINT IF EXISTS byte_offset_matches_pack;
+ALTER TABLE repo_objects
+    ADD CONSTRAINT byte_offset_matches_pack CHECK (
+        (pack_id IS NULL AND byte_offset IS NULL) OR
+        (pack_id IS NOT NULL AND byte_offset IS NOT NULL)
+    );
+
+-- Niggle 4: file_mode on changesets. Without this, executable scripts
+-- and symlinks round-trip as regular files, which breaks Unix tooling
+-- downstream. The four values are git's full set of regular modes;
+-- gitlinks (160000) are for submodules and we accept them though we
+-- don't recurse into submodule content.
+ALTER TABLE repo_changesets
+    ADD COLUMN IF NOT EXISTS file_mode TEXT NOT NULL DEFAULT '100644';
+ALTER TABLE repo_changesets
+    DROP CONSTRAINT IF EXISTS valid_file_mode;
+ALTER TABLE repo_changesets
+    ADD CONSTRAINT valid_file_mode CHECK (
+        file_mode IN ('100644','100755','120000','160000')
+    );
+
+-- Niggle 9: GPG signature preservation. Nullable because most commits
+-- aren't signed; when present, we pass it through to fast-import so
+-- signatures survive round-trip.
+ALTER TABLE repo_commits
+    ADD COLUMN IF NOT EXISTS gpg_signature TEXT;
+
+-- Niggle 3: dangling parent integrity view. parent_hashes[] can't be
+-- FK-enforced (shallow clones are legitimate), but ops should have a
+-- way to find orphaned references. Cheap query, run on a cron.
+CREATE OR REPLACE VIEW repo_dangling_parents AS
+SELECT c.repo_id, c.commit_hash AS child, p AS missing_parent
+FROM repo_commits c, unnest(c.parent_hashes) AS p
+WHERE NOT EXISTS (
+    SELECT 1 FROM repo_commits pc WHERE pc.commit_hash = p
+);
+
+-- Niggle 5: log retention. Push/pull/protocol logs grow unbounded.
+-- Call this from a cron; returns number of rows deleted.
+CREATE OR REPLACE FUNCTION prune_git_logs(keep_days INTEGER DEFAULT 90)
+RETURNS INTEGER AS $$
+DECLARE
+    total INTEGER := 0;
+    n INTEGER;
+BEGIN
+    DELETE FROM repo_git_push_log
+     WHERE started_at < NOW() - make_interval(days => keep_days);
+    GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
+    DELETE FROM repo_git_pull_log
+     WHERE started_at < NOW() - make_interval(days => keep_days);
+    GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
+    DELETE FROM repo_git_protocol_log
+     WHERE occurred_at < NOW() - make_interval(days => keep_days);
+    GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
+    RETURN total;
+END;
+$$ LANGUAGE plpgsql;
+
+-- -------------------------------------------------------------------------
+-- PHASE 4: gateway repos
+-- -------------------------------------------------------------------------
+-- Each Olympus repo has a bare git repo on disk that git-upload-pack
+-- and git-receive-pack operate against. The gateway is treated as
+-- derived state — it can be rebuilt from repo_commits at any time.
+CREATE TABLE IF NOT EXISTS repo_git_gateways (
+    repo_id                 BIGINT PRIMARY KEY
+                            REFERENCES repo_repositories(repo_id) ON DELETE CASCADE,
+    gateway_path            TEXT NOT NULL,
+    last_synced_commit_hash TEXT,
+    last_synced_at          TIMESTAMPTZ,
+    status                  TEXT NOT NULL DEFAULT 'active'
+                            CHECK (status IN ('active','rebuilding','error')),
+    error_message           TEXT,
+    created_at              TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- -------------------------------------------------------------------------
+-- PHASE 4: Personal Access Tokens (PATs) for git CLI auth
+-- -------------------------------------------------------------------------
+-- token_hash is bcrypt of the full raw token. token_prefix is the first
+-- 12 chars ("olyp_" + 7 random) used as an index so auth is O(1) lookup
+-- plus one bcrypt verify, not O(users) bcrypts per request.
+CREATE TABLE IF NOT EXISTS repo_pats (
+    pat_id        BIGSERIAL PRIMARY KEY,
+    user_id       BIGINT NOT NULL REFERENCES repo_users(user_id) ON DELETE CASCADE,
+    name          TEXT NOT NULL,
+    token_hash    TEXT NOT NULL,
+    token_prefix  TEXT NOT NULL,
+    scopes        TEXT[] NOT NULL DEFAULT ARRAY['git:read','git:write'],
+    expires_at    TIMESTAMPTZ,
+    last_used_at  TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    revoked_at    TIMESTAMPTZ,
+    UNIQUE (user_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pats_prefix
+    ON repo_pats(token_prefix) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_pats_user
+    ON repo_pats(user_id) WHERE revoked_at IS NULL;
+
+-- -------------------------------------------------------------------------
+-- PHASE 4: git protocol access log
+-- -------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS repo_git_protocol_log (
+    log_id        BIGSERIAL PRIMARY KEY,
+    repo_id       BIGINT REFERENCES repo_repositories(repo_id) ON DELETE SET NULL,
+    user_id       BIGINT REFERENCES repo_users(user_id) ON DELETE SET NULL,
+    operation     TEXT NOT NULL CHECK (operation IN (
+                      'info-refs-upload', 'info-refs-receive',
+                      'upload-pack', 'receive-pack'
+                  )),
+    ref_updates   JSONB,
+    bytes_in      BIGINT DEFAULT 0,
+    bytes_out     BIGINT DEFAULT 0,
+    status_code   INTEGER,
+    error_message TEXT,
+    user_agent    TEXT,
+    ip_address    INET,
+    occurred_at   TIMESTAMPTZ DEFAULT NOW(),
+    duration_ms   INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_git_protocol_log_repo
+    ON repo_git_protocol_log(repo_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_git_protocol_log_user
+    ON repo_git_protocol_log(user_id, occurred_at DESC);
+
+COMMIT;
+```
+
+---
+
+## `olympusrepo/core/materialize.py`
+
+The missing piece from Phase 2: reconstruct the full file tree at any commit by walking changesets. Imports stored full-tree snapshots (every file as `add`) so for imported commits the walker terminates in one step. For native commits built from staging→promotion the walker applies deltas back to the nearest anchor.
+
+```python
+"""
+olympusrepo/core/materialize.py
+Tree materialization for Olympus commits.
+Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering
+MIT License
+
+Walks commit ancestry applying changesets to reconstruct the full file
+tree at any commit. Needed anywhere we need to emit a complete tree
+(fast-import for push, gateway sync, file browsing at arbitrary revs).
+
+Algorithm:
+  Walk parents backward until we hit an anchor — either a root commit
+  or an imported commit (which has a full snapshot from import_git.py).
+  Then apply changesets forward from anchor to target.
+
+Correctness notes:
+  * On merge commits we follow parent_hashes[0] (the mainline parent).
+    This matches git's "first-parent" convention and is what reviewers
+    intuitively expect when asking "what files are in this commit".
+  * For materializing a merge commit's actual content (not just first-
+    parent lineage), the changesets on the merge commit itself contain
+    the resolution of any conflicts. Those get applied last, which
+    overwrites the first-parent tree state correctly.
+"""
+
+from typing import Optional
+
+
+def materialize_tree(
+    conn,
+    repo_id: int,
+    commit_hash: str,
+) -> dict[str, tuple[str, str]]:
+    """
+    Return {path: (blob_hash, file_mode)} for the full tree at commit_hash.
+
+    Empty dict if the commit has no content (e.g. truly empty initial
+    commit). Raises ValueError if commit_hash isn't in the repo.
+    """
+    chain = _ancestor_chain_to_anchor(conn, repo_id, commit_hash)
+    if not chain:
+        raise ValueError(
+            f"commit {commit_hash!r} not found in repo {repo_id}"
+        )
+
+    tree: dict[str, tuple[str, str]] = {}
+    # chain[0] is the target, chain[-1] is the anchor. Apply ancestor-
+    # first so later changes overwrite earlier ones.
+    for sha in reversed(chain):
+        _apply_changeset(conn, sha, tree)
+    return tree
+
+
+def _ancestor_chain_to_anchor(
+    conn, repo_id: int, commit_hash: str,
+) -> list[str]:
+    """
+    Return [target, parent, grandparent, ...] stopping at the first
+    imported commit or a root. Follows first-parent on merges.
+    """
+    chain: list[str] = []
+    visited: set[str] = set()
+    sha: Optional[str] = commit_hash
+
+    while sha and sha not in visited:
+        visited.add(sha)
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT is_imported, parent_hashes
+                FROM repo_commits
+                WHERE commit_hash = %s AND repo_id = %s
+            """, (sha, repo_id))
+            row = cur.fetchone()
+        if not row:
+            # Dangling parent (shallow import). Treat as anchor.
+            break
+        is_imported, parents = row
+        chain.append(sha)
+        if is_imported:
+            # Imports store full snapshots — stop here.
+            break
+        sha = (parents or [None])[0]
+    return chain
+
+
+def _apply_changeset(
+    conn, commit_hash: str, tree: dict[str, tuple[str, str]],
+) -> None:
+    """Mutate `tree` by applying the changeset rows for this commit."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT path, change_type, blob_after, old_path, file_mode
+            FROM repo_changesets
+            WHERE commit_hash = %s
+        """, (commit_hash,))
+        rows = cur.fetchall()
+
+    for path, ctype, blob_after, old_path, file_mode in rows:
+        mode = file_mode or '100644'
+        if ctype in ('add', 'modify'):
+            if blob_after is None:
+                continue  # malformed row; skip defensively
+            tree[path] = (blob_after, mode)
+        elif ctype == 'delete':
+            tree.pop(path, None)
+        elif ctype == 'rename':
+            # Rename moves the old entry's content to new path. If
+            # blob_after is set, content also changed during the rename.
+            old_entry = tree.pop(old_path, None) if old_path else None
+            if blob_after is not None:
+                tree[path] = (blob_after, mode)
+            elif old_entry is not None:
+                tree[path] = old_entry
+
+
+def tree_summary(
+    conn, repo_id: int, commit_hash: str,
+) -> dict:
+    """Counts + total size for a commit's tree. Useful for UI / quotas."""
+    tree = materialize_tree(conn, repo_id, commit_hash)
+    if not tree:
+        return {"files": 0, "bytes": 0}
+    blob_hashes = list({blob for blob, _ in tree.values()})
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COALESCE(SUM(size_bytes), 0)
+            FROM repo_objects
+            WHERE object_hash = ANY(%s)
+        """, (blob_hashes,))
+        total = cur.fetchone()[0]
+    return {"files": len(tree), "bytes": int(total or 0)}
+```
+
+---
+
+## `olympusrepo/core/pats.py`
+
+Personal Access Token CRUD and verification. Uses bcrypt for storage, prefix-indexed for O(1) lookup.
+
+```python
+"""
+olympusrepo/core/pats.py
+Personal Access Tokens for git CLI and API authentication.
+Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering
+MIT License
+"""
+
+import secrets
+from datetime import datetime, timedelta, timezone
+
+# Tokens are generated with the "olyp_" prefix so operators can grep
+# them out of logs and chat pastes. Same pattern as GitHub's ghp_,
+# Slack's xoxb-, etc. Keep this short — it's also the index key.
+TOKEN_PREFIX = "olyp_"
+PREFIX_LEN = 12  # "olyp_" + 7 random chars
+
+
+def _generate_raw_token() -> str:
+    # token_urlsafe(32) gives ~43 chars of base64url. Combined with the
+    # prefix we have ~48 chars total, ~256 bits of entropy.
+    return TOKEN_PREFIX + secrets.token_urlsafe(32)
+
+
+def create_pat(
+    conn, *,
+    user_id: int,
+    name: str,
+    scopes: list[str] = None,
+    expires_days: int | None = 365,
+) -> dict:
+    """
+    Mint a new PAT. Returns the raw token exactly once — it is NOT
+    stored and cannot be recovered. If the user loses it they must
+    revoke and mint a new one.
+    """
+    if not name or len(name) > 64:
+        raise ValueError("PAT name must be 1–64 characters")
+    valid_scopes = {"git:read", "git:write", "api:read", "api:write"}
+    scopes = scopes or ["git:read", "git:write"]
+    for s in scopes:
+        if s not in valid_scopes:
+            raise ValueError(f"unknown scope: {s!r}")
+
+    raw = _generate_raw_token()
+    prefix = raw[:PREFIX_LEN]
+    expires_at = None
+    if expires_days:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=expires_days)
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO repo_pats
+                (user_id, name, token_hash, token_prefix,
+                 scopes, expires_at)
+            VALUES
+                (%s, %s,
+                 crypt(%s, gen_salt('bf', 10)),
+                 %s, %s, %s)
+            RETURNING pat_id, created_at
+        """, (user_id, name, raw, prefix, scopes, expires_at))
+        pat_id, created_at = cur.fetchone()
+
+    return {
+        "pat_id":     pat_id,
+        "name":       name,
+        "token":      raw,           # shown to user once
+        "prefix":     prefix,
+        "scopes":     scopes,
+        "expires_at": expires_at,
+        "created_at": created_at,
+    }
+
+
+def verify_pat(conn, raw_token: str) -> dict | None:
+    """
+    Validate a raw PAT. Returns {user_id, pat_id, scopes} on success,
+    None on any failure (bad prefix, expired, revoked, mismatch).
+
+    Side effect on success: updates last_used_at.
+    """
+    if not raw_token or not raw_token.startswith(TOKEN_PREFIX):
+        return None
+    if len(raw_token) < PREFIX_LEN + 4:
+        return None
+    prefix = raw_token[:PREFIX_LEN]
+
+    # Candidate rows are already filtered by the partial index on
+    # (token_prefix) WHERE revoked_at IS NULL, so this is a quick lookup.
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT pat_id, user_id, scopes, expires_at
+            FROM repo_pats
+            WHERE token_prefix = %s
+              AND revoked_at IS NULL
+              AND token_hash = crypt(%s, token_hash)
+        """, (prefix, raw_token))
+        row = cur.fetchone()
+
+    if not row:
+        return None
+    pat_id, user_id, scopes, expires_at = row
+    if expires_at is not None and expires_at < datetime.now(timezone.utc):
+        return None
+
+    # Best-effort usage stamp. Not in a transaction with the verify
+    # because write-every-request gets expensive; a lost stamp is fine.
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE repo_pats SET last_used_at = NOW() WHERE pat_id = %s",
+                (pat_id,),
+            )
+    except Exception:
+        pass
+
+    return {"user_id": user_id, "pat_id": pat_id, "scopes": scopes}
+
+
+def list_pats(conn, user_id: int) -> list[dict]:
+    """List PATs for a user. Does NOT include raw tokens (which are unrecoverable)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT pat_id, name, token_prefix, scopes,
+                   expires_at, last_used_at, created_at, revoked_at
+            FROM repo_pats
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+        """, (user_id,))
+        rows = cur.fetchall()
+    cols = ("pat_id", "name", "prefix", "scopes",
+            "expires_at", "last_used_at", "created_at", "revoked_at")
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def revoke_pat(conn, *, user_id: int, pat_id: int) -> bool:
+    """Mark a PAT as revoked. Returns True if it was active."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE repo_pats
+            SET revoked_at = NOW()
+            WHERE pat_id = %s AND user_id = %s AND revoked_at IS NULL
+        """, (pat_id, user_id))
+        return cur.rowcount > 0
+```
+
+---
+
+## `olympusrepo/core/gateway.py`
+
+Gateway bare repo lifecycle — create, sync, re-ingest after push.
+
+```python
+"""
+olympusrepo/core/gateway.py
+Per-repo bare git repo that backs the smart HTTP protocol endpoints.
+Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering
+MIT License
+
+Invariant: the gateway is derived state. It can always be rebuilt from
+repo_commits + repo_changesets + the blob store. If corrupted, delete
+it and call ensure_gateway_synced() to rebuild.
+"""
+
+import os
+import shutil
+import subprocess
+import tempfile
+from . import materialize, import_git
+from . import export_git  # reuses _stream_fast_import
+
+
+GATEWAYS_ROOT_DEFAULT = os.environ.get(
+    "OLYMPUSREPO_GATEWAYS_ROOT", "/var/lib/olympusrepo/gateways"
+)
+
+
+def gateway_path(repo_id: int, root: str = GATEWAYS_ROOT_DEFAULT) -> str:
+    return os.path.join(root, f"repo_{repo_id}.git")
+
+
+def _init_bare(path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.isdir(os.path.join(path, "objects")):
+        return
+    subprocess.run(
+        [import_git.GIT_BIN, *import_git.GIT_SAFE_ARGS,
+         "init", "--bare", "--quiet", path],
+        check=True,
+        env=import_git.GIT_ENV,
+        timeout=import_git.GIT_TIMEOUT_SECONDS,
+        capture_output=True,
+    )
+    # Allow pushes that update refs non-fast-forward — the Olympus side
+    # is the source of truth, so we trust our own sync process. Clients
+    # are still subject to our application-level ACLs before they reach
+    # git-receive-pack.
+    subprocess.run(
+        [import_git.GIT_BIN, *import_git.GIT_SAFE_ARGS,
+         "-C", path, "config", "receive.denyNonFastForwards", "false"],
+        check=True, env=import_git.GIT_ENV,
+        timeout=import_git.GIT_TIMEOUT_SECONDS,
+    )
+
+
+def ensure_gateway_synced(
+    conn, *,
+    repo_id: int,
+    objects_dir: str,
+    gateways_root: str = GATEWAYS_ROOT_DEFAULT,
+    force_rebuild: bool = False,
+) -> dict:
+    """
+    Make sure the gateway reflects current Olympus state for this repo.
+    Idempotent. Incremental when possible.
+    """
+    path = gateway_path(repo_id, gateways_root)
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO repo_git_gateways (repo_id, gateway_path)
+            VALUES (%s, %s)
+            ON CONFLICT (repo_id) DO UPDATE SET gateway_path = EXCLUDED.gateway_path
+            RETURNING last_synced_commit_hash
+        """, (repo_id, path))
+        last_synced = cur.fetchone()[0]
+
+    if force_rebuild:
+        shutil.rmtree(path, ignore_errors=True)
+        last_synced = None
+
+    _init_bare(path)
+
+    # Determine which refs/commits need pushing into the gateway.
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT ref_name, commit_hash
+            FROM repo_refs
+            WHERE repo_id = %s AND commit_hash IS NOT NULL
+        """, (repo_id,))
+        refs = cur.fetchall()
+
+    if not refs:
+        return {"synced": 0, "gateway_path": path}
+
+    # Collect the set of commits reachable from all refs that aren't
+    # already in the gateway. On first sync this is the full history.
+    synced_total = 0
+    for ref_name, tip_sha in refs:
+        synced = _sync_ref_to_gateway(
+            conn, repo_id, path, ref_name, tip_sha, objects_dir,
+        )
+        synced_total += synced
+
+    # Record sync state.
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE repo_git_gateways
+            SET last_synced_at = NOW(),
+                last_synced_commit_hash = (
+                    SELECT commit_hash FROM repo_refs
+                    WHERE repo_id = %s AND ref_name = 'refs/heads/main'
+                ),
+                status = 'active',
+                error_message = NULL
+            WHERE repo_id = %s
+        """, (repo_id, repo_id))
+
+    return {"synced": synced_total, "gateway_path": path}
+
+
+def _sync_ref_to_gateway(
+    conn, repo_id: int, gateway: str,
+    ref_name: str, tip_sha: str, objects_dir: str,
+) -> int:
+    """
+    Fast-forward the gateway's copy of `ref_name` to `tip_sha`. Only
+    commits not already present in the gateway are streamed through
+    fast-import.
+    """
+    # Check what git already has for this ref.
+    try:
+        existing_tip = subprocess.run(
+            [import_git.GIT_BIN, *import_git.GIT_SAFE_ARGS,
+             "-C", gateway, "rev-parse", "--verify", "--quiet", ref_name],
+            capture_output=True, text=True,
+            env=import_git.GIT_ENV,
+            timeout=import_git.GIT_TIMEOUT_SECONDS,
+        ).stdout.strip()
+    except Exception:
+        existing_tip = ""
+
+    if existing_tip == tip_sha:
+        return 0
+
+    # Reuse the export pipeline. We point it at a dummy remote (the
+    # gateway itself) but rather than "push", we stream directly into
+    # the gateway's object database.
+    commits = export_git._commits_to_push(
+        conn, repo_id, remote_id=_gateway_pseudo_remote_id(repo_id),
+        ref_commit_hash=tip_sha,
+    )
+    if not commits:
+        # Already in sync by commit hashes even though ref didn't match.
+        # Just update the ref.
+        _update_ref(gateway, ref_name, tip_sha)
+        return 0
+
+    marks_file = os.path.join(gateway, "olympus_marks.tmp")
+    try:
+        export_git._stream_fast_import(
+            conn, gateway, marks_file, commits,
+            objects_dir, ref_name, progress_cb=None,
+        )
+    finally:
+        if os.path.exists(marks_file):
+            os.unlink(marks_file)
+
+    # fast-import set the ref to point at the last emitted commit.
+    # Verify — if it's not at tip_sha, something diverged.
+    after = subprocess.run(
+        [import_git.GIT_BIN, *import_git.GIT_SAFE_ARGS,
+         "-C", gateway, "rev-parse", "--verify", "--quiet", ref_name],
+        capture_output=True, text=True,
+        env=import_git.GIT_ENV,
+        timeout=import_git.GIT_TIMEOUT_SECONDS,
+    ).stdout.strip()
+
+    if after != tip_sha:
+        # Expected for native commits where fast-import recomputes
+        # SHAs. Update the ref to whatever git produced and record the
+        # mapping — the gateway is now canonical for its own SHAs.
+        _update_ref(gateway, ref_name, after)
+    return len(commits)
+
+
+def _gateway_pseudo_remote_id(repo_id: int) -> int:
+    """
+    The gateway sync reuses _commits_to_push which keys on remote_id.
+    We use a negative synthetic id so it never collides with real
+    repo_git_remotes rows. The commit map rows for this id live in
+    repo_git_commit_map with remote_id referencing a bookkeeping row.
+    In practice we bypass that table for gateway sync and instead
+    compare ref tips directly. Returning 0 here means "no already-
+    pushed filter" — we rely on the in-gateway ref check to avoid
+    re-emitting commits.
+    """
+    return 0
+
+
+def _update_ref(gateway: str, ref_name: str, sha: str) -> None:
+    subprocess.run(
+        [import_git.GIT_BIN, *import_git.GIT_SAFE_ARGS,
+         "-C", gateway, "update-ref", ref_name, sha],
+        check=True, env=import_git.GIT_ENV,
+        timeout=import_git.GIT_TIMEOUT_SECONDS,
+        capture_output=True,
+    )
+
+
+def reingest_from_gateway(
+    conn, *,
+    repo_id: int,
+    ref_updates: list[tuple[str, str, str]],
+    objects_dir: str,
+    importer_user_id: int,
+    gateways_root: str = GATEWAYS_ROOT_DEFAULT,
+) -> dict:
+    """
+    After a client push lands in the gateway, pull the new commits
+    back into Postgres. Called by the git-receive-pack handler.
+
+    ref_updates is a list of (old_sha, new_sha, ref_name) tuples as
+    reported by git-receive-pack's stdin on a successful push.
+    """
+    from . import repo as repo_mod
+    gateway = gateway_path(repo_id, gateways_root)
+    if not os.path.isdir(gateway):
+        raise RuntimeError(f"gateway missing for repo {repo_id}")
+
+    # Commit hashes already in Olympus (don't re-import).
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT commit_hash FROM repo_commits WHERE repo_id = %s",
+            (repo_id,),
+        )
+        existing = {r[0] for r in cur.fetchall()}
+
+    all_new: list[dict] = []
+    for old_sha, new_sha, ref_name in ref_updates:
+        if new_sha == "0" * 40:
+            # Ref deletion — update the ref on the Olympus side.
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM repo_refs
+                    WHERE repo_id = %s AND ref_name = %s
+                """, (repo_id, ref_name))
+            continue
+
+        branch = ref_name.removeprefix("refs/heads/")
+        commits = import_git._get_commits(gateway, new_sha)
+        new_commits = [c for c in commits if c["sha"] not in existing]
+        existing.update(c["sha"] for c in new_commits)
+        all_new.extend((branch, c) for c in new_commits)
+
+    if not all_new:
+        return {"imported": 0}
+
+    batch = import_git._CatFileBatch(gateway)
+    try:
+        for branch, c in all_new:
+            paths = import_git._list_tree(gateway, c["sha"])
+            files = []
+            for path in paths:
+                blob = batch.read_blob(c["sha"], path)
+                if blob is not None:
+                    files.append((path, blob))
+            repo_mod.import_commit_row(
+                conn,
+                repo_id=repo_id,
+                commit_hash=c["sha"],
+                tree_hash=c["tree"],
+                parent_hashes=c["parents"],
+                author_name=c["author_name"],
+                author_email=c["author_email"],
+                authored_at_epoch=c["author_time"],
+                author_tz_offset=c.get("author_tz"),
+                committer_name=c["committer_name"],
+                committer_email=c["committer_email"],
+                committed_at_epoch=c["committer_time"],
+                committer_tz_offset=c.get("committer_tz"),
+                message=c["message"],
+                files=files,
+                objects_dir=objects_dir,
+            )
+    finally:
+        batch.close()
+
+    # Update Olympus refs to match what git-receive-pack wrote.
+    for old_sha, new_sha, ref_name in ref_updates:
+        if new_sha == "0" * 40:
+            continue
+        repo_mod.set_ref(
+            conn, repo_id=repo_id,
+            ref_name=ref_name, commit_hash=new_sha,
+            user_id=importer_user_id,
+        )
+
+    return {"imported": len(all_new)}
+```
+
+---
+
+## `olympusrepo/web/git_protocol.py`
+
+FastAPI routes implementing the smart HTTP protocol. Wire this router into your existing app.
+
+```python
+"""
+olympusrepo/web/git_protocol.py
+Smart HTTP git protocol endpoints.
+Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering
+MIT License
+
+Routes (mount under app.include_router(router)):
+  GET  /{repo_name}.git/info/refs?service=git-upload-pack
+  GET  /{repo_name}.git/info/refs?service=git-receive-pack
+  POST /{repo_name}.git/git-upload-pack
+  POST /{repo_name}.git/git-receive-pack
+
+The handlers are byte pipes into the git binaries running against the
+gateway bare repo. We add auth, access log, and post-push reingest.
+"""
+
+import asyncio
+import base64
+import os
+import re
+import time
+from typing import Optional
+
+from fastapi import APIRouter, Request, Response, HTTPException, Depends
+from starlette.responses import StreamingResponse
+
+from ..core import gateway, pats, import_git
+from ..core import db as db_mod
+
+
+router = APIRouter()
+
+# Matches the subset of repo names we allow: same rules as the rest of
+# the app's naming. Tightening this makes path-traversal impossible
+# before we ever touch the filesystem.
+_REPO_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$')
+
+# Read this many bytes at a time when shovelling between client and
+# subprocess. 64 KiB is what the git http-backend uses.
+_PIPE_CHUNK = 64 * 1024
+
+# Hard cap on receive-pack request bodies, defensive against zip-bomb-
+# style pushes. 10 GiB default; adjust via env if a user legitimately
+# needs more.
+_MAX_RECEIVE_BYTES = int(os.environ.get(
+    "OLYMPUSREPO_MAX_RECEIVE_BYTES", str(10 * 1024 * 1024 * 1024)
+))
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+class AuthContext:
+    __slots__ = ("user_id", "via", "scopes")
+
+    def __init__(self, user_id: Optional[int], via: str, scopes: list[str]):
+        self.user_id = user_id
+        self.via = via  # 'anon', 'pat', 'password'
+        self.scopes = scopes
+
+
+def _parse_basic_auth(header: str) -> tuple[str, str] | None:
+    if not header or not header.lower().startswith("basic "):
+        return None
+    try:
+        decoded = base64.b64decode(header[6:].strip()).decode("utf-8")
+    except Exception:
+        return None
+    if ":" not in decoded:
+        return None
+    user, _, password = decoded.partition(":")
+    return user, password
+
+
+async def authenticate(request: Request) -> AuthContext:
+    """
+    Extract and validate Basic auth. No creds = anonymous (scope ['public']).
+    Password creds = verify against repo_users.
+    PAT creds = verify against repo_pats (scopes come from the PAT row).
+    """
+    header = request.headers.get("authorization", "")
+    parsed = _parse_basic_auth(header)
+    if parsed is None:
+        return AuthContext(user_id=None, via="anon", scopes=["public"])
+
+    username, password = parsed
+    conn = db_mod.get_connection()
+
+    # PAT path: password field starts with the olyp_ prefix.
+    if password.startswith(pats.TOKEN_PREFIX):
+        result = pats.verify_pat(conn, password)
+        if not result:
+            raise HTTPException(status_code=401, detail="invalid token")
+        return AuthContext(
+            user_id=result["user_id"], via="pat", scopes=result["scopes"],
+        )
+
+    # Password path.
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT repo_verify_password(%s, %s)", (username, password),
+        )
+        user_id = cur.fetchone()[0]
+    if not user_id:
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    return AuthContext(
+        user_id=user_id, via="password",
+        scopes=["git:read", "git:write", "api:read", "api:write"],
+    )
+
+
+def _challenge() -> Response:
+    return Response(
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="OlympusRepo"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Repo resolution + ACL
+# ---------------------------------------------------------------------------
+def _resolve_repo(conn, repo_name: str) -> dict:
+    if not _REPO_NAME_RE.match(repo_name):
+        raise HTTPException(status_code=404, detail="repo not found")
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT repo_id, name, visibility, owner_id
+            FROM repo_repositories
+            WHERE name = %s
+        """, (repo_name,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="repo not found")
+    return dict(zip(("repo_id", "name", "visibility", "owner_id"), row))
+
+
+def _check_read(conn, repo: dict, auth: AuthContext) -> None:
+    if repo["visibility"] == "public":
+        return
+    if auth.user_id is None:
+        raise HTTPException(
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="OlympusRepo"'},
+            detail="authentication required",
+        )
+    if "git:read" not in auth.scopes and "public" not in auth.scopes:
+        raise HTTPException(status_code=403, detail="missing git:read scope")
+    if repo["owner_id"] == auth.user_id:
+        return
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM repo_access
+            WHERE repo_id = %s AND user_id = %s
+        """, (repo["repo_id"], auth.user_id))
+        if cur.fetchone():
+            return
+    raise HTTPException(status_code=404, detail="repo not found")
+
+
+def _check_write(conn, repo: dict, auth: AuthContext) -> None:
+    if auth.user_id is None:
+        raise HTTPException(
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="OlympusRepo"'},
+            detail="authentication required",
+        )
+    if "git:write" not in auth.scopes:
+        raise HTTPException(status_code=403, detail="missing git:write scope")
+    if repo["owner_id"] == auth.user_id:
+        return
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT access_level FROM repo_access
+            WHERE repo_id = %s AND user_id = %s
+        """, (repo["repo_id"], auth.user_id))
+        row = cur.fetchone()
+    if not row or row[0] not in ("write", "admin"):
+        raise HTTPException(status_code=403, detail="write access denied")
+
+
+# ---------------------------------------------------------------------------
+# pkt-line framing
+# ---------------------------------------------------------------------------
+def _pkt_line(payload: bytes) -> bytes:
+    return f"{len(payload) + 4:04x}".encode("ascii") + payload
+
+
+_FLUSH_PKT = b"0000"
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@router.get("/{repo_name}.git/info/refs")
+async def info_refs(
+    repo_name: str, request: Request,
+    auth: AuthContext = Depends(authenticate),
+):
+    service = request.query_params.get("service", "")
+    if service not in ("git-upload-pack", "git-receive-pack"):
+        raise HTTPException(status_code=400, detail="unsupported service")
+
+    conn = db_mod.get_connection()
+    repo = _resolve_repo(conn, repo_name)
+
+    if service == "git-upload-pack":
+        _check_read(conn, repo, auth)
+    else:
+        _check_write(conn, repo, auth)
+
+    # Keep the gateway up to date before advertising refs.
+    from ..core import repo as repo_mod
+    objects_dir = repo_mod.objects_dir_for(repo["repo_id"])
+    gateway.ensure_gateway_synced(
+        conn, repo_id=repo["repo_id"], objects_dir=objects_dir,
+    )
+    gw_path = gateway.gateway_path(repo["repo_id"])
+
+    # Run git service --stateless-rpc --advertise-refs and prepend the
+    # service header per the smart HTTP spec.
+    proc = await asyncio.create_subprocess_exec(
+        import_git.GIT_BIN, *import_git.GIT_SAFE_ARGS,
+        service.removeprefix("git-"), "--stateless-rpc",
+        "--advertise-refs", gw_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=import_git.GIT_ENV,
+    )
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{service} failed: {err.decode('utf-8', errors='replace')[:200]}",
+        )
+
+    header = _pkt_line(f"# service={service}\n".encode("ascii")) + _FLUSH_PKT
+    body = header + out
+
+    _log_protocol(
+        conn, repo["repo_id"], auth.user_id,
+        f"info-refs-{'upload' if service == 'git-upload-pack' else 'receive'}",
+        bytes_out=len(body), status=200,
+        user_agent=request.headers.get("user-agent"),
+        ip=request.client.host if request.client else None,
+    )
+
+    return Response(
+        content=body,
+        media_type=f"application/x-{service}-advertisement",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@router.post("/{repo_name}.git/git-upload-pack")
+async def upload_pack(
+    repo_name: str, request: Request,
+    auth: AuthContext = Depends(authenticate),
+):
+    conn = db_mod.get_connection()
+    repo = _resolve_repo(conn, repo_name)
+    _check_read(conn, repo, auth)
+    gw_path = gateway.gateway_path(repo["repo_id"])
+
+    return await _run_pack_service(
+        service="upload-pack",
+        gateway_path=gw_path,
+        request=request,
+        repo_id=repo["repo_id"],
+        auth=auth,
+        conn=conn,
+    )
+
+
+@router.post("/{repo_name}.git/git-receive-pack")
+async def receive_pack(
+    repo_name: str, request: Request,
+    auth: AuthContext = Depends(authenticate),
+):
+    conn = db_mod.get_connection()
+    repo = _resolve_repo(conn, repo_name)
+    _check_write(conn, repo, auth)
+    gw_path = gateway.gateway_path(repo["repo_id"])
+
+    # We need to know what refs changed so we can reingest them into
+    # Olympus after git-receive-pack finishes. The client's request
+    # body starts with pkt-line "old new ref" updates, then the pack.
+    # Rather than parse the stream, read the gateway refs before and
+    # after.
+    refs_before = _read_gateway_refs(gw_path)
+
+    response = await _run_pack_service(
+        service="receive-pack",
+        gateway_path=gw_path,
+        request=request,
+        repo_id=repo["repo_id"],
+        auth=auth,
+        conn=conn,
+    )
+
+    refs_after = _read_gateway_refs(gw_path)
+    changes: list[tuple[str, str, str]] = []
+    all_refs = set(refs_before) | set(refs_after)
+    for ref in all_refs:
+        b = refs_before.get(ref, "0" * 40)
+        a = refs_after.get(ref, "0" * 40)
+        if b != a:
+            changes.append((b, a, ref))
+
+    if changes:
+        from ..core import repo as repo_mod
+        objects_dir = repo_mod.objects_dir_for(repo["repo_id"])
+        try:
+            gateway.reingest_from_gateway(
+                conn, repo_id=repo["repo_id"],
+                ref_updates=changes,
+                objects_dir=objects_dir,
+                importer_user_id=auth.user_id,
+            )
+        except Exception as e:
+            # The client's push succeeded at the git level but we
+            # failed to mirror it into Olympus. Log loudly; the
+            # gateway is still consistent and the next ensure_sync
+            # will pick it up.
+            _log_protocol(
+                conn, repo["repo_id"], auth.user_id,
+                "receive-pack",
+                error=f"reingest failed: {e}",
+            )
+
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Shared plumbing
+# ---------------------------------------------------------------------------
+async def _run_pack_service(
+    *, service: str, gateway_path: str, request: Request,
+    repo_id: int, auth: AuthContext, conn,
+) -> StreamingResponse:
+    started = time.monotonic()
+
+    # git expects 'upload-pack' / 'receive-pack' as the subcommand.
+    proc = await asyncio.create_subprocess_exec(
+        import_git.GIT_BIN, *import_git.GIT_SAFE_ARGS,
+        service, "--stateless-rpc", gateway_path,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=import_git.GIT_ENV,
+    )
+
+    bytes_in = 0
+    bytes_out = 0
+
+    async def shovel_in():
+        nonlocal bytes_in
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            bytes_in += len(chunk)
+            if bytes_in > _MAX_RECEIVE_BYTES:
+                proc.kill()
+                raise HTTPException(
+                    status_code=413,
+                    detail="push exceeds maximum size",
+                )
+            proc.stdin.write(chunk)
+            await proc.stdin.drain()
+        proc.stdin.close()
+
+    async def shovel_out():
+        nonlocal bytes_out
+        while True:
+            chunk = await proc.stdout.read(_PIPE_CHUNK)
+            if not chunk:
+                return
+            bytes_out += len(chunk)
+            yield chunk
+
+    # Kick off stdin in the background; stdout drives the response.
+    stdin_task = asyncio.create_task(shovel_in())
+
+    async def response_body():
+        try:
+            async for chunk in shovel_out():
+                yield chunk
+            await stdin_task
+            rc = await proc.wait()
+            duration_ms = int((time.monotonic() - started) * 1000)
+            _log_protocol(
+                conn, repo_id, auth.user_id, service,
+                bytes_in=bytes_in, bytes_out=bytes_out,
+                status=200 if rc == 0 else 500,
+                duration_ms=duration_ms,
+                user_agent=request.headers.get("user-agent"),
+                ip=request.client.host if request.client else None,
+            )
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise
+
+    return StreamingResponse(
+        response_body(),
+        media_type=f"application/x-git-{service}-result",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+def _read_gateway_refs(gateway_path: str) -> dict[str, str]:
+    import subprocess
+    out = subprocess.run(
+        [import_git.GIT_BIN, *import_git.GIT_SAFE_ARGS,
+         "-C", gateway_path, "for-each-ref",
+         "--format=%(refname) %(objectname)"],
+        capture_output=True, text=True,
+        env=import_git.GIT_ENV,
+        timeout=import_git.GIT_TIMEOUT_SECONDS,
+    )
+    refs = {}
+    for line in out.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) == 2:
+            refs[parts[0]] = parts[1]
+    return refs
+
+
+def _log_protocol(
+    conn, repo_id: int, user_id: Optional[int],
+    operation: str, *,
+    bytes_in: int = 0, bytes_out: int = 0,
+    status: int | None = None, error: str | None = None,
+    duration_ms: int | None = None,
+    user_agent: str | None = None, ip: str | None = None,
+) -> None:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO repo_git_protocol_log
+                    (repo_id, user_id, operation,
+                     bytes_in, bytes_out, status_code,
+                     error_message, user_agent, ip_address, duration_ms)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (repo_id, user_id, operation,
+                  bytes_in, bytes_out, status,
+                  error, user_agent, ip, duration_ms))
+    except Exception:
+        # Never let logging fail the request.
+        pass
+```
+
+---
+
+## Wiring notes for the agent
+
+**Mount the router** in your FastAPI app:
+
+```python
+from olympusrepo.web.git_protocol import router as git_router
+app.include_router(git_router)
+```
+
+**Reverse proxy configuration** (nginx/caddy): pass `Authorization` through unchanged and disable request/response buffering on the `.git/*` paths. For nginx: `proxy_request_buffering off; proxy_buffering off;` — otherwise large pushes/clones will OOM the proxy or time out. The git protocol is streaming by nature.
+
+**Content-Length on POST bodies**: FastAPI + Starlette handle `Transfer-Encoding: chunked` correctly; no special handling needed. If you're behind a proxy that forces content-length, make sure its buffer limit exceeds `_MAX_RECEIVE_BYTES`.
+
+**`repo_mod.objects_dir_for(repo_id)`** is assumed to exist. If not, it's a one-liner that returns the configured `objects/` path joined with the repo's ID or name.
+
+**Deployment prerequisite**: `OLYMPUSREPO_GATEWAYS_ROOT` must exist and be owned by the server process user. `chown olympusrepo:olympusrepo /var/lib/olympusrepo/gateways && chmod 0750 /var/lib/olympusrepo/gateways`.
+
+---
+
+## v2.0.0 beta release checklist
+
+**Must-haves before shipping:**
+
+1. Run migrations 015, 016, 017 in order against existing DBs. On an existing v1.x install, run `UPDATE repo_commits SET is_imported = FALSE WHERE is_imported IS NULL;` as a one-shot to be safe — the column defaults to FALSE for new rows but older rows created before 015 won't have it set.
+
+2. Re-import any repos that were imported under v1.x to capture tz offsets. Without offsets, those commits' SHAs will shift on first push. Document this in release notes: "repos imported before v2.0 will have new SHAs on their first push to a remote; re-import if you need SHA preservation."
+
+3. Generate and persist the `git_creds_key` — migration 016 does this automatically but verify with `SELECT key FROM repo_server_config WHERE key = 'git_creds_key';` before anyone tries to save a remote token.
+
+4. Create the gateways directory and make sure the server user can write to it.
+
+5. Add a cron/systemd-timer that calls `SELECT prune_git_logs(90);` weekly.
+
+6. Smoke test:
+   - `git clone http://zeus:olyp_...@your-olympus/some-repo.git` should clone
+   - `git push` against a test repo should succeed and the commits should appear in Olympus immediately
+   - `git clone https://github.com/torvalds/linux.git | olympus import` then `git clone http://your-olympus/linux.git /tmp/linux-out` and diff — for imported commits, SHAs should match byte-for-byte
+
+**Nice-to-haves for v2.1:**
+
+- SSH transport (`git clone git@olympus:user/repo.git`) via a shell-proxy script that gates to `git-upload-pack` / `git-receive-pack` based on PAT
+- GPG signature capture on import + preservation on push
+- Per-repo push hooks (reject force-push to protected branches, require issue reference in commit message, etc.)
+- Background worker that rebuilds gateways drifted from Olympus truth (cron check: `SELECT repo_id FROM repo_git_gateways WHERE last_synced_at < NOW() - INTERVAL '1 day'`)
+- Shallow clone support — already works via git's own protocol, just needs explicit testing
+
+**Known deferred items:**
+
+- Git LFS. Intentionally out of scope for v2.0.
+- Submodules. Gitlinks (mode 160000) are preserved but we don't recurse.
+- Partial clones with `--filter`. Should work via git's protocol without intervention; untested.
+- Multi-repo push (pushing to multiple gateway-mounted repos in one operation). Git doesn't support this natively; not needed.
