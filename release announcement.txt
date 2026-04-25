@@ -1,0 +1,227 @@
+# OlympusRepo v2.0 Beta — The Git Connector Release
+
+**Sovereign version control just learned to speak git.**
+
+Six months ago we shipped v1.00 with a vision: hierarchical, review-driven version control built on Postgres, free of corporate hooks. **It worked.** Real teams ran it. Real Zeus accounts promoted real offerings. We spent the months since making it talk to the rest of the world — and v2.0 is the result.
+
+---
+
+## 🚀 The Big One: Real Git Interop
+
+OlympusRepo has always *imported* git history. **v2.0 makes the conversation two-way.**
+
+### Import any git repo with full fidelity ⚡
+
+Drop a GitHub/GitLab URL into `/import` and watch every commit, tree, parent SHA, author identity, committer identity, **timezone offset**, and merge graph land in Postgres exactly as it lived in git. Original SHAs preserved. The 12-fanged demonic merge commit your colleague made in 2019 — same SHA, same parents, same byte-for-byte text. We hash-checked.
+
+### Push back to GitHub (or anywhere) 🔁
+
+Configure a remote on the new `/repo/<name>/remotes` page. Click **Send Offering** *(/ git push)*. OlympusRepo materializes the full tree, streams it through `git fast-import`, and `git push`es to your configured remote. Tokens encrypted at rest with `pgp_sym_encrypt`. SHAs round-trip when the import metadata survived. Audit log of every push attempt — who, when, how many bytes, success/failure — automatically.
+
+### `git clone http://yourbox:8000/<repo>.git` ✨
+
+This is the headline. **Standard git protocol.** No olympusrepo CLI required. Anyone with `git` installed can clone, fetch, and (with a Personal Access Token) push directly. Behind the scenes: a per-repo bare gateway that auto-rebuilds from the canonical Postgres state, and a fastapi smart-HTTP server speaking git pkt-line over `git-upload-pack` / `git-receive-pack`.
+
+### Pull from a configured remote 📥
+
+Click **Receive Tribute** *(/ git pull)* on the remotes page. Only the new commits get imported. Bare-mirror cache reused for incremental fetches. The audit log records every pull too.
+
+---
+
+## 🎨 The UI Got Real Controls
+
+The remotes management page is a proper **mission console**, not a status dialog:
+
+- **Auth banner at the top** tells you exactly who you are and what you can do — green (write access), amber (logged in but no permission), grey (not logged in). No more silently featureless pages.
+- **Branch dropdowns** for push and pull (no more typing ref names by hand)
+- **Per-remote audit history** — collapsible panel with the last 5 offerings + tributes, status pills, error messages
+- **Test Connection button** — runs `git ls-remote` against the URL so you catch credential / connectivity issues *before* triggering a push
+- **Force-push as inline checkbox confirmation**, not a `confirm()` dialog (because muscle-memory clicking through `confirm()` is how feet get shot off)
+- **Dual-named buttons everywhere** — `Bind Realm / git remote add`, `Sever / remote rm`, `Send Offering / git push`, `Receive Tribute / git pull`. Olympus vocabulary in front, the standard git command in monospace beside it. Doubles as a teaching tool — the mapping is always visible.
+
+---
+
+## 🔐 Personal Access Tokens
+
+Generate `olyp_…` prefixed tokens for git push and API auth. Scope-restricted (`git:read`, `git:write`, `api:read`, `api:write`). Hashed with bcrypt at rest. Same prefix pattern GitHub uses (`ghp_`), Slack uses (`xoxb-`), so they're greppable out of leaked logs and chat pastes.
+
+---
+
+## 🧹 Niggle Tightening (the v1 bugs we squashed)
+
+The git connector work surfaced a pile of bugs in the existing v1 code. **All fixed:**
+
+- **DM messages saying "not sent" while showing up on refresh.** Caused by `asyncio.create_task()` from a sync FastAPI handler — the handler ran in a threadpool with no event loop, so the create_task raised AFTER the row was committed. Hours of confused users; one-line fix once we found it.
+- **DM body bytes truncated at the framing boundary.** A 52-vs-55 byte length mismatch on the trailing headers blob ate the `\r\n\r\n` end-of-headers separator and curl gave up on every body, regardless of size.
+- **Smart-HTTP clones returning empty packs.** Three independent bugs in a chain: gateway HEAD pointing at `master` while the actual ref was `main`, fast-import's stdin closed twice causing communicate() to flush a closed file, and request body never reaching the subprocess due to an asyncio scheduling deadlock. Took strace + tcpdump to find. **Now `git clone` actually works.** ✅
+- **Zeus locked out of git remote management** on repos he didn't personally own. Fixed: instance-Zeus role overrides per-repo write checks for remote management (deliberately scoped — Zeus still doesn't bypass the staging/promotion review for actual code commits).
+- **Bind Realm form buried below the empty-state on first visit.** Hoisted to the top with explanatory copy. First-time users now see the action immediately.
+
+---
+
+## 🏗️ Under the Hood
+
+Three new SQL migrations land 17+ schema improvements:
+
+- `015` — git import schema (full author/committer fidelity, `is_imported` flag, helper SQL function for bulk insert)
+- `016` — git push schema (timezone offsets for SHA round-trip, encrypted remote credentials, push/pull audit logs, commit-mapping per remote)
+- `017` — Phase 4 tightening (file_mode per file so executables and symlinks survive round-trip, GPG signature passthrough, dangling-parent integrity view, log-retention pruning function, the gateway repo registry)
+
+Five new core modules:
+
+- `core/materialize.py` — reconstruct any commit's full file tree by walking changesets back to imported snapshot anchors
+- `core/import_git.py` — full-fidelity git importer with SSRF guards + protocol allowlist + repo-size caps
+- `core/export_git.py` — streaming fast-import-based push to git remotes with credential injection at push time
+- `core/pull_git.py` — incremental fetch using bare mirror cache
+- `core/git_remotes.py` — CRUD + URL allowlist + encrypted-credential helpers
+- `core/gateway.py` — bare git mirror per repo, derived state, rebuilt on demand
+- `core/pats.py` — Personal Access Tokens
+- `web/git_protocol.py` — fastapi router for `/<repo>.git/info/refs`, `/git-upload-pack`, `/git-receive-pack`
+
+---
+
+## 🚀 Installation (Same as Always — Seriously Easy)
+
+```bash
+git clone https://github.com/AiLang-Author/OlympusRepo.git
+cd OlympusRepo
+./setup.sh
+```
+
+The setup script now provisions:
+- Postgres database + user
+- All 17 migrations
+- `objects/`, `mirrors/`, **and `gateways/`** directories (auto, no root required)
+- `.env` with all required variables including `OLYMPUSREPO_MIRRORS_DIR` and `OLYMPUSREPO_GATEWAYS_ROOT`
+- First Zeus user account
+- Shell alias for your instance
+
+Then run:
+
+```bash
+set -a; source .env; set +a
+uvicorn olympusrepo.web.app:app --host 0.0.0.0 --port 8000
+```
+
+Open [http://localhost:8000/](http://localhost:8000) and login. Done.
+
+---
+
+## 🎬 The Two-Minute v2 Demo
+
+```bash
+# 1. Import a git repo via the web UI
+#    Browser:  http://localhost:8000/import
+#    Paste:    https://github.com/torvalds/linux.git    (or any small repo)
+#    Click:    ★ Import Repository ★
+
+# 2. Clone it back out via standard git — anywhere with git installed
+git clone http://localhost:8000/my-imported-repo.git
+cd my-imported-repo
+git log --oneline   # Same SHAs you imported
+
+# 3. Push back to GitHub
+#    Browser:  http://localhost:8000/repo/my-imported-repo/remotes
+#    Bind Realm:  origin = https://github.com/you/your-fork.git
+#                 Auth:   Personal access token  (paste a GitHub PAT)
+#    Click:    Send Offering / git push  ⚡
+```
+
+Three steps. Real round-trip. Standard tools.
+
+---
+
+## 👥 Who is this for?
+
+- Teams who want **real hierarchy and review** instead of "everyone can push to main"
+- People tired of paying GitHub rent for projects that should be owned
+- Anyone running a **homelab** who wants their git server to look like git but be sovereign
+- Open-source maintainers who want to mirror upstream + keep a sovereign canonical
+- Solo devs who want a personal git server that doesn't suck
+
+---
+
+## 📜 License
+
+**MIT.** Fork it, modify it, run it, host it, reskin the UI, build on it. Just please attribute the original work.
+
+---
+
+## 🔗 Links
+
+- **GitHub:** [https://github.com/AiLang-Author/OlympusRepo](https://github.com/AiLang-Author/OlympusRepo)
+- **Issues:** open one — we read every report
+- **Contributing:** see `docs/CONTRIBUTING.md`. The short version: fix something from the known-gaps list and offer it via `olympusrepo offer`. Don't open GitHub PRs for code — use the tool.
+
+*Made with care by 2 Paws Machine and Engineering.*
+
+---
+
+## 📖 OlympusRepo Commands — The Essentials
+
+The native CLI is unchanged from v1 — v2's git interop is additive. Use the native CLI for your day-to-day Olympus workflow; reach for standard git when you want to interop with the rest of the ecosystem.
+
+**The 8 commands you'll use 90% of the time:**
+
+```bash
+olympusrepo init <name>          # create a repo
+olympusrepo add .                # stage everything
+olympusrepo commit -m "msg"      # commit
+olympusrepo status               # what's changed
+olympusrepo log                  # history
+olympusrepo offer -m "why"       # send for review (federation)
+olympusrepo import-git <url> <name>   # bring in a git repo
+git clone http://yourbox:8000/<repo>.git   # NEW v2 — standard git!
+```
+
+**Full reference** — including branching, federation remotes, fsck/prune, admin commands, and standard-git interop — lives in [`docs/CLI_REFERENCE.md`](docs/CLI_REFERENCE.md).
+
+---
+
+## 🔧 Quick Reference (Most Used)
+
+### Basic workflow
+
+```bash
+olympusrepo init myproject
+cd myproject
+echo "# Hello" > README.md
+olympusrepo add .
+olympusrepo commit -m "initial commit"
+```
+
+### Clone + contribute (Olympus-native)
+
+```bash
+olympusrepo clone http://server:8000/repo/myproject
+cd myproject
+# make changes...
+olympusrepo add .
+olympusrepo commit -m "my fix"
+olympusrepo offer -m "here's why this should be accepted"
+```
+
+### Clone + contribute (standard git, v2)
+
+```bash
+git clone http://server:8000/myproject.git
+cd myproject
+# make changes...
+git commit -am "my fix"
+git push origin main      # asks for username + PAT (olyp_…)
+```
+
+### Admin / Maintenance
+
+```bash
+olympusrepo fsck
+olympusrepo prune --force
+olympusrepo import-git https://github.com/user/repo.git myimportedrepo
+```
+
+---
+
+**v2.0 ships standard git interop without giving up the Olympus workflow.**
+**Try it. Break it. File the bug. We'll fix it.**
+
+⚡
