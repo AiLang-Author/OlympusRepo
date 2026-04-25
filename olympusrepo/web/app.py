@@ -2273,23 +2273,30 @@ def blob_page(name: str, branch: str, path: str, request: Request,
         version_label = row["committed_at"].strftime("%Y-%m-%d %H:%M")
         is_historical = True
     else:
-        # Current version
+        # Current version — use materialize_tree which walks parent-chain
+        # and forward-applies changesets, so files modified in earlier
+        # commits and still present in the tree are found correctly.
+        # The previous SQL only matched files modified in the branch's
+        # tip commit and 404'd on everything else.
         ref_name = f"refs/heads/{branch}"
-        row = db.query_one(conn, """
-            SELECT cs.blob_after, fr.committed_at
-              FROM repo_changesets cs
-              JOIN repo_commits c ON c.commit_hash = cs.commit_hash
-              JOIN repo_refs rf ON rf.commit_hash = c.commit_hash
-              LEFT JOIN repo_file_revisions fr
-                ON fr.commit_hash = cs.commit_hash AND fr.path = cs.path
-             WHERE c.repo_id = %s AND rf.ref_name = %s
-               AND cs.path = %s AND cs.change_type != 'delete'
-             ORDER BY c.rev DESC LIMIT 1
-        """, (r["repo_id"], ref_name, path))
-        if not row:
-            raise HTTPException(404, "File not found.")
-        blob_hash = row["blob_after"]
-        version_label = row["committed_at"].strftime("%Y-%m-%d %H:%M") if row["committed_at"] else "current"
+        ref_row = db.query_one(conn, """
+            SELECT commit_hash FROM repo_refs
+             WHERE repo_id = %s AND ref_name = %s
+        """, (r["repo_id"], ref_name))
+        if not ref_row or not ref_row["commit_hash"]:
+            raise HTTPException(404, f"Branch '{branch}' not found.")
+
+        from ..core import materialize as mat
+        try:
+            tree = mat.materialize_tree(conn, r["repo_id"],
+                                        ref_row["commit_hash"])
+        except ValueError:
+            raise HTTPException(404, "Branch tip commit missing.")
+
+        if path not in tree:
+            raise HTTPException(404, f"{path} not in tree at {branch}.")
+        blob_hash = tree[path][0]
+        version_label = "current"
         is_historical = False
 
     # Get full history for prev/next navigation
@@ -2300,18 +2307,7 @@ def blob_page(name: str, branch: str, path: str, request: Request,
          ORDER BY committed_at DESC
     """, (r["repo_id"], path))
 
-    objects_dir = os.environ.get(
-        "OLYMPUSREPO_OBJECTS_DIR",
-        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
-    )
-    objects_dir = os.environ.get(
-        "OLYMPUSREPO_OBJECTS_DIR",
-        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
-    )
-    objects_dir = os.environ.get(
-        "OLYMPUSREPO_OBJECTS_DIR",
-        os.path.join(os.path.dirname(__file__), "..", "..", "objects")
-    )
+    objects_dir = _get_objects_dir()
     from ..core import objects as obj_store
     content_bytes = obj_store.retrieve_blob(blob_hash, objects_dir)
     if content_bytes is None:
