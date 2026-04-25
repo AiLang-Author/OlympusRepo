@@ -105,10 +105,20 @@ def _path_is_skipped(path: str) -> bool:
 #   %B  full message      -> message
 _COMMIT_FMT = (
     "%H%x1e%T%x1e%P%x1e"
-    "%an%x1e%ae%x1e%at%x1e"
-    "%cn%x1e%ce%x1e%ct%x1e"
+    "%an%x1e%ae%x1e%at%x1e%ai%x1e"   # +%ai (ISO date) for author tz offset
+    "%cn%x1e%ce%x1e%ct%x1e%ci%x1e"   # +%ci (ISO date) for committer tz offset
     "%B%x1f"
 )
+
+
+# ISO date format ends in " +HHMM" or " -HHMM". Pull just the offset
+# without parsing the rest of the string — git always emits exactly this.
+_TZ_RE = re.compile(r"([+\-]\d{4})\s*$")
+
+
+def _tz_from_iso(iso: str) -> str:
+    m = _TZ_RE.search(iso.strip())
+    return m.group(1) if m else "+0000"
 
 
 def _get_commits(git_dir: str, branch: str) -> list[dict]:
@@ -129,12 +139,12 @@ def _get_commits(git_dir: str, branch: str) -> list[dict]:
         if not record:
             continue
         parts = record.split("\x1e")
-        if len(parts) < 10:
+        if len(parts) < 12:
             continue
         (sha, tree, parents_str,
-         an, ae, at,
-         cn, ce, ct,
-         message) = parts[:10]
+         an, ae, at, ai,
+         cn, ce, ct, ci,
+         message) = parts[:12]
         parents = parents_str.split() if parents_str else []
         commits.append({
             "sha":              sha,
@@ -143,9 +153,11 @@ def _get_commits(git_dir: str, branch: str) -> list[dict]:
             "author_name":      an,
             "author_email":     ae,
             "author_time":      int(at),
+            "author_tz":        _tz_from_iso(ai),
             "committer_name":   cn,
             "committer_email":  ce,
             "committer_time":   int(ct),
+            "committer_tz":     _tz_from_iso(ci),
             "message":          message,
         })
     return commits
@@ -392,9 +404,11 @@ def import_git_repo(
                 author_name=c["author_name"],
                 author_email=c["author_email"],
                 authored_at_epoch=c["author_time"],
+                author_tz_offset=c["author_tz"],
                 committer_name=c["committer_name"],
                 committer_email=c["committer_email"],
                 committed_at_epoch=c["committer_time"],
+                committer_tz_offset=c["committer_tz"],
                 message=c["message"],
                 files=file_list,
                 objects_dir=objects_dir,
