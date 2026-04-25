@@ -467,16 +467,14 @@ def commit_files(conn, repo_id: int, user_id: int, message: str,
                 VALUES (%s, %s, %s, %s)
             """, (commit_hash, filepath, change_type, h), commit=False)
 
-            # Record in repo_objects
-            try:
-                db.execute(conn, """
-                    INSERT INTO repo_objects
-                        (object_hash, repo_id, byte_offset, size_bytes, obj_type)
-                    VALUES (%s, %s, 0, %s, 'blob')
-                    ON CONFLICT (object_hash) DO NOTHING
-                """, (h, repo_id, len(content)), commit=False)
-            except Exception:
-                pass
+            # Record in repo_objects. byte_offset = NULL for loose objects
+            # per the byte_offset_matches_pack constraint from migration 017.
+            db.execute(conn, """
+                INSERT INTO repo_objects
+                    (object_hash, repo_id, byte_offset, size_bytes, obj_type)
+                VALUES (%s, %s, NULL, %s, 'blob')
+                ON CONFLICT (object_hash) DO NOTHING
+            """, (h, repo_id, len(content)), commit=False)
 
         # Update ref
         db.execute(conn, """
