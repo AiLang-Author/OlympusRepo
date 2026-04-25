@@ -123,7 +123,7 @@
 
     <!-- Branch selector -->
     {% if branches %}
-    <div class="row" style="margin-bottom:16px;">
+    <div class="row" style="margin-bottom:16px; align-items:center; flex-wrap:wrap;">
         <span style="color:#8b949e; font-size:0.9em;">Branch:</span>
         {% for b in branches %}
             {% set bname = b.ref_name.replace('refs/heads/', '') %}
@@ -133,7 +133,95 @@
                 {{ bname }}
             </a>
         {% endfor %}
+        {% if user %}
+        <button id="new-branch-btn" class="btn"
+                style="padding:4px 10px; font-size:0.85em;
+                       background:#21262d; color:#58a6ff;
+                       border:1px dashed #30363d;">
+            + New Branch
+            <span style="font-family:monospace;font-size:0.85em;opacity:0.6;">/ git branch</span>
+        </button>
+        {% endif %}
     </div>
+
+    <!-- New-branch modal — opens from the + New Branch button.  Talks to
+         POST /api/repos/{name}/branches. Source branch defaults to the
+         current view; user can pick any existing branch as the base. -->
+    {% if user %}
+    <div id="new-branch-modal" class="card" style="display:none; margin-bottom:16px;">
+        <h3 style="margin-top:0;">
+            New Branch
+            <span style="font-family:monospace;font-size:0.7em;opacity:0.6;font-weight:400;">/ git branch &lt;name&gt; &lt;source&gt;</span>
+        </h3>
+        <div id="new-branch-error" class="flash flash-error" style="display:none;"></div>
+        <form id="new-branch-form">
+            <div class="form-group">
+                <label>Branch name</label>
+                <input type="text" name="branch_name"
+                       placeholder="feature/something"
+                       pattern="[A-Za-z0-9][A-Za-z0-9._\-/]{0,199}"
+                       required style="font-family:monospace;">
+            </div>
+            <div class="form-group">
+                <label>Branch from</label>
+                <select name="from_branch" style="font-family:monospace;">
+                    {% for b in branches %}
+                    {% set bname = b.ref_name.replace('refs/heads/', '') %}
+                    <option value="{{ bname }}" {% if bname == current_branch %}selected{% endif %}>
+                        {{ bname }}
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="row" style="gap:8px;">
+                <button type="submit" class="btn btn-primary">Create Branch</button>
+                <button type="button" id="new-branch-cancel" class="btn">Cancel</button>
+            </div>
+        </form>
+    </div>
+
+    <script>
+    (function() {
+        var btn   = document.getElementById('new-branch-btn');
+        var modal = document.getElementById('new-branch-modal');
+        var cancel = document.getElementById('new-branch-cancel');
+        var form  = document.getElementById('new-branch-form');
+        var err   = document.getElementById('new-branch-error');
+        if (!btn || !modal) return;
+        btn.addEventListener('click', function() {
+            modal.style.display = 'block';
+            btn.style.display = 'none';
+        });
+        cancel.addEventListener('click', function() {
+            modal.style.display = 'none';
+            btn.style.display = 'inline-flex';
+            err.style.display = 'none';
+        });
+        form.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            err.style.display = 'none';
+            var fd = new FormData(form);
+            try {
+                var res = await fetch('/api/repos/{{ repo.name }}/branches',
+                    { method: 'POST', body: fd });
+                if (res.ok) {
+                    var data = await res.json();
+                    location.href = '/repo/{{ repo.name }}?branch=' +
+                                    encodeURIComponent(data.branch);
+                } else {
+                    var d = {};
+                    try { d = await res.json(); } catch (_) {}
+                    err.textContent = d.detail || ('Create failed (HTTP ' + res.status + ')');
+                    err.style.display = 'block';
+                }
+            } catch (e2) {
+                err.textContent = 'Network error: ' + e2;
+                err.style.display = 'block';
+            }
+        });
+    })();
+    </script>
+    {% endif %}
     {% endif %}
 
     <a href="/repo/{{ repo.name }}/tribute" class="pay-tribute-box">

@@ -993,10 +993,17 @@ def repo_remotes_page(name: str, request: Request, conn=Depends(get_db)):
 @app.post("/api/repos/{name}/remotes/{remote_name}/test")
 def test_remote_api(name: str, remote_name: str, request: Request,
                     conn=Depends(get_db)):
-    """Lightweight reachability check. Runs `git ls-remote --heads <url>`
-    and returns the remote's branch list (or the error). Used by the
-    'Test Connection' button in the remotes UI so users find creds /
-    URL problems before triggering a full push or pull."""
+    """Lightweight reachability check + sync diff. Runs
+    `git ls-remote --heads <url>` and returns the remote's branch list,
+    then joins each remote ref against our local repo_refs to report
+    sync status per branch:
+
+      * synced     : local SHA == remote SHA — no offering needed
+      * diverged   : both sides have a SHA but they differ — push or pull
+      * local-only : ref exists locally but not on the remote
+      * remote-only: ref exists on the remote but not locally
+
+    Used by the 'Test Connection' button in the remotes UI."""
     user = get_current_user(request, conn)
     if not user:
         raise HTTPException(401)
@@ -1020,20 +1027,182 @@ def test_remote_api(name: str, remote_name: str, request: Request,
             env=ig.GIT_ENV,
             timeout=30,
         )
-        if result.returncode != 0:
-            return {
-                "ok": False,
-                "error": (result.stderr or "").strip()[:400],
-            }
-        # ls-remote output: "<sha>\t<refname>" per line
-        heads = []
-        for line in result.stdout.splitlines():
-            parts = line.split("\t", 1)
-            if len(parts) == 2:
-                heads.append({"sha": parts[0], "ref": parts[1]})
-        return {"ok": True, "heads": heads[:50], "head_count": len(heads)}
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "Connection timed out (30s)."}
+
+    if result.returncode != 0:
+        return {"ok": False,
+                "error": (result.stderr or "").strip()[:400]}
+
+    # remote heads -> {branch_name: sha}
+    remote_heads = {}
+    for line in result.stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and parts[1].startswith("refs/heads/"):
+            remote_heads[parts[1][len("refs/heads/"):]] = parts[0]
+
+    # local heads — read from repo_refs
+    local_heads = {}
+    for row in db.query(conn, """
+        SELECT ref_name, commit_hash FROM repo_refs
+         WHERE repo_id = %s AND ref_name LIKE 'refs/heads/%%'
+           AND commit_hash IS NOT NULL
+    """, (r["repo_id"],)):
+        local_heads[row["ref_name"][len("refs/heads/"):]] = row["commit_hash"]
+
+    # Join the two side maps. branches union; classify each.
+    branches = []
+    for name in sorted(set(local_heads) | set(remote_heads)):
+        local_sha  = local_heads.get(name)
+        remote_sha = remote_heads.get(name)
+        if local_sha and remote_sha:
+            status = "synced" if local_sha == remote_sha else "diverged"
+        elif local_sha:
+            status = "local-only"
+        else:
+            status = "remote-only"
+        branches.append({
+            "name":       name,
+            "local_sha":  local_sha,
+            "remote_sha": remote_sha,
+            "status":     status,
+        })
+
+    return {
+        "ok":         True,
+        "head_count": len(remote_heads),
+        "branches":   branches,
+    }
+
+
+# =========================================================================
+# BRANCH CREATION (web)
+# =========================================================================
+@app.post("/api/repos/{name}/branches")
+def create_branch_api(name: str, request: Request,
+                      branch_name: str = Form(...),
+                      from_branch: str = Form(""),
+                      conn=Depends(get_db)):
+    """Create a new branch. Branches off of `from_branch` (default: the
+    repo's default_branch) at its current tip."""
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+    r = repo.get_repo(conn, name)
+    if not r:
+        raise HTTPException(404)
+    if not repo.check_can_write(conn, r["repo_id"], user["user_id"]) \
+            and user.get("role") != "zeus":
+        raise HTTPException(403, "Write access required to create branches.")
+
+    branch_name = branch_name.strip()
+    if not re.match(r'^[A-Za-z0-9][A-Za-z0-9._\-/]{0,199}$', branch_name):
+        raise HTTPException(400, "Invalid branch name.")
+
+    src = (from_branch or "").strip() or r.get("default_branch") or "main"
+
+    try:
+        result = repo.create_branch(
+            conn, r["repo_id"], user["user_id"],
+            branch_name=branch_name, from_branch=src,
+        )
+        db.audit_log(conn, "branch_create_web", user_id=user["user_id"],
+                     repo_id=r["repo_id"], target_type="ref",
+                     target_id=branch_name,
+                     details={"from": src})
+        return {"status": "created", "branch": branch_name, "from": src,
+                "result": result}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# =========================================================================
+# PERSONAL ACCESS TOKENS (web)
+# =========================================================================
+@app.get("/account/tokens", response_class=HTMLResponse)
+def tokens_page(request: Request, conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        return RedirectResponse(url="/login", status_code=302)
+    from ..core import pats as pats_mod
+    tokens = pats_mod.list_pats(conn, user["user_id"])
+    # Keep the freshly-issued plaintext token (if any) only for one render
+    # via a session cookie one-shot. Cleaner than a query param (which
+    # browsers log + bookmark).
+    flash_token = request.cookies.get("flash_pat")
+    response = templates.TemplateResponse(request, "tokens.html", {
+        "user": user,
+        "tokens": tokens,
+        "flash_token": flash_token,
+    })
+    if flash_token:
+        # Consume the flash so a refresh doesn't re-show the token.
+        response.delete_cookie("flash_pat")
+    return response
+
+
+@app.post("/api/account/tokens")
+def create_token_api(request: Request,
+                     name: str = Form(...),
+                     scopes: str = Form("git:read git:write"),
+                     expires_days: str = Form("365"),
+                     conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+    name = name.strip()
+    if not re.match(r'^[A-Za-z0-9][A-Za-z0-9 ._\-]{0,63}$', name):
+        raise HTTPException(400, "Invalid token name.")
+    scope_list = [s for s in scopes.split() if s]
+    valid_scopes = {"git:read", "git:write", "api:read", "api:write"}
+    bad = [s for s in scope_list if s not in valid_scopes]
+    if bad:
+        raise HTTPException(400, f"Unknown scopes: {', '.join(bad)}")
+    try:
+        expires = int(expires_days) if expires_days.strip() else None
+    except ValueError:
+        raise HTTPException(400, "expires_days must be an integer or blank.")
+
+    from ..core import pats as pats_mod
+    try:
+        result = pats_mod.create_pat(
+            conn, user_id=user["user_id"],
+            name=name, scopes=scope_list,
+            expires_days=expires,
+        )
+    except Exception as e:
+        # most likely UniqueViolation on (user_id, name)
+        raise HTTPException(400, f"Could not create token: {e}")
+
+    db.audit_log(conn, "pat_create", user_id=user["user_id"],
+                 target_type="pat", target_id=name,
+                 details={"scopes": scope_list, "expires_days": expires})
+
+    # Stash plaintext token in a one-shot cookie; the page consumes it
+    # on next render and shows it once. Never persisted server-side.
+    raw = result.get("token") or result.get("raw_token")
+    response = JSONResponse({"status": "created",
+                             "name": name,
+                             "pat_id": result.get("pat_id")})
+    if raw:
+        response.set_cookie("flash_pat", raw,
+                            max_age=120, httponly=False, samesite="strict")
+    return response
+
+
+@app.delete("/api/account/tokens/{pat_id}")
+def revoke_token_api(pat_id: int, request: Request,
+                     conn=Depends(get_db)):
+    user = get_current_user(request, conn)
+    if not user:
+        raise HTTPException(401)
+    from ..core import pats as pats_mod
+    ok = pats_mod.revoke_pat(conn, user_id=user["user_id"], pat_id=pat_id)
+    if not ok:
+        raise HTTPException(404, "Token not found or already revoked.")
+    db.audit_log(conn, "pat_revoke", user_id=user["user_id"],
+                 target_type="pat", target_id=str(pat_id))
+    return {"status": "revoked"}
 
 
 @app.post("/api/repos/{name}/remotes")

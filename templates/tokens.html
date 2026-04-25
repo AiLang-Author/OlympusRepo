@@ -1,0 +1,230 @@
+{% extends "base.html" %}
+{% block title %}Personal Access Tokens — OlympusRepo{% endblock %}
+
+{% block extra_css %}
+<style>
+main {
+    background:
+        linear-gradient(to bottom, rgba(13,17,23,0.60), rgba(13,17,23,0.85)),
+        url('/static/forge-room.png') center center / cover no-repeat fixed;
+}
+.pat-row {
+    padding: 10px 12px;
+    border-bottom: 1px solid #21262d;
+    display: grid;
+    grid-template-columns: 2fr 2fr 1fr 1fr 80px;
+    gap: 12px;
+    align-items: center;
+}
+.pat-row.head { color: #8b949e; font-size: 0.85em; border-bottom: 1px solid #30363d; font-weight: 600; }
+.pat-row code { font-family: monospace; font-size: 0.8em; color: #c9d1d9; }
+.pat-scope {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 9px;
+    background: #21262d;
+    color: #8b949e;
+    font-size: 0.72em;
+    margin-right: 4px;
+    font-family: monospace;
+}
+.pat-revoked { opacity: 0.45; }
+
+.flash-token {
+    border: 2px solid #ffd700;
+    background: rgba(255,215,0,0.06);
+    padding: 14px 16px;
+    border-radius: 8px;
+    margin-bottom: 18px;
+}
+.flash-token code {
+    display: block;
+    background: #0a0d12;
+    color: #ffd700;
+    padding: 10px 14px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 1.05em;
+    margin: 8px 0;
+    word-break: break-all;
+    cursor: pointer;
+}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container" style="max-width:820px;">
+
+    <div class="row-between" style="margin-bottom:14px;">
+        <h1>🗝 Personal Access Tokens</h1>
+        <a href="/account" class="btn">&larr; Account</a>
+    </div>
+    <div class="card-meta" style="margin-bottom:18px;">
+        Long-lived secrets that authenticate <code>git push</code>, the API, and
+        any non-interactive client. Use as the <em>password</em> field for HTTP basic
+        auth. <strong>Revoke anything you don't recognize.</strong>
+    </div>
+
+    {% if flash_token %}
+    <div class="flash-token">
+        <strong>★ Your new token (shown ONCE — copy it now)</strong>
+        <code id="flash-token" title="click to copy">{{ flash_token }}</code>
+        <div class="card-meta">
+            Refresh this page or navigate away and the token is gone forever.
+            Store it in your password manager or <code>~/.netrc</code>:
+        </div>
+        <pre style="background:#0a0d12; padding:10px; border-radius:4px; font-size:0.85em; margin-top:6px;"><code>machine yourbox.example.com
+  login {{ user.username }}
+  password {{ flash_token }}</code></pre>
+    </div>
+    {% endif %}
+
+    <!-- ============ NEW TOKEN ============ -->
+    <div class="card" style="margin-bottom:24px;">
+        <h2 style="margin-top:0;">Generate New Token</h2>
+        <div id="new-error" class="flash flash-error" style="display:none;"></div>
+        <form id="new-token-form">
+            <div class="form-group">
+                <label>Name</label>
+                <input type="text" name="name"
+                       placeholder="laptop-cli, ci-runner, etc."
+                       pattern="[A-Za-z0-9][A-Za-z0-9 ._\-]{0,63}"
+                       required>
+                <div class="card-meta" style="margin-top:4px;">
+                    Pick something memorable so you know what to revoke later.
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Scopes</label>
+                <div style="display:flex; flex-wrap:wrap; gap:14px; padding:6px 0;">
+                    <label><input type="checkbox" name="scope" value="git:read"  checked> <code>git:read</code></label>
+                    <label><input type="checkbox" name="scope" value="git:write" checked> <code>git:write</code></label>
+                    <label><input type="checkbox" name="scope" value="api:read"> <code>api:read</code></label>
+                    <label><input type="checkbox" name="scope" value="api:write"> <code>api:write</code></label>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Expires in (days)</label>
+                <input type="text" name="expires_days" value="365" style="width:120px;">
+                <div class="card-meta" style="margin-top:4px;">
+                    Blank = never expires. <code>365</code> is a sensible default.
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary">Generate Token</button>
+        </form>
+    </div>
+
+    <!-- ============ EXISTING TOKENS ============ -->
+    <div class="card">
+        <h2 style="margin-top:0;">Active Tokens</h2>
+        {% if tokens %}
+        <div class="pat-row head">
+            <div>Name</div>
+            <div>Scopes</div>
+            <div>Created</div>
+            <div>Last used</div>
+            <div></div>
+        </div>
+        {% for t in tokens %}
+        <div class="pat-row {% if t.revoked_at %}pat-revoked{% endif %}" data-pat-id="{{ t.pat_id }}">
+            <div>
+                <strong style="color:#f0f6fc;">{{ t.name }}</strong>
+                <div class="card-meta" style="margin-top:2px;">
+                    <code>{{ t.token_prefix }}…</code>
+                    {% if t.revoked_at %}<span style="color:#f85149;">revoked {{ t.revoked_at.strftime('%b %d') }}</span>{% endif %}
+                </div>
+            </div>
+            <div>
+                {% for s in t.scopes %}<span class="pat-scope">{{ s }}</span>{% endfor %}
+            </div>
+            <div class="card-meta">
+                {{ t.created_at.strftime('%b %d, %Y') }}
+                {% if t.expires_at %}<br><span style="font-size:0.85em;">expires {{ t.expires_at.strftime('%b %d, %Y') }}</span>{% endif %}
+            </div>
+            <div class="card-meta">
+                {% if t.last_used_at %}{{ t.last_used_at.strftime('%b %d %H:%M') }}{% else %}<em>never</em>{% endif %}
+            </div>
+            <div>
+                {% if not t.revoked_at %}
+                <button class="btn revoke-btn" data-pat-id="{{ t.pat_id }}"
+                        data-name="{{ t.name }}"
+                        style="padding:3px 10px; font-size:0.8em;
+                               background:#21262d; color:#f85149;">
+                    Revoke
+                </button>
+                {% endif %}
+            </div>
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="empty-state"><p>No tokens yet. Generate one above.</p></div>
+        {% endif %}
+    </div>
+
+</div>
+
+<script>
+(function() {
+    /* Click to copy the flash token */
+    var flash = document.getElementById('flash-token');
+    if (flash) {
+        flash.addEventListener('click', function() {
+            navigator.clipboard.writeText(flash.textContent.trim()).then(function() {
+                var orig = flash.style.background;
+                flash.style.background = '#1a3a1a';
+                setTimeout(function() { flash.style.background = orig; }, 600);
+            });
+        });
+    }
+
+    /* Generate new token */
+    var form = document.getElementById('new-token-form');
+    if (form) {
+        form.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            var err = document.getElementById('new-error');
+            err.style.display = 'none';
+            var fd = new FormData(form);
+            // Collapse the multiple "scope" checkboxes into a single
+            // space-separated form field.
+            var scopes = Array.from(document.querySelectorAll('input[name="scope"]:checked'))
+                              .map(function(c) { return c.value; }).join(' ');
+            var packed = new FormData();
+            packed.append('name', fd.get('name'));
+            packed.append('scopes', scopes);
+            packed.append('expires_days', fd.get('expires_days') || '');
+            try {
+                var res = await fetch('/api/account/tokens',
+                    { method: 'POST', body: packed });
+                if (res.ok) {
+                    location.reload();
+                } else {
+                    var data = {};
+                    try { data = await res.json(); } catch (_) {}
+                    err.textContent = data.detail || ('Generate failed (HTTP ' + res.status + ')');
+                    err.style.display = 'block';
+                }
+            } catch (e2) {
+                err.textContent = 'Network error: ' + e2;
+                err.style.display = 'block';
+            }
+        });
+    }
+
+    /* Revoke */
+    document.querySelectorAll('.revoke-btn').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+            var id   = btn.dataset.patId;
+            var name = btn.dataset.name;
+            if (!confirm('Revoke token "' + name + '"? Any clients using it will stop authenticating.')) return;
+            try {
+                var res = await fetch('/api/account/tokens/' + encodeURIComponent(id),
+                    { method: 'DELETE' });
+                if (res.ok) location.reload();
+                else alert('Revoke failed: HTTP ' + res.status);
+            } catch (e) { alert('Network error: ' + e); }
+        });
+    });
+})();
+</script>
+{% endblock %}

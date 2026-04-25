@@ -605,28 +605,46 @@ main {
         });
     });
 
-    /* Test connection */
+    /* Test connection — now also reports per-branch sync status by
+       diffing local repo_refs vs the remote ls-remote heads. */
+    function fmtSync(b) {
+        var local  = b.local_sha  ? b.local_sha.substring(0, 8)  : '─────';
+        var remote = b.remote_sha ? b.remote_sha.substring(0, 8) : '─────';
+        var status = ({
+            'synced'     : '✓ in sync',
+            'diverged'   : '⚠ diverged — push or pull to reconcile',
+            'local-only' : '↑ local only — push to publish',
+            'remote-only': '↓ remote only — pull to import',
+        })[b.status] || b.status;
+        return '  ' + b.name.padEnd(24) +
+               'local=' + local + '  remote=' + remote + '  ' + status;
+    }
     $$('.test-btn').forEach(function(btn) {
         btn.addEventListener('click', async function() {
             var name = btn.dataset.name;
             btn.disabled = true;
-            setStatus(name, 'test', 'Probing ' + name + ' (ls-remote)…', null);
+            setStatus(name, 'test', 'Probing ' + name + ' (ls-remote + diff vs local refs)…', null);
             try {
                 var res = await fetch('/api/repos/' + encodeURIComponent(repoName) +
                                       '/remotes/' + encodeURIComponent(name) + '/test',
                                       { method: 'POST' });
                 var data = await res.json();
-                if (data.ok) {
-                    var lines = (data.heads || []).map(function(h) {
-                        return h.sha.substring(0, 8) + '  ' + h.ref;
-                    });
-                    setStatus(name, 'test',
-                        '✓ Reachable. ' + (data.head_count || 0) + ' branch(es) on remote:\n' +
-                        lines.join('\n'),
-                        true);
-                } else {
+                if (!data.ok) {
                     setStatus(name, 'test', '✗ ' + (data.error || 'Unknown error'), false);
+                    return;
                 }
+                var lines = ['✓ Reachable. ' + (data.head_count || 0) +
+                             ' branch(es) on remote.', ''];
+                lines.push('  ' + 'branch'.padEnd(24) +
+                           'local       remote      status');
+                lines.push('  ' + '─'.repeat(70));
+                (data.branches || []).forEach(function(b) {
+                    lines.push(fmtSync(b));
+                });
+                if (!data.branches || data.branches.length === 0) {
+                    lines.push('  (no branches on either side)');
+                }
+                setStatus(name, 'test', lines.join('\n'), true);
             } catch (e) {
                 setStatus(name, 'test', '✗ Network error: ' + e, false);
             } finally {
