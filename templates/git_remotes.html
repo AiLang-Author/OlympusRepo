@@ -183,7 +183,7 @@ main {
 {% block content %}
 <div class="container">
 
-    <div class="row-between" style="margin-bottom:18px;">
+    <div class="row-between" style="margin-bottom:8px;">
         <div>
             <h1 style="margin-bottom:4px;">⇄ Realms — {{ repo.name }}</h1>
             <div class="card-meta">
@@ -194,6 +194,79 @@ main {
         </div>
         <a href="/repo/{{ repo.name }}" class="btn">&larr; Repo</a>
     </div>
+
+    <!-- Auth status banner — surfaces WHY controls may be hidden so the
+         page never looks featureless without explanation. -->
+    <div class="card" style="
+        margin-bottom:18px; padding:10px 14px;
+        border-color: {% if can_write %}#238636{% elif user %}#9e6a03{% else %}#3a3a3a{% endif %};
+        background: {% if can_write %}rgba(35,134,54,0.08){% elif user %}rgba(158,106,3,0.08){% else %}rgba(50,50,50,0.18){% endif %};
+    ">
+        {% if can_write %}
+            ✓ Logged in as <strong>{{ user.username }}</strong> with write access.
+            All controls are live.
+        {% elif user %}
+            ⓘ Logged in as <strong>{{ user.username }}</strong> ({{ user.role }}),
+            but you don't have write access on this repo. Read-only view —
+            push/pull/add buttons are hidden. Ask an Olympian or Zeus to grant
+            write access via <a href="/repo/{{ repo.name }}/access" style="color:#58a6ff;">repo access</a>.
+        {% else %}
+            ⓘ <strong>Not logged in.</strong> Read-only view —
+            <a href="/login" style="color:#58a6ff;">log in</a> as a user with write
+            access on this repo to send offerings (push), receive tributes (pull),
+            or bind new realms.
+        {% endif %}
+    </div>
+
+    <!-- When there are no remotes yet AND the user can write, hoist the
+         Bind form to the TOP of the page (instead of the bottom under an
+         empty-state card) so first-time users see the action immediately. -->
+    {% if can_write and not remotes %}
+    <div class="card add-form" style="margin-bottom:24px; border-color:#1f6feb;">
+        <h2 style="margin-top:0;">
+            ▶ Bind Your First Realm
+            <span style="font-family:monospace;font-size:0.65em;opacity:0.6;font-weight:400;">/ git remote add</span>
+        </h2>
+        <div class="card-meta" style="margin-bottom:12px;">
+            No realms configured for this repo yet. Add the first one below to start
+            sending offerings (pushing) and receiving tributes (pulling).
+        </div>
+        <div id="add-error-top" class="flash flash-error" style="display:none;"></div>
+        <form id="add-remote-form-top">
+            <div class="form-group">
+                <label>Name</label>
+                <input type="text" name="remote_name"
+                       placeholder="origin"
+                       pattern="[A-Za-z0-9][A-Za-z0-9._\-/]*"
+                       required>
+            </div>
+            <div class="form-group">
+                <label>URL</label>
+                <input type="text" name="url"
+                       placeholder="https://github.com/user/repo.git"
+                       required>
+            </div>
+            <div class="form-group">
+                <label>Auth</label>
+                <select name="auth_type" id="auth-select-top">
+                    <option value="none">None (public read-only)</option>
+                    <option value="token">Personal access token</option>
+                    <option value="ssh_key">SSH key (use system ssh config)</option>
+                </select>
+            </div>
+            <div class="form-group" id="cred-group-top" style="display:none;">
+                <label>Credential</label>
+                <input type="password" name="credential"
+                       placeholder="ghp_… or path to ssh key"
+                       autocomplete="off">
+            </div>
+            <button type="submit" class="btn btn-primary btn-dual">
+                Bind Realm
+                <span class="git-name">git remote add</span>
+            </button>
+        </form>
+    </div>
+    {% endif %}
 
     <!-- =================================================================
          REMOTE LIST
@@ -473,15 +546,6 @@ main {
         });
     });
 
-    /* Auth field show/hide */
-    var authSel = document.getElementById('auth-select');
-    var credGroup = document.getElementById('cred-group');
-    if (authSel) {
-        authSel.addEventListener('change', function() {
-            credGroup.style.display = (authSel.value === 'none') ? 'none' : 'block';
-        });
-    }
-
     /* Force-push checkbox toggles the danger panel */
     $$('.push-btn').forEach(function(btn) {
         var name = btn.dataset.name;
@@ -489,14 +553,24 @@ main {
         if (dangerPanel) dangerPanel.style.display = 'block';
     });
 
-    /* Add remote */
-    var addForm = document.getElementById('add-remote-form');
-    if (addForm) {
-        addForm.addEventListener('submit', async function(e) {
+    /* Add remote — wires both the bottom form and the hoisted top form
+       (only one of them exists in the DOM at a time, but both share the
+       same handler). */
+    function wireAddForm(formId, errId, authSelId, credGroupId) {
+        var form = document.getElementById(formId);
+        if (!form) return;
+        var authSel = document.getElementById(authSelId);
+        var credGroup = document.getElementById(credGroupId);
+        if (authSel && credGroup) {
+            authSel.addEventListener('change', function() {
+                credGroup.style.display = (authSel.value === 'none') ? 'none' : 'block';
+            });
+        }
+        form.addEventListener('submit', async function(e) {
             e.preventDefault();
-            var err = document.getElementById('add-error');
+            var err = document.getElementById(errId);
             err.style.display = 'none';
-            var fd = new FormData(addForm);
+            var fd = new FormData(form);
             try {
                 var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/remotes',
                     { method: 'POST', body: fd });
@@ -514,6 +588,8 @@ main {
             }
         });
     }
+    wireAddForm('add-remote-form',     'add-error',     'auth-select',     'cred-group');
+    wireAddForm('add-remote-form-top', 'add-error-top', 'auth-select-top', 'cred-group-top');
 
     /* Sever (delete) */
     $$('.delete-btn').forEach(function(btn) {
