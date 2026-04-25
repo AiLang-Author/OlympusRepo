@@ -703,8 +703,10 @@ divider
 INSTALL_ABS="$(cd "$INSTALL_DIR" && pwd)"
 OBJECTS_DIR="${INSTALL_ABS}/objects"
 MIRRORS_DIR="${INSTALL_ABS}/mirrors"
+GATEWAYS_DIR="${INSTALL_ABS}/gateways"
 mkdir -p "$OBJECTS_DIR"
 mkdir -p "$MIRRORS_DIR"
+mkdir -p "$GATEWAYS_DIR"
 ALIAS_NAME="olympus-$(basename "$INSTALL_ABS" | /usr/bin/tr '[:upper:]' '[:lower:]' | /usr/bin/tr ' ' '-')"
 
 cat > "$ENV_FILE" << EOF
@@ -730,6 +732,10 @@ OLYMPUSREPO_OBJECTS_DIR=${OBJECTS_DIR}
 # Git Bridge mirror cache — bare git mirrors for incremental pull
 OLYMPUSREPO_MIRRORS_DIR=${MIRRORS_DIR}
 
+# Smart-HTTP gateways — bare repos that git-upload-pack/receive-pack
+# operate on. Derived state, rebuilt on demand from canonical commits.
+OLYMPUSREPO_GATEWAYS_ROOT=${GATEWAYS_DIR}
+
 # Security (set to 1 if behind HTTPS reverse proxy)
 OLYMPUSREPO_COOKIE_SECURE=0
 
@@ -739,7 +745,7 @@ OLYMPUSREPO_INSTANCE_NAME=${INSTANCE_NAME}
 OLYMPUSREPO_RELAYS=${RELAY_URLS}
 EOF
 
-success ".env written (objects: ${OBJECTS_DIR}, mirrors: ${MIRRORS_DIR})"
+success ".env written (objects: ${OBJECTS_DIR}, mirrors: ${MIRRORS_DIR}, gateways: ${GATEWAYS_DIR})"
 
 # Source env vars into current shell session
 set -a; source "$ENV_FILE"; set +a
