@@ -923,6 +923,17 @@ def _get_mirrors_dir() -> str:
     )
 
 
+def _can_manage_remotes(conn, user, repo_id: int) -> bool:
+    """True if user may add/delete remotes or trigger push/pull. Zeus has
+    instance-wide override; otherwise falls back to per-repo write
+    access (owner / explicit repo_access write|admin)."""
+    if not user:
+        return False
+    if user.get("role") == "zeus":
+        return True
+    return repo.check_can_write(conn, repo_id, user["user_id"])
+
+
 @app.get("/repo/{name}/remotes", response_class=HTMLResponse)
 def repo_remotes_page(name: str, request: Request, conn=Depends(get_db)):
     user = get_current_user(request, conn)
@@ -936,8 +947,10 @@ def repo_remotes_page(name: str, request: Request, conn=Depends(get_db)):
     from ..core import git_remotes as gr
     remotes = gr.list_remotes(conn, r["repo_id"])
     branches = repo.get_branches(conn, r["repo_id"])
-    can_write = bool(user) and repo.check_can_write(
-        conn, r["repo_id"], user["user_id"])
+    # Same auth helper used by the mutation endpoints — Zeus has
+    # instance-wide override for remote management; everyone else needs
+    # owner / write|admin grant on the specific repo.
+    can_write = _can_manage_remotes(conn, user, r["repo_id"])
 
     # Pull recent push + pull log entries per remote so the page can
     # show "what happened last and was it ok" without a second
@@ -990,7 +1003,7 @@ def test_remote_api(name: str, remote_name: str, request: Request,
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
-    if not repo.check_can_write(conn, r["repo_id"], user["user_id"]):
+    if not _can_manage_remotes(conn, user, r["repo_id"]):
         raise HTTPException(403)
 
     from ..core import git_remotes as gr
@@ -1036,7 +1049,7 @@ def add_remote_api(name: str, request: Request,
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
-    if not repo.check_can_write(conn, r["repo_id"], user["user_id"]):
+    if not _can_manage_remotes(conn, user, r["repo_id"]):
         raise HTTPException(403, "Write access required to manage remotes.")
 
     from ..core import git_remotes as gr
@@ -1067,7 +1080,7 @@ def delete_remote_api(name: str, remote_name: str, request: Request,
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
-    if not repo.check_can_write(conn, r["repo_id"], user["user_id"]):
+    if not _can_manage_remotes(conn, user, r["repo_id"]):
         raise HTTPException(403)
 
     from ..core import git_remotes as gr
@@ -1089,7 +1102,7 @@ def push_remote_api(name: str, remote_name: str, request: Request,
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
-    if not repo.check_can_write(conn, r["repo_id"], user["user_id"]):
+    if not _can_manage_remotes(conn, user, r["repo_id"]):
         raise HTTPException(403)
 
     from ..core import export_git as eg
@@ -1121,7 +1134,7 @@ def pull_remote_api(name: str, remote_name: str, request: Request,
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
-    if not repo.check_can_write(conn, r["repo_id"], user["user_id"]):
+    if not _can_manage_remotes(conn, user, r["repo_id"]):
         raise HTTPException(403)
 
     from ..core import pull_git as pg
