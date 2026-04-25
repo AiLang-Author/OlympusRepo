@@ -336,10 +336,31 @@ async def receive_pack(
 async def _run_pack_service(
     *, service: str, gateway_path: str, request: Request,
     repo_id: int, auth: AuthContext, conn,
-) -> StreamingResponse:
+) -> Response:
+    """
+    Run git-upload-pack / git-receive-pack against the gateway repo and
+    proxy its stdout back as the HTTP response body.
+
+    Non-streaming: we read the full request body up-front and feed it
+    to the subprocess via communicate(). The previous streaming
+    implementation deadlocked because request.stream() inside an
+    asyncio.create_task() never yielded — looked like a Starlette/
+    asyncio scheduling interaction with StreamingResponse. Smart-HTTP
+    request bodies for typical clones are KB-range, so the simpler
+    buffered approach is fine.
+    """
     started = time.monotonic()
 
-    # git expects 'upload-pack' / 'receive-pack' as the subcommand.
+    # Read the client's full body (want/have negotiation lines, then
+    # for receive-pack the pack itself). _MAX_RECEIVE_BYTES caps it so
+    # a hostile push can't OOM us.
+    body = await request.body()
+    if len(body) > _MAX_RECEIVE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="push exceeds maximum size",
+        )
+
     proc = await asyncio.create_subprocess_exec(
         import_git.GIT_BIN, *import_git.GIT_SAFE_ARGS,
         service, "--stateless-rpc", gateway_path,
@@ -349,61 +370,42 @@ async def _run_pack_service(
         env=import_git.GIT_ENV,
     )
 
-    bytes_in = 0
-    bytes_out = 0
-
-    async def shovel_in():
-        nonlocal bytes_in
-        async for chunk in request.stream():
-            if not chunk:
-                continue
-            bytes_in += len(chunk)
-            if bytes_in > _MAX_RECEIVE_BYTES:
-                proc.kill()
-                raise HTTPException(
-                    status_code=413,
-                    detail="push exceeds maximum size",
-                )
-            proc.stdin.write(chunk)
-            await proc.stdin.drain()
-        proc.stdin.close()
-
-    async def shovel_out():
-        nonlocal bytes_out
-        while True:
-            chunk = await proc.stdout.read(_PIPE_CHUNK)
-            if not chunk:
-                return
-            bytes_out += len(chunk)
-            yield chunk
-
-    # Kick off stdin in the background; stdout drives the response.
-    stdin_task = asyncio.create_task(shovel_in())
-
-    async def response_body():
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=body),
+            timeout=import_git.GIT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
         try:
-            async for chunk in shovel_out():
-                yield chunk
-            await stdin_task
-            rc = await proc.wait()
-            duration_ms = int((time.monotonic() - started) * 1000)
-            _log_protocol(
-                conn, repo_id, auth.user_id, service,
-                bytes_in=bytes_in, bytes_out=bytes_out,
-                status=200 if rc == 0 else 500,
-                duration_ms=duration_ms,
-                user_agent=request.headers.get("user-agent"),
-                ip=request.client.host if request.client else None,
-            )
+            proc.kill()
         except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            raise
+            pass
+        raise HTTPException(status_code=504, detail=f"{service} timed out")
 
-    return StreamingResponse(
-        response_body(),
+    duration_ms = int((time.monotonic() - started) * 1000)
+    rc = proc.returncode
+
+    _log_protocol(
+        conn, repo_id, auth.user_id, service,
+        bytes_in=len(body), bytes_out=len(stdout),
+        status=200 if rc == 0 else 500,
+        duration_ms=duration_ms,
+        user_agent=request.headers.get("user-agent"),
+        ip=request.client.host if request.client else None,
+    )
+
+    if rc != 0:
+        # Surface git's stderr (truncated) so debugging doesn't require
+        # crawling server logs. status 500 is the right tier here — the
+        # client request was structurally valid; the backend failed.
+        err_text = stderr.decode("utf-8", errors="replace")[:600] if stderr else ""
+        raise HTTPException(
+            status_code=500,
+            detail=f"{service} failed (rc {rc}): {err_text.strip()}",
+        )
+
+    return Response(
+        content=stdout,
         media_type=f"application/x-git-{service}-result",
         headers={"Cache-Control": "no-cache"},
     )
