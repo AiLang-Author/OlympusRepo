@@ -490,16 +490,24 @@ def zeus_dashboard(request: Request, conn=Depends(get_db)):
             "SELECT COUNT(*) FROM repo_commits WHERE committed_at >= CURRENT_DATE") or 0,
     }
 
+    # repo_name comes from the repos JOIN — the template builds the
+    # Review URL as /repo/{repo_name}/staging/{id}/review, so missing
+    # this would render an empty path segment and 404. LEFT JOIN on
+    # repo_users so anonymous offerings (NULL user_id) still show up.
     staging = db.query(conn, """
         SELECT s.staging_id, s.branch_name, s.status, s.updated_at,
+               s.anon_name, s.anon_email,
                u.username, u.role,
+               r.name as repo_name,
                COUNT(sc.change_id) as change_count
           FROM repo_staging s
-          JOIN repo_users u ON u.user_id = s.user_id
+          LEFT JOIN repo_users u ON u.user_id = s.user_id
+          JOIN repo_repositories r ON r.repo_id = s.repo_id
           LEFT JOIN repo_staging_changes sc ON sc.staging_id = s.staging_id
          WHERE s.status = 'active'
          GROUP BY s.staging_id, s.branch_name, s.status, s.updated_at,
-                  u.username, u.role
+                  s.anon_name, s.anon_email,
+                  u.username, u.role, r.name
          ORDER BY s.updated_at DESC
     """)
 
@@ -1639,16 +1647,17 @@ def create_repo_api(request: Request,
 
 def _load_file_tree(conn, repo_id: int, branch: str) -> list[dict]:
     """
-    Load the file list for a branch from its latest commit's changeset records.
+    Load the file list for a branch's tip commit.
     Returns a list of dicts: {path, size, change_type}
 
-    We reconstruct the current tree by replaying all changesets in rev order:
-    adds and modifies build the set, deletes remove from it.
-    This is the correct approach until we have a proper tree-object walker.
+    Uses materialize_tree so the listing matches exactly what blob_page
+    and edit_blob_page will resolve against. Replaying every changeset
+    across the whole repo (the previous approach) ignored branch
+    boundaries and surfaced files that weren't reachable from the
+    selected branch's first-parent chain — clicking those 404'd.
     """
     ref_name = f"refs/heads/{branch}"
 
-    # Get the current commit hash for this branch
     ref_row = db.query_one(conn,
         "SELECT commit_hash FROM repo_refs WHERE repo_id = %s AND ref_name = %s",
         (repo_id, ref_name))
@@ -1656,36 +1665,21 @@ def _load_file_tree(conn, repo_id: int, branch: str) -> list[dict]:
     if not ref_row or not ref_row["commit_hash"]:
         return []
 
-    # Replay all changesets in order to build current file set
-    rows = db.query(conn, """
-        SELECT cs.path, cs.change_type, cs.blob_after,
-               c.rev
-          FROM repo_changesets cs
-          JOIN repo_commits c ON c.commit_hash = cs.commit_hash
-         WHERE c.repo_id = %s
-         ORDER BY c.rev ASC, cs.path ASC
-    """, (repo_id,))
-
-    # Build current file set: path -> blob_hash
-    tree = {}
-    for row in rows:
-        if row["change_type"] in ("add", "modify"):
-            tree[row["path"]] = row["blob_after"]
-        elif row["change_type"] == "delete":
-            tree.pop(row["path"], None)
-        elif row["change_type"] == "rename" and row.get("old_path"):
-            tree.pop(row.get("old_path"), None)
-            tree[row["path"]] = row["blob_after"]
+    from ..core import materialize as mat
+    try:
+        tree = mat.materialize_tree(conn, repo_id, ref_row["commit_hash"])
+    except ValueError:
+        return []
 
     # Build display list sorted by path
     files = []
-    
+
     BINARY_EXTENSIONS = {
         '.png','.jpg','.jpeg','.gif','.ico','.svg',
         '.pdf','.zip','.tar','.gz','.whl','.pyc',
         '.pyo','.so','.dll','.exe','.bin'
     }
-    for path, blob_hash in sorted(tree.items()):
+    for path, (blob_hash, _mode) in sorted(tree.items()):
         try:
             committed_at = db.query_scalar(conn, """
                 SELECT committed_at FROM repo_file_revisions
@@ -3982,10 +3976,13 @@ def staging_review_page(name: str, staging_id: int,
     if not r:
         raise HTTPException(404)
 
+    # LEFT JOIN — anonymous offerings have NULL user_id; INNER JOIN
+    # would drop them and 404 the review page. Template falls back to
+    # anon_name / anon_email when username is NULL.
     staging_row = db.query_one(conn, """
         SELECT s.*, u.username, u.role as user_role
           FROM repo_staging s
-          JOIN repo_users u ON u.user_id = s.user_id
+          LEFT JOIN repo_users u ON u.user_id = s.user_id
          WHERE s.staging_id = %s AND s.repo_id = %s
     """, (staging_id, r["repo_id"]))
     if not staging_row:

@@ -64,8 +64,20 @@
             <tbody>
                 {% for s in staging %}
                 <tr>
-                    <td style="font-weight:600;">{{ s.username }}</td>
-                    <td><span class="role-tag role-{{ s.role }}">{{ s.role }}</span></td>
+                    <td style="font-weight:600;">
+                        {% if s.username %}
+                            {{ s.username }}
+                        {% else %}
+                            {{ s.anon_name or 'Anonymous' }}
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if s.username %}
+                            <span class="role-tag role-{{ s.role }}">{{ s.role }}</span>
+                        {% else %}
+                            <span class="role-tag" style="background:#9e6a03; color:#ffd700;">ANON</span>
+                        {% endif %}
+                    </td>
                     <td><code>{{ s.branch_name }}</code></td>
                     <td>{{ s.change_count }}</td>
                     <td class="card-meta">

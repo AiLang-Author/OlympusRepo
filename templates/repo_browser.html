@@ -393,15 +393,10 @@
                         <span class="badge" style="background:#1f6feb; color:#fff;">{{ s.change_count }} changes</span>
                         {% if user and user.role in ('zeus', 'olympian') %}
                             <a href="/repo/{{ repo.name }}/staging/{{ s.staging_id }}/review"
-                               class="btn"
+                               class="btn btn-gold"
                                style="padding:4px 10px; font-size:0.8em;">
-                                Review Diff
+                                Review &amp; Promote
                             </a>
-                            <button class="btn btn-gold promote-btn"
-                                    data-staging-id="{{ s.staging_id }}"
-                                    style="padding:4px 10px; font-size:0.8em;">
-                                Promote
-                            </button>
                         {% endif %}
                     </span>
                 </div>
@@ -934,37 +929,6 @@ olympusrepo commit -m "Initial commit"</pre>
 
         })();
     }
-
-    // Promote buttons
-    document.querySelectorAll('.promote-btn').forEach(function(btn) {
-        btn.addEventListener('click', async function() {
-            var stagingId = btn.getAttribute('data-staging-id');
-            var notes = prompt('Promotion notes (optional):');
-            if (notes === null) return;  // cancelled
-
-            btn.disabled = true;
-            try {
-                var res = await fetch('/api/repos/' + encodeURIComponent(repoName) + '/promote/' + stagingId, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ notes: notes })
-                });
-
-                if (res.ok) {
-                    alert('Promoted to canonical tree.');
-                    window.location.reload();
-                } else {
-                    var data = {};
-                    try { data = await res.json(); } catch (e) {}
-                    alert(data.detail || 'Promotion failed.');
-                    btn.disabled = false;
-                }
-            } catch (err) {
-                alert('Network error.');
-                btn.disabled = false;
-            }
-        });
-    });
 
     var forkBtn = document.getElementById('fork-btn');
     if (forkBtn) {

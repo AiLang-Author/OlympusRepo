@@ -100,10 +100,24 @@
         <div>
             <h1 style="margin-bottom:4px;">Review Offering</h1>
             <div class="row" style="gap:8px;">
-                <strong style="color:#f0f6fc;">{{ staging.username }}</strong>
-                <span class="role-tag role-{{ staging.user_role }}">
-                    {{ staging.user_role }}
-                </span>
+                {% if staging.username %}
+                    <strong style="color:#f0f6fc;">{{ staging.username }}</strong>
+                    <span class="role-tag role-{{ staging.user_role }}">
+                        {{ staging.user_role }}
+                    </span>
+                {% else %}
+                    <strong style="color:#f0f6fc;">
+                        {{ staging.anon_name or 'Anonymous' }}
+                    </strong>
+                    <span class="role-tag" style="background:#9e6a03; color:#ffd700;">
+                        ANON
+                    </span>
+                    {% if staging.anon_email %}
+                        <span style="color:#8b949e; font-size:0.9em;">
+                            &lt;{{ staging.anon_email }}&gt;
+                        </span>
+                    {% endif %}
+                {% endif %}
                 <span style="color:#8b949e;">wants to merge</span>
                 <code>{{ staging.branch_name }}</code>
                 <span style="color:#8b949e;">into</span>
