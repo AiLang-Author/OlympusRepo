@@ -46,11 +46,19 @@ GIT_SAFE_ARGS = [
 GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
 GIT_TIMEOUT_SECONDS = int(os.environ.get("OLYMPUSREPO_GIT_TIMEOUT", "300"))
 
-# Import guardrails. A 40GB repo pointed at a live web request will eat
-# the server alive; fail fast with a clear message instead.
-MAX_COMMITS = int(os.environ.get("OLYMPUSREPO_IMPORT_MAX_COMMITS", "50000"))
-MAX_TOTAL_BYTES = int(os.environ.get("OLYMPUSREPO_IMPORT_MAX_BYTES",
-                                     str(2 * 1024 * 1024 * 1024)))  # 2 GiB
+# Clone timeout is separate — network clones of large repos (Linux kernel)
+# can take 30+ minutes. 0 = no timeout (Python's subprocess.run default).
+GIT_CLONE_TIMEOUT = int(os.environ.get("OLYMPUSREPO_GIT_CLONE_TIMEOUT", "0")) or None
+
+# git log over 1M+ commits can take minutes. Give it 10x the normal
+# per-command timeout.
+GIT_LOG_TIMEOUT = int(os.environ.get("OLYMPUSREPO_GIT_LOG_TIMEOUT",
+                                     str(GIT_TIMEOUT_SECONDS * 10))) or None
+
+# Import guardrails. Set to 0 (the default) for unlimited.
+# Operators can cap imports via env vars if needed.
+MAX_COMMITS = int(os.environ.get("OLYMPUSREPO_IMPORT_MAX_COMMITS", "0"))  # 0 = unlimited
+MAX_TOTAL_BYTES = int(os.environ.get("OLYMPUSREPO_IMPORT_MAX_BYTES", "0"))  # 0 = unlimited
 
 # Paths we never want to suck into the object store. Matched as path
 # segments, not raw substrings, so "src/objects/model.py" is NOT skipped
@@ -62,15 +70,17 @@ SKIP_SEGMENTS = frozenset({
 SKIP_SUFFIXES = (".pyc", ".pyo")
 
 
-def _git(args: list, cwd: str) -> str:
+def _git(args: list, cwd: str, timeout: int = None) -> str:
     """Run a git command and return stdout (text)."""
+    if timeout is None:
+        timeout = GIT_TIMEOUT_SECONDS
     result = subprocess.run(
         [GIT_BIN, *GIT_SAFE_ARGS, *args],
         cwd=cwd,
         capture_output=True,
         text=True,
         check=True,
-        timeout=GIT_TIMEOUT_SECONDS,
+        timeout=timeout or None,
         env=GIT_ENV,
     )
     return result.stdout.strip()
@@ -132,6 +142,7 @@ def _get_commits(git_dir: str, branch: str) -> list[dict]:
         ["log", "--reverse", "--topo-order",
          f"--format={_COMMIT_FMT}", branch],
         git_dir,
+        timeout=GIT_LOG_TIMEOUT,
     )
     commits = []
     for record in raw.split("\x1f"):
@@ -220,6 +231,35 @@ class _CatFileBatch:
         self.proc.stdout.read(1)
         return data
 
+    def read_blob_by_hash(self, blob_hash: str) -> bytes | None:
+        """Read a blob directly by its git object hash."""
+        req = f"{blob_hash}\n".encode()
+        self.proc.stdin.write(req)
+        header = self.proc.stdout.readline()
+        if not header:
+            raise RuntimeError("git cat-file closed unexpectedly")
+        header_str = header.decode("utf-8", errors="replace").rstrip("\n")
+        if header_str.endswith(" missing"):
+            return None
+        try:
+            _sha, obj_type, size_str = header_str.split()
+            size = int(size_str)
+        except ValueError:
+            return None
+        if obj_type != "blob":
+            _ = self.proc.stdout.read(size + 1)
+            return None
+        data = b""
+        remaining = size
+        while remaining > 0:
+            chunk = self.proc.stdout.read(remaining)
+            if not chunk:
+                raise RuntimeError("git cat-file truncated blob")
+            data += chunk
+            remaining -= len(chunk)
+        self.proc.stdout.read(1)
+        return data
+
     def close(self):
         try:
             if self.proc.stdin:
@@ -237,9 +277,116 @@ def _list_tree(git_dir: str, commit_sha: str) -> list[str]:
     output = _git(
         ["ls-tree", "-r", "--name-only", commit_sha],
         git_dir,
+        timeout=GIT_LOG_TIMEOUT,
     )
     return [p for p in output.splitlines()
             if p.strip() and not _path_is_skipped(p)]
+
+
+# ---------------------------------------------------------------------------
+# diff-tree: only files that changed between parent and child
+# ---------------------------------------------------------------------------
+# git diff-tree -r --no-commit-id -M outputs lines like:
+#   :100644 100644 <old_hash> <new_hash> M\tpath
+#   :000000 100644 0000000.. <new_hash> A\tpath
+#   :100644 000000 <old_hash> 0000000.. D\tpath
+#   :100644 100644 <old_hash> <new_hash> R100\told_path\tnew_path
+#
+# Using -z for NUL termination is safer for paths with special chars.
+
+# Map git diff-tree status letters to our change_type values
+_STATUS_MAP = {
+    "A": "add",
+    "M": "modify",
+    "D": "delete",
+    "T": "modify",   # type change (e.g. file→symlink) — treat as modify
+    "C": "add",      # copy — the new path is effectively an add
+}
+
+
+def _diff_tree(git_dir: str, commit_sha: str, parent_sha: str) -> list[dict]:
+    """
+    Return list of changes between parent and commit.
+
+    Each entry: {
+        "path": str,
+        "change_type": "add" | "modify" | "delete" | "rename",
+        "old_hash": str | None,     # git blob hash (for reading via cat-file)
+        "new_hash": str | None,     # git blob hash
+        "old_path": str | None,     # only for renames
+    }
+    """
+    output = _git(
+        ["diff-tree", "-r", "--no-commit-id", "-M", "-z",
+         parent_sha, commit_sha],
+        git_dir,
+        timeout=GIT_LOG_TIMEOUT,
+    )
+
+    if not output:
+        return []
+
+    # -z output: NUL-separated fields. Each record is:
+    #   :<old_mode> <new_mode> <old_hash> <new_hash> <status>\0<path>\0
+    # For renames: ...<status>\0<old_path>\0<new_path>\0
+    parts = output.split("\0")
+    changes = []
+    i = 0
+    while i < len(parts):
+        raw = parts[i]
+        if not raw.startswith(":"):
+            i += 1
+            continue
+
+        # Parse: ":old_mode new_mode old_hash new_hash status"
+        meta = raw[1:]  # strip leading ':'
+        fields = meta.split()
+        if len(fields) < 5:
+            i += 1
+            continue
+
+        _old_mode, _new_mode, old_hash, new_hash, status = fields[:5]
+        null_hash = "0" * len(old_hash)
+
+        status_letter = status[0]  # R100 → R, C050 → C, etc.
+
+        if status_letter in ("R", "C"):
+            # Rename/copy: two path fields follow
+            if i + 2 >= len(parts):
+                break
+            old_path = parts[i + 1]
+            new_path = parts[i + 2]
+            i += 3
+
+            if _path_is_skipped(new_path):
+                continue
+            changes.append({
+                "path": new_path,
+                "change_type": "rename" if status_letter == "R" else "add",
+                "old_hash": old_hash if old_hash != null_hash else None,
+                "new_hash": new_hash if new_hash != null_hash else None,
+                "old_path": old_path if status_letter == "R" else None,
+            })
+        else:
+            # Single path field follows
+            if i + 1 >= len(parts):
+                break
+            path = parts[i + 1]
+            i += 2
+
+            if _path_is_skipped(path):
+                continue
+
+            change_type = _STATUS_MAP.get(status_letter, "modify")
+            changes.append({
+                "path": path,
+                "change_type": change_type,
+                "old_hash": old_hash if old_hash != null_hash else None,
+                "new_hash": new_hash if new_hash != null_hash else None,
+                "old_path": None,
+            })
+
+    return changes
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +412,10 @@ def import_git_repo(
       * committer_name, committer_email, committed_at
       * message        = full commit message body
       * is_imported    = TRUE
+
+    Root commits (no parents) store a full-tree snapshot. Subsequent
+    commits store only the diff from their first parent, making imports
+    O(total_changed_files) instead of O(commits * tree_size).
 
     Args:
         conn:        DB connection
@@ -297,20 +448,52 @@ def import_git_repo(
     # URL sources get cloned into a temp dir (argv invocation, no shell).
     # "--" terminator makes git treat the URL as a positional even if it
     # contains flag-like characters.
+    #
+    # Clone uses a separate, generous timeout (default: unlimited) because
+    # network clones of large repos (e.g. Linux kernel) can take 30+ min.
     if git_source.startswith(("http://", "https://", "git://", "git@")):
         tmp_dir = tempfile.mkdtemp(prefix="olympus_import_")
+        if progress_cb:
+            progress_cb(0, 0, f"Cloning {git_source}...")
         print(f"  Cloning {git_source}...")
         try:
-            subprocess.run(
-                [GIT_BIN, *GIT_SAFE_ARGS, "clone", "--quiet",
+            # Stream stderr so git's transfer progress is visible in logs
+            # and doesn't buffer in memory. stdout is unused for clone.
+            proc = subprocess.Popen(
+                [GIT_BIN, *GIT_SAFE_ARGS, "clone", "--bare", "--progress",
                  "--no-tags", "--no-recurse-submodules",
                  "--", git_source, tmp_dir],
-                check=True,
-                timeout=GIT_TIMEOUT_SECONDS,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 env=GIT_ENV,
-                capture_output=True,
                 text=True,
             )
+            # Read stderr line-by-line so we can relay progress.
+            # Git writes transfer stats as \r-terminated lines to stderr.
+            clone_buf = ""
+            while True:
+                chunk = proc.stderr.read(256)
+                if not chunk:
+                    break
+                clone_buf += chunk
+                # Extract the last \r or \n delimited line for progress
+                lines = clone_buf.replace("\r", "\n").split("\n")
+                for line in lines[:-1]:
+                    line = line.strip()
+                    if line:
+                        print(f"  [clone] {line}")
+                        if progress_cb:
+                            progress_cb(0, 0, line)
+                clone_buf = lines[-1]
+
+            rc = proc.wait()
+            if rc != 0:
+                raise subprocess.CalledProcessError(
+                    rc, proc.args, output="", stderr=clone_buf,
+                )
+        except subprocess.CalledProcessError:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
         except Exception:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
@@ -340,10 +523,10 @@ def import_git_repo(
         total = len(commits)
         if total == 0:
             raise ValueError(f"No commits found on branch '{branch}'")
-        if total > MAX_COMMITS:
+        if MAX_COMMITS and total > MAX_COMMITS:
             raise ValueError(
                 f"Repo has {total} commits; exceeds limit of {MAX_COMMITS}. "
-                f"Raise OLYMPUSREPO_IMPORT_MAX_COMMITS to override."
+                f"Set OLYMPUSREPO_IMPORT_MAX_COMMITS=0 for unlimited."
             )
         print(f"  Found {total} commit(s) on branch '{branch}'")
 
@@ -367,34 +550,70 @@ def import_git_repo(
 
         for i, c in enumerate(commits):
             subject = c["message"].splitlines()[0] if c["message"] else ""
+            is_root = not c["parents"]
+
             if progress_cb:
                 progress_cb(i + 1, total, subject[:60])
-            else:
+            elif i % 1000 == 0 or i == total - 1 or is_root:
+                # Reduce log spam on huge repos — print every 1000th commit
                 print(f"  [{i+1}/{total}] {c['sha'][:8]} {subject[:60]}")
 
-            # Gather file list + contents for this commit via the
-            # long-lived cat-file process.
-            paths = _list_tree(git_dir, c["sha"])
-            file_list: list[tuple[str, bytes]] = []
-            for path in paths:
-                blob = batch.read_blob(c["sha"], path)
-                if blob is None:
-                    continue
-                file_list.append((path, blob))
-                total_bytes += len(blob)
-                if total_bytes > MAX_TOTAL_BYTES:
-                    raise ValueError(
-                        f"Import exceeded {MAX_TOTAL_BYTES} bytes; aborting."
-                    )
+            if is_root:
+                # Root commit (no parents) — full snapshot via ls-tree.
+                # This is the anchor that materialize_tree walks back to.
+                paths = _list_tree(git_dir, c["sha"])
+                file_changes = []
+                for path in paths:
+                    blob = batch.read_blob(c["sha"], path)
+                    if blob is None:
+                        continue
+                    file_changes.append({
+                        "path": path,
+                        "change_type": "add",
+                        "content": blob,
+                        "old_path": None,
+                    })
+                    total_bytes += len(blob)
+                    if MAX_TOTAL_BYTES and total_bytes > MAX_TOTAL_BYTES:
+                        raise ValueError(
+                            f"Import exceeded {MAX_TOTAL_BYTES} bytes; aborting. "
+                            f"Set OLYMPUSREPO_IMPORT_MAX_BYTES=0 for unlimited."
+                        )
+            else:
+                # Non-root commit — diff-tree against first parent.
+                # Only reads blobs for files that actually changed.
+                parent_sha = c["parents"][0]
+                diff_entries = _diff_tree(git_dir, c["sha"], parent_sha)
 
-            # Write blobs to the object store, build changeset rows, and
-            # insert the commit row with full metadata. Parents are
-            # stored as the original git SHA array — no id translation
-            # needed because commit_hash IS the git SHA on imported rows.
-            #
-            # This assumes repo_mod.import_commit_row() wraps the call to
-            # SQL function repo_insert_imported_commit() from 015. See
-            # the accompanying repo_mod changes for the signature.
+                file_changes = []
+                for entry in diff_entries:
+                    if entry["change_type"] == "delete":
+                        # Deletes don't need blob content
+                        file_changes.append({
+                            "path": entry["path"],
+                            "change_type": "delete",
+                            "content": None,
+                            "old_path": entry.get("old_path"),
+                        })
+                        continue
+
+                    # add, modify, rename — read the new blob
+                    blob = batch.read_blob(c["sha"], entry["path"])
+                    if blob is None:
+                        continue
+                    file_changes.append({
+                        "path": entry["path"],
+                        "change_type": entry["change_type"],
+                        "content": blob,
+                        "old_path": entry.get("old_path"),
+                    })
+                    total_bytes += len(blob)
+                    if MAX_TOTAL_BYTES and total_bytes > MAX_TOTAL_BYTES:
+                        raise ValueError(
+                            f"Import exceeded {MAX_TOTAL_BYTES} bytes; aborting. "
+                            f"Set OLYMPUSREPO_IMPORT_MAX_BYTES=0 for unlimited."
+                        )
+
             repo_mod.import_commit_row(
                 conn,
                 repo_id=repo_id,
@@ -410,11 +629,11 @@ def import_git_repo(
                 committed_at_epoch=c["committer_time"],
                 committer_tz_offset=c["committer_tz"],
                 message=c["message"],
-                files=file_list,
+                file_changes=file_changes,
                 objects_dir=objects_dir,
             )
             imported += 1
-            total_files += len(file_list)
+            total_files += len(file_changes)
 
         # Point the default ref at the tip of the imported branch.
         tip_sha = commits[-1]["sha"]

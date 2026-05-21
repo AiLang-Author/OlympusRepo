@@ -52,6 +52,7 @@ PUBLIC_URL=""
 NETWORK_MODE=""
 ENV_FILE=".env"
 SHELL_RC=""
+SYSTEMD_STARTED=0
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -819,7 +820,15 @@ if [[ "$OS" == "linux" ]] && [[ "$MODE" != "contributor" ]]; then
       sudo systemctl daemon-reload
       sudo systemctl enable olympusrepo.service
       success "Service installed and enabled"
-      info "Start it with: sudo systemctl start olympusrepo"
+      info "Starting olympusrepo service..."
+      sudo systemctl start olympusrepo.service
+      if systemctl is-active --quiet olympusrepo.service; then
+        success "olympusrepo service is running"
+        SYSTEMD_STARTED=1
+      else
+        warn "Service installed but failed to start. Check: sudo journalctl -u olympusrepo -f"
+        SYSTEMD_STARTED=0
+      fi
       info "Check status:  sudo systemctl status olympusrepo"
       info "View logs:     sudo journalctl -u olympusrepo -f"
     fi
@@ -912,3 +921,30 @@ echo -e "  ${CYAN}source ${SHELL_RC}${RESET}"
 echo ""
 divider
 echo ""
+
+# =============================================================================
+# STEP 13 — Offer to start the server
+# =============================================================================
+if [[ "$MODE" != "contributor" && "$SYSTEMD_STARTED" -eq 0 ]]; then
+  divider
+  echo -e "${BOLD}  STEP 13 — Start Server${RESET}"
+  divider
+  read -rp "  Start the OlympusRepo server now? [Y/n]: " start_now
+  if [[ "${start_now:-Y}" =~ ^[Yy]$ ]]; then
+    info "Starting uvicorn on port ${APP_PORT}..."
+    echo ""
+    if [[ "$NEED_VENV" -eq 1 ]]; then
+      source "${INSTALL_ABS}/.venv/bin/activate" 2>/dev/null || true
+    fi
+    set -a; source "${INSTALL_ABS}/${ENV_FILE}" 2>/dev/null; set +a
+    exec uvicorn olympusrepo.web.app:app --host 0.0.0.0 --port "${APP_PORT}" --reload
+  else
+    info "Skipped. Start manually with:"
+    echo ""
+    if [[ "$NEED_VENV" -eq 1 ]]; then
+      echo -e "  ${CYAN}source .venv/bin/activate${RESET}"
+    fi
+    echo -e "  ${CYAN}uvicorn olympusrepo.web.app:app --host 0.0.0.0 --port ${APP_PORT} --reload${RESET}"
+    echo ""
+  fi
+fi

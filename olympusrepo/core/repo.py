@@ -833,18 +833,28 @@ def import_commit_row(
     committed_at_epoch: int,
     committer_tz_offset: str = "+0000",
     message: str,
-    files: list,
+    file_changes: list = None,
     objects_dir: str,
+    # Legacy compat: callers using the old (path, content) tuple list
+    files: list = None,
 ) -> dict:
     """
     Insert one git-imported commit with full fidelity.
 
-    - Writes every file to the blob store (idempotent by content hash)
-    - Inserts repo_changesets rows for each file as 'add' (imports treat
-      each commit as a full snapshot; diffs are reconstructable later
-      from parent tree comparison if/when needed)
-    - Inserts repo_commits via repo_insert_imported_commit() SQL function,
-      which sets is_imported = TRUE and lets Postgres assign rev
+    Accepts file_changes as a list of dicts:
+        {
+            "path":        str,
+            "change_type": "add" | "modify" | "delete" | "rename",
+            "content":     bytes | None,   (None for deletes)
+            "old_path":    str | None,     (only for renames)
+        }
+
+    Root commits (no parents) should pass all files as "add". Non-root
+    commits should pass only the diff from their first parent. This
+    makes the import O(total_changed_files) instead of O(commits * tree).
+
+    Also accepts the legacy `files` kwarg (list of (path, content) tuples)
+    for backward compatibility — these are treated as all-"add".
 
     Returns {"commit_hash": str, "rev": int, "files_written": int}.
 
@@ -858,15 +868,38 @@ def import_commit_row(
     authored_at = datetime.fromtimestamp(authored_at_epoch, tz=timezone.utc)
     committed_at = datetime.fromtimestamp(committed_at_epoch, tz=timezone.utc)
 
+    # Normalize legacy callers: convert (path, content) tuples to dicts
+    if file_changes is None and files is not None:
+        file_changes = [
+            {"path": p, "change_type": "add", "content": c, "old_path": None}
+            for p, c in files
+        ]
+    if file_changes is None:
+        file_changes = []
+
     # 1. Store blobs. objects.store_blob is idempotent on hash collisions
-    #    so re-imports and shared files are cheap. (Patch 5 docstring
-    #    referred to it as write_blob; the actual API name is store_blob
-    #    and content is the first positional arg.)
+    #    so re-imports and shared files are cheap.
     files_written = 0
-    path_to_blob = {}
-    for path, content in files:
+    changeset_rows = []
+    blob_hashes = set()
+
+    for entry in file_changes:
+        path = entry["path"]
+        ctype = entry["change_type"]
+        content = entry.get("content")
+        old_path = entry.get("old_path")
+
+        if ctype == "delete":
+            # No blob to store for deletes
+            changeset_rows.append((commit_hash, path, "delete", None, None, old_path))
+            continue
+
+        if content is None:
+            continue  # skip malformed entries
+
         blob_hash = objects.store_blob(content, objects_dir)
-        path_to_blob[path] = blob_hash
+        blob_hashes.add(blob_hash)
+        changeset_rows.append((commit_hash, path, ctype, None, blob_hash, old_path))
         files_written += 1
 
     with conn.cursor() as cur:
@@ -916,7 +949,7 @@ def import_commit_row(
         # byte_offset = NULL for loose objects per the constraint added
         # in migration 017 (byte_offset_matches_pack); only packed
         # objects get a real offset.
-        if path_to_blob:
+        if blob_hashes:
             cur.executemany(
                 """
                 INSERT INTO repo_objects
@@ -925,26 +958,23 @@ def import_commit_row(
                     (%s, %s, NULL, 0, 'blob')
                 ON CONFLICT (object_hash) DO NOTHING
                 """,
-                [(h, repo_id) for h in set(path_to_blob.values())],
+                [(h, repo_id) for h in blob_hashes],
             )
 
-        # 4. Changesets. For imports we record every file as 'add' at
-        #    its commit; real add/modify/delete diffs would require
-        #    comparing trees between parent and this commit. That's a
-        #    future optimization — the data we've stored is sufficient
-        #    to compute real diffs on demand later.
-        if path_to_blob:
+        # 4. Changesets with proper change types (add/modify/delete/rename).
+        if changeset_rows:
             cur.executemany(
                 """
                 INSERT INTO repo_changesets
                     (commit_hash, path, change_type,
                      blob_before, blob_after,
-                     lines_added, lines_removed)
-                VALUES (%s, %s, 'add', NULL, %s, 0, 0)
+                     lines_added, lines_removed, old_path)
+                VALUES (%s, %s, %s, %s, %s, 0, 0, %s)
                 ON CONFLICT (commit_hash, path) DO NOTHING
                 """,
-                [(commit_hash, path, blob_hash)
-                 for path, blob_hash in path_to_blob.items()],
+                [(sha, path, ctype, blob_before, blob_after, old_path)
+                 for sha, path, ctype, blob_before, blob_after, old_path
+                 in changeset_rows],
             )
 
     return {

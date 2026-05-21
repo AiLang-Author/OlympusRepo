@@ -832,6 +832,21 @@ def import_git_page(request: Request, conn=Depends(get_db)):
     })
 
 
+# ---------------------------------------------------------------------------
+# Import: background task + SSE progress
+# ---------------------------------------------------------------------------
+# Imports can take minutes to hours (Linux kernel). Running them in the
+# request thread (even via run_in_executor) means the browser connection
+# must survive the whole duration — any proxy/keep-alive timeout kills it.
+#
+# Instead: POST /import validates and kicks off a background thread,
+# returning immediately. The browser then opens an SSE stream at
+# GET /import/progress/{job_id} for live updates.
+import uuid as _uuid
+
+_import_jobs: dict[str, dict] = {}   # job_id -> {status, progress, result, error}
+
+
 @app.post("/import", response_class=HTMLResponse)
 async def import_git_submit(
     request: Request,
@@ -848,11 +863,12 @@ async def import_git_submit(
     repo_name = repo_name.strip()
     branch    = branch.strip()
 
-    def _render(error=None, success=None):
+    def _render(error=None, success=None, job_id=None):
         return templates.TemplateResponse(request, "import_git.html", {
             "user":      user,
             "error":     error,
             "success":   success,
+            "job_id":    job_id,
             "git_url":   git_url if error else "",
             "repo_name": repo_name if error else "",
         })
@@ -879,37 +895,118 @@ async def import_git_submit(
         os.path.join(os.path.dirname(__file__), "..", "..", "objects")
     )
 
+    # Create a job and kick off the import in a background thread.
+    job_id = _uuid.uuid4().hex[:12]
+    _import_jobs[job_id] = {
+        "status":   "running",
+        "current":  0,
+        "total":    0,
+        "message":  "Starting import...",
+        "result":   None,
+        "error":    None,
+    }
+
     from ..core import import_git as ig
-    try:
-        result = ig.import_git_repo(
-            conn=conn,
-            git_source=git_url,
-            repo_name=repo_name,
-            user_id=user["user_id"],
-            objects_dir=objects_dir,
-            branch=branch or None,
-        )
-        db.audit_log(conn, "git_import", user_id=user["user_id"],
-                     target_type="repo", target_id=repo_name,
-                     details={"source": git_url, "branch": branch or ""})
-        return _render(success=result)
-    except subprocess.TimeoutExpired:
-        return _render("Git clone timed out. Try a smaller repo or local path.")
-    except subprocess.CalledProcessError as e:
-        # Surface git's actual stderr so the user can see 'repo not found',
-        # 'auth required', cert issues, etc. — not just the opaque rc.
-        detail = (getattr(e, "stderr", "") or "").strip()
-        if detail:
-            # Trim long diagnostic chatter to one screenful.
-            detail = detail.replace("\r", "").strip()
-            if len(detail) > 400:
-                detail = detail[:400] + "…"
-            return _render(f"Git command failed (rc {e.returncode}): {detail}")
-        return _render(f"Git command failed with exit code {e.returncode} (no stderr captured — check server console).")
-    except ValueError as e:
-        return _render(str(e))
-    except Exception as e:
-        return _render(f"Import failed: {e}")
+
+    def _progress_cb(current, total, message):
+        job = _import_jobs.get(job_id)
+        if job:
+            job["current"] = current
+            job["total"] = total
+            job["message"] = message
+
+    def _run_import():
+        # Get a fresh DB connection for this thread
+        import_conn = db.connect()
+        try:
+            result = ig.import_git_repo(
+                conn=import_conn,
+                git_source=git_url,
+                repo_name=repo_name,
+                user_id=user["user_id"],
+                objects_dir=objects_dir,
+                branch=branch or None,
+                progress_cb=_progress_cb,
+            )
+            db.audit_log(import_conn, "git_import", user_id=user["user_id"],
+                         target_type="repo", target_id=repo_name,
+                         details={"source": git_url, "branch": branch or ""})
+            import_conn.commit()
+            _import_jobs[job_id]["status"] = "done"
+            _import_jobs[job_id]["result"] = result
+        except Exception as e:
+            import_conn.rollback()
+            _import_jobs[job_id]["status"] = "error"
+            err_detail = str(e)
+            if isinstance(e, subprocess.CalledProcessError):
+                stderr = (getattr(e, "stderr", "") or "").strip()
+                if stderr:
+                    stderr = stderr.replace("\r", "").strip()
+                    if len(stderr) > 400:
+                        stderr = stderr[:400] + "…"
+                    err_detail = f"Git command failed (rc {e.returncode}): {stderr}"
+            _import_jobs[job_id]["error"] = err_detail
+        finally:
+            try:
+                import_conn.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_run_import, daemon=True)
+    t.start()
+
+    return _render(job_id=job_id)
+
+
+@app.get("/import/progress/{job_id}")
+async def import_progress_sse(job_id: str, request: Request):
+    """SSE endpoint: streams import progress to the browser."""
+    from starlette.responses import StreamingResponse
+
+    async def _event_stream():
+        last_msg = ""
+        while True:
+            job = _import_jobs.get(job_id)
+            if not job:
+                yield f"data: {json_mod.dumps({'status': 'unknown'})}\n\n"
+                return
+
+            payload = {
+                "status":  job["status"],
+                "current": job["current"],
+                "total":   job["total"],
+                "message": job["message"],
+            }
+
+            if job["status"] == "done":
+                payload["result"] = job["result"]
+                yield f"data: {json_mod.dumps(payload)}\n\n"
+                # Clean up after a short delay
+                _import_jobs.pop(job_id, None)
+                return
+
+            if job["status"] == "error":
+                payload["error"] = job["error"]
+                yield f"data: {json_mod.dumps(payload)}\n\n"
+                _import_jobs.pop(job_id, None)
+                return
+
+            # Only send if something changed
+            msg_key = f"{job['current']}:{job['message']}"
+            if msg_key != last_msg:
+                yield f"data: {json_mod.dumps(payload)}\n\n"
+                last_msg = msg_key
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering
+        },
+    )
 
 
 # =========================================================================

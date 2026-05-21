@@ -9,8 +9,8 @@ tree at any commit. Needed anywhere we need to emit a complete tree
 (fast-import for push, gateway sync, file browsing at arbitrary revs).
 
 Algorithm:
-  Walk parents backward until we hit an anchor — either a root commit
-  or an imported commit (which has a full snapshot from import_git.py).
+  Walk parents backward until we hit an anchor — a root commit (no
+  parents) whose changesets represent a full snapshot of the tree.
   Then apply changesets forward from anchor to target.
 
 Correctness notes:
@@ -55,8 +55,11 @@ def _ancestor_chain_to_anchor(
     conn, repo_id: int, commit_hash: str,
 ) -> list[str]:
     """
-    Return [target, parent, grandparent, ...] stopping at the first
-    imported commit or a root. Follows first-parent on merges.
+    Return [target, parent, grandparent, ...] stopping at a root commit
+    (no parents). Follows first-parent on merges.
+
+    Root commits store full-tree snapshots as all-"add" changesets,
+    making them valid anchors for forward replay.
     """
     chain: list[str] = []
     visited: set[str] = set()
@@ -66,7 +69,7 @@ def _ancestor_chain_to_anchor(
         visited.add(sha)
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT is_imported, parent_hashes
+                SELECT parent_hashes
                 FROM repo_commits
                 WHERE commit_hash = %s AND repo_id = %s
             """, (sha, repo_id))
@@ -74,12 +77,12 @@ def _ancestor_chain_to_anchor(
         if not row:
             # Dangling parent (shallow import). Treat as anchor.
             break
-        is_imported, parents = row
+        parents = row[0]
         chain.append(sha)
-        if is_imported:
-            # Imports store full snapshots — stop here.
+        if not parents:
+            # Root commit — full snapshot anchor. Stop here.
             break
-        sha = (parents or [None])[0]
+        sha = parents[0]
     return chain
 
 
