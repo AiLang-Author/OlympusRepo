@@ -155,7 +155,7 @@ COOKIE_SECURE = os.getenv("OLYMPUSREPO_COOKIE_SECURE", "0") == "1"
 
 
 # =========================================================================
-# SECURITY MIDDLEWARE (RenkuOS hardening — docs/SECURITY_AUDIT.md)
+# SECURITY MIDDLEWARE (hardening — docs/SECURITY_AUDIT.md)
 #   * Same-origin check on state-changing requests that carry a session
 #     cookie (defence in depth on top of SameSite=Strict).
 #   * Baseline security headers on every response.

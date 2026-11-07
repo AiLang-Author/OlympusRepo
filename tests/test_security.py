@@ -1,10 +1,9 @@
-"""Regression tests for the RenkuOS security fixes. Run after test_tracker.py
+"""Regression tests for the security fixes in docs/SECURITY_AUDIT.md.
+Destructive: wipes users and repositories. Throwaway DB only (tests/README.md)."""
 import os as _os
 if _os.environ.get("OLYMPUSREPO_DESTRUCTIVE_TESTS") != "1":
     raise SystemExit("Refusing to run: this test WIPES repo_users/repo_repositories. "
                      "Point OLYMPUSREPO_DB_* at a throwaway database and set OLYMPUSREPO_DESTRUCTIVE_TESTS=1.")
-
-(reuses its users/repos: zeus2 owner, dev writer on 'haiku', outsider)."""
 import base64, sys, hashlib
 from fastapi.testclient import TestClient
 from olympusrepo.core import db

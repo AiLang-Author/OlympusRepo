@@ -142,7 +142,7 @@ CREATE INDEX IF NOT EXISTS idx_git_pull_log_repo
 -- The key lives in repo_server_config rather than in a file so that
 -- backups of the database are self-contained. Operators who want
 -- defense-in-depth should additionally encrypt the database at rest.
--- RenkuOS fork: the credential key no longer lives in the database.
+-- The credential key no longer lives in the database.
 -- See olympusrepo/core/credbox.py. (Upstream inserted git_creds_key here;
 -- existing values are migrated and deleted at app startup.)
 SELECT 1;
