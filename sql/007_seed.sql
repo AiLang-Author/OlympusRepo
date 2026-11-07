@@ -1,19 +1,10 @@
 -- sql/007_seed.sql
--- Optional seed data: default zeus account
--- Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering
--- License: MIT
+-- Intentionally empty in the RenkuOS fork.
 --
--- Creates a default 'zeus' account with password 'changeme'.
--- CHANGE THIS PASSWORD IMMEDIATELY AFTER FIRST LOGIN.
+-- Upstream created a 'zeus' account with password 'changeme' here. setup.sh
+-- runs every sql/0*.sql file, so every install got that account in addition
+-- to the real admin setup.sh creates interactively. 021_security.sql disables
+-- any account still using that password.
 --
--- To skip seeding, do not run this file.
-
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM repo_users WHERE username = 'zeus') THEN
-        PERFORM repo_create_user('zeus', 'changeme', 'zeus', 'Zeus (default admin)', NULL);
-        RAISE NOTICE 'Default zeus account created. CHANGE THE PASSWORD IMMEDIATELY.';
-    ELSE
-        RAISE NOTICE 'User zeus already exists, skipping seed.';
-    END IF;
-END $$;
+-- Create the first admin with ./setup.sh (or `olympusrepo user create`).
+SELECT 1;

@@ -72,6 +72,36 @@ def _parse_basic_auth(header: str) -> tuple[str, str] | None:
     return user, password
 
 
+# Failed-auth limiter for Basic auth. Without it, the smart-HTTP endpoint
+# was an unthrottled password oracle that bypassed the web login limit.
+import threading as _threading
+_fail_lock = _threading.Lock()
+_fail_log: dict = {}          # ip -> [timestamps]
+_FAIL_MAX = int(os.environ.get("OLYMPUSREPO_GIT_AUTH_MAX_FAILURES", "10"))
+_FAIL_WINDOW = 900
+
+
+def _client_ip(request: Request) -> str:
+    if os.environ.get("OLYMPUSREPO_TRUST_FORWARDED_FOR") == "1":
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            return xff.split(",")[-1].strip()
+    return request.client.host if request.client else "0.0.0.0"
+
+
+def _too_many_failures(ip: str) -> bool:
+    cutoff = time.time() - _FAIL_WINDOW
+    with _fail_lock:
+        hits = [t for t in _fail_log.get(ip, ()) if t >= cutoff]
+        _fail_log[ip] = hits
+        return len(hits) >= _FAIL_MAX
+
+
+def _record_failure(ip: str) -> None:
+    with _fail_lock:
+        _fail_log.setdefault(ip, []).append(time.time())
+
+
 async def authenticate(request: Request) -> AuthContext:
     """
     Extract and validate Basic auth. No creds = anonymous (scope ['public']).
@@ -83,30 +113,41 @@ async def authenticate(request: Request) -> AuthContext:
     if parsed is None:
         return AuthContext(user_id=None, via="anon", scopes=["public"])
 
+    ip = _client_ip(request)
+    if _too_many_failures(ip):
+        raise HTTPException(status_code=429, detail="too many failed logins",
+                            headers={"Retry-After": str(_FAIL_WINDOW)})
+
     username, password = parsed
     conn = db_mod.connect()
+    try:
+        # PAT path: password field starts with the olyp_ prefix.
+        if password.startswith(pats.TOKEN_PREFIX):
+            result = pats.verify_pat(conn, password)
+            conn.commit()   # keep the last_used_at stamp
+            if not result:
+                _record_failure(ip)
+                raise HTTPException(status_code=401, detail="invalid token")
+            return AuthContext(
+                user_id=result["user_id"], via="pat", scopes=result["scopes"],
+            )
 
-    # PAT path: password field starts with the olyp_ prefix.
-    if password.startswith(pats.TOKEN_PREFIX):
-        result = pats.verify_pat(conn, password)
-        if not result:
-            raise HTTPException(status_code=401, detail="invalid token")
+        # Password path.
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT repo_verify_password(%s, %s)", (username, password),
+            )
+            user_id = cur.fetchone()[0]
+        conn.commit()
+        if not user_id:
+            _record_failure(ip)
+            raise HTTPException(status_code=401, detail="invalid credentials")
         return AuthContext(
-            user_id=result["user_id"], via="pat", scopes=result["scopes"],
+            user_id=user_id, via="password",
+            scopes=["git:read", "git:write", "api:read", "api:write"],
         )
-
-    # Password path.
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT repo_verify_password(%s, %s)", (username, password),
-        )
-        user_id = cur.fetchone()[0]
-    if not user_id:
-        raise HTTPException(status_code=401, detail="invalid credentials")
-    return AuthContext(
-        user_id=user_id, via="password",
-        scopes=["git:read", "git:write", "api:read", "api:write"],
-    )
+    finally:
+        conn.close()
 
 
 def _challenge() -> Response:

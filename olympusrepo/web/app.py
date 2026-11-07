@@ -50,7 +50,7 @@ def _rate_limit(request: Request, route_key: str,
                 max_hits: int, window_sec: int) -> None:
     """Raise 429 if the caller has exceeded max_hits for this route
     inside the trailing window_sec seconds. Sets a Retry-After header."""
-    ip = request.client.host if request.client else "unknown"
+    ip = _client_ip(request)
     key = (route_key, ip)
     now = time.time()
     cutoff = now - window_sec
@@ -138,6 +138,57 @@ TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "templates")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
 COOKIE_SECURE = os.getenv("OLYMPUSREPO_COOKIE_SECURE", "0") == "1"
+
+
+# =========================================================================
+# SECURITY MIDDLEWARE (RenkuOS hardening — docs/SECURITY_AUDIT.md)
+#   * Same-origin check on state-changing requests that carry a session
+#     cookie (defence in depth on top of SameSite=Strict).
+#   * Baseline security headers on every response.
+# Git smart-HTTP (Basic auth) and signed federation offers carry no session
+# cookie and are unaffected.
+# =========================================================================
+from urllib.parse import urlsplit as _urlsplit
+
+_UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_EXTRA_ORIGINS = {o.strip().rstrip("/") for o in
+                  os.getenv("OLYMPUSREPO_TRUSTED_ORIGINS", "").split(",") if o.strip()}
+_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        "connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; "
+        "frame-ancestors 'none'; form-action 'self'")
+
+
+def _origin_ok(request: Request) -> bool:
+    src = request.headers.get("origin") or request.headers.get("referer")
+    if not src:
+        return True   # non-browser client; browsers always send Origin on cross-site POST
+    if src == "null":
+        return False
+    parts = _urlsplit(src)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    if origin.rstrip("/") in _EXTRA_ORIGINS:
+        return True
+    host = request.headers.get("x-forwarded-host") if os.getenv(
+        "OLYMPUSREPO_TRUST_FORWARDED_FOR") == "1" else None
+    return parts.netloc == (host or request.headers.get("host", ""))
+
+
+@app.middleware("http")
+async def _security_middleware(request: Request, call_next):
+    if (request.method in _UNSAFE_METHODS and request.cookies.get("session_id")
+            and not _origin_ok(request)):
+        return JSONResponse({"detail": "Cross-origin request refused."}, status_code=403)
+    response = await call_next(request)
+    h = response.headers
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("Referrer-Policy", "same-origin")
+    h.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    h.setdefault("Content-Security-Policy", _CSP)
+    if COOKIE_SECURE:
+        h.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return response
 
 
 @app.exception_handler(403)
@@ -962,6 +1013,13 @@ async def import_git_submit(
 async def import_progress_sse(job_id: str, request: Request):
     """SSE endpoint: streams import progress to the browser."""
     from starlette.responses import StreamingResponse
+    _c = db.connect()
+    try:
+        _u = get_current_user(request, _c)
+    finally:
+        _c.close()
+    if not _u or _u["role"] != "zeus":
+        raise HTTPException(403)
 
     async def _event_stream():
         last_msg = ""
@@ -1201,9 +1259,11 @@ def _client_ip(request: Request) -> str:
     """Return the client's IP. Trusts X-Forwarded-For only when this
     server is configured to sit behind a proxy (env var)."""
     if os.environ.get("OLYMPUSREPO_TRUST_FORWARDED_FOR") == "1":
+        # The left-most entries are supplied by the client and can be forged;
+        # the right-most is the address our own reverse proxy saw.
         xff = request.headers.get("x-forwarded-for", "")
         if xff:
-            return xff.split(",")[0].strip()
+            return xff.split(",")[-1].strip()
     return request.client.host if request.client else "0.0.0.0"
 
 
@@ -1308,6 +1368,10 @@ async def submit_anon_offering(name: str, request: Request,
 
     if website.strip():
         raise HTTPException(400, "Spam check failed.")
+    try:
+        path = repo.normalize_repo_path(path)
+    except repo.UnsafePathError as e:
+        raise HTTPException(400, f"Unsafe path: {e}")
 
     if len(new_content.encode("utf-8", errors="replace")) > _ANON_MAX_DIFF_BYTES:
         raise HTTPException(413,
@@ -2088,9 +2152,13 @@ async def upload_files(name: str, request: Request,
         content = await f.read()
         # Use the filename field which contains the relative path
         # e.g. "src/main.py" not just "main.py"
-        filepath = f.filename.replace("\\", "/").lstrip("/")
+        filepath = (f.filename or "").replace("\\", "/").lstrip("/")
         if not filepath:
             continue
+        try:
+            filepath = repo.normalize_repo_path(filepath)
+        except repo.UnsafePathError as e:
+            raise HTTPException(400, f"Unsafe path {f.filename!r}: {e}")
         # Skip ignored patterns
         ignored = ["__pycache__", ".pyc", ".git", "node_modules",
                    ".venv", ".DS_Store", ".olympusrepo"]
@@ -2290,7 +2358,9 @@ def config_page(request: Request, conn=Depends(get_db)):
     user = get_current_user(request, conn)
     if not user or user["role"] != "zeus":
         raise HTTPException(403, "Only Zeus can access server config.")
-    config = db.query(conn, "SELECT key, value, updated_at FROM repo_server_config ORDER BY key")
+    # Secrets (credential-encryption key) never leave the server.
+    config = db.query(conn, """SELECT key, value, updated_at FROM repo_server_config
+                                WHERE key NOT IN ('git_creds_key') ORDER BY key""")
     return templates.TemplateResponse(request, "config.html", {"user": user, "config": config})
 
 @app.post("/api/admin/config")
@@ -2342,6 +2412,16 @@ def set_config_value(request: Request,
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise HTTPException(400,
                 "instance_url must be a full http/https URL")
+    elif key == "offer_policy":
+        if value not in ("trusted", "open", "closed"):
+            raise HTTPException(400, "offer_policy must be one of: trusted, open, closed")
+    elif key == "offer_trusted_keys":
+        keys = [k for k in re.split(r"[\s,]+", value) if k]
+        if any(not re.fullmatch(r"[0-9a-fA-F]{64}", k) for k in keys):
+            raise HTTPException(400, "offer_trusted_keys: comma/space separated 64-hex Ed25519 public keys")
+        value = ",".join(k.lower() for k in keys)
+        db.execute(conn, "INSERT INTO repo_server_config (key, value) VALUES (%s, '') "
+                         "ON CONFLICT (key) DO NOTHING", (key,), commit=False)
     elif key == "instance_name":
         if not re.match(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,62}$", value):
             raise HTTPException(400,
@@ -2735,11 +2815,14 @@ def request_password_reset(request: Request,
 
     # Generate token
     import secrets
+    import hashlib
     token = secrets.token_hex(32)
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    # Only the digest is stored; a DB dump can't be replayed into resets.
     db.execute(conn, """
-        INSERT INTO repo_password_resets (user_id, token, expires_at)
-        VALUES (%s, %s, NOW() + INTERVAL '1 hour')
-    """, (user["user_id"], token), commit=False)
+        INSERT INTO repo_password_resets (user_id, token, token_sha256, expires_at)
+        VALUES (%s, %s, %s, NOW() + INTERVAL '1 hour')
+    """, (user["user_id"], digest, digest), commit=False)
     db.audit_log(conn, "password_reset_request", user_id=user["user_id"],
                  target_type="user", target_id=user["username"],
                  commit=False)
@@ -2769,8 +2852,9 @@ def do_password_reset(request: Request,
     row = db.query_one(conn, """
         SELECT r.*, u.username FROM repo_password_resets r
           JOIN repo_users u ON u.user_id = r.user_id
-         WHERE r.token = %s AND r.used = FALSE AND r.expires_at > NOW()
-    """, (token,))
+         WHERE r.token_sha256 = %s AND r.used = FALSE AND r.expires_at > NOW()
+           AND u.is_active
+    """, (__import__("hashlib").sha256(token.encode()).hexdigest(),))
     if not row:
         raise HTTPException(400, "Invalid or expired reset token.")
 
@@ -3210,6 +3294,8 @@ def get_commit_comments(name: str, commit_hash: str,
     user = get_current_user(request, conn)
     r = repo.get_repo(conn, name)
     if not r:
+        raise HTTPException(404)
+    if not repo.check_visibility(conn, r["repo_id"], user["user_id"] if user else None):
         raise HTTPException(404)
 
     return db.query(conn, """
@@ -3690,10 +3776,10 @@ def sync_info(name: str, request: Request, conn=Depends(get_db)):
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
-    if r["visibility"] == "private":
-        user = get_current_user(request, conn)
-        if not user:
-            raise HTTPException(403)
+    _sync_user = get_current_user(request, conn)
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 _sync_user["user_id"] if _sync_user else None):
+        raise HTTPException(404)
 
     latest = db.query_one(conn, """
         SELECT c.rev, c.commit_hash, c.committed_at
@@ -3723,10 +3809,10 @@ def sync_commits(name: str, request: Request,
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
-    if r["visibility"] == "private":
-        user = get_current_user(request, conn)
-        if not user:
-            raise HTTPException(403)
+    _sync_user = get_current_user(request, conn)
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 _sync_user["user_id"] if _sync_user else None):
+        raise HTTPException(404)
 
     commits = db.query(conn, """
         SELECT c.rev, c.commit_hash, c.tree_hash,
@@ -3761,14 +3847,22 @@ def sync_blob(name: str, blob_hash: str,
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
-    if r["visibility"] == "private":
-        user = get_current_user(request, conn)
-        if not user:
-            raise HTTPException(403)
+    _sync_user = get_current_user(request, conn)
+    if not repo.check_visibility(conn, r["repo_id"],
+                                 _sync_user["user_id"] if _sync_user else None):
+        raise HTTPException(404)
 
     # Validate hash format
     if not re.match(r'^[a-f0-9]{64}$', blob_hash):
         raise HTTPException(400, "Invalid blob hash.")
+    # The object store is shared across repos, so the hash alone must not
+    # be enough: only serve blobs that belong to this repo's history.
+    if not db.query_scalar(conn, """
+            SELECT EXISTS (SELECT 1 FROM repo_changesets cs
+                             JOIN repo_commits c ON c.commit_hash = cs.commit_hash
+                            WHERE c.repo_id = %s AND cs.blob_after = %s)""",
+            (r["repo_id"], blob_hash)):
+        raise HTTPException(404, "Blob not found.")
 
     objects_dir = os.environ.get(
         "OLYMPUSREPO_OBJECTS_DIR",
@@ -3806,11 +3900,26 @@ async def receive_offer(name: str, request: Request,
     The signer's public_key identifies the remote contributor; the claimed
     ``offered_by`` label is informational only.
     """
+    _rate_limit(request, "sync_offer", max_hits=20, window_sec=3600)
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
 
-    envelope = await request.json()
+    # Cap the body before parsing: base64 inflates by 4/3, plus metadata.
+    max_body = MAX_OFFER_BLOB_BYTES * 4 // 3 + 4 * 1024 * 1024
+    try:
+        declared = int(request.headers.get("content-length", "0"))
+    except ValueError:
+        declared = 0
+    if declared > max_body:
+        raise HTTPException(413, "Offer too large.")
+    raw = await request.body()
+    if len(raw) > max_body:
+        raise HTTPException(413, "Offer too large.")
+    try:
+        envelope = json_mod.loads(raw)
+    except ValueError:
+        raise HTTPException(400, "Offer body must be JSON.")
     from ..core import identity as id_mod
 
     payload = id_mod.verify_envelope(envelope)
@@ -3818,6 +3927,20 @@ async def receive_offer(name: str, request: Request,
         raise HTTPException(401, "Offer envelope missing or signature invalid.")
 
     signer_pub  = payload["public_key"]             # authenticated
+
+    # Who may offer: 'trusted' (default) = listed signer keys only,
+    # 'open' = any valid signature, 'closed' = nobody.
+    policy = db.query_scalar(conn,
+        "SELECT value FROM repo_server_config WHERE key = 'offer_policy'") or "trusted"
+    if policy == "closed":
+        raise HTTPException(403, "This instance does not accept federation offers.")
+    if policy != "open":
+        trusted = db.query_scalar(conn,
+            "SELECT value FROM repo_server_config WHERE key = 'offer_trusted_keys'") or ""
+        if str(signer_pub).lower() not in {k.strip().lower() for k in re.split(r"[\s,]+", trusted) if k.strip()}:
+            raise HTTPException(403,
+                "Signer key is not trusted on this instance. Ask Zeus to add it to "
+                "offer_trusted_keys in /zeus/config.")
     branch_name = payload.get("branch_name", "offered")
     from_rev    = payload.get("from_rev", 0)
     base_rev    = payload.get("base_rev", 0)
@@ -3830,6 +3953,13 @@ async def receive_offer(name: str, request: Request,
         raise HTTPException(400, "No changes in offer.")
     if not isinstance(changes, list) or len(changes) > MAX_OFFER_CHANGES:
         raise HTTPException(400, "Too many changes in offer.")
+    for ch in changes:
+        if not isinstance(ch, dict) or ch.get("change_type") not in ("add", "modify", "delete", "rename"):
+            raise HTTPException(400, "Malformed change entry.")
+        try:
+            ch["path"] = repo.normalize_repo_path(ch.get("path"))
+        except repo.UnsafePathError as e:
+            raise HTTPException(400, f"Unsafe path in offer: {e}")
 
     # Approximate size from base64 payload (4 b64 chars ≈ 3 bytes).
     if isinstance(blobs, dict):
@@ -3852,9 +3982,10 @@ async def receive_offer(name: str, request: Request,
                 raise HTTPException(400, "Invalid blob hash format.")
             if not obj_store.exists(blob_hash, objects_dir):
                 content = base64.b64decode(b64_content)
-                stored_hash = obj_store.store_blob(content, objects_dir)
-                if stored_hash != blob_hash:
+                # Verify before writing so bad offers can't fill the disk.
+                if obj_store.hash_content(content) != blob_hash:
                     raise HTTPException(400, f"Blob hash mismatch: {blob_hash}")
+                obj_store.store_blob(content, objects_dir)
 
         # The authenticated label includes the signer's pubkey prefix, so two
         # different signers can't collide on one claimed username.
@@ -4359,6 +4490,10 @@ async def tribute_edit_api(name: str, request: Request,
 
     if not path:
         raise HTTPException(400, "Missing path.")
+    try:
+        path = repo.normalize_repo_path(path)
+    except repo.UnsafePathError as e:
+        raise HTTPException(400, f"Unsafe path: {e}")
     if not isinstance(new_content, str):
         raise HTTPException(400, "Content must be a string.")
     if len(reason) < TRIBUTE_MIN_REASON_CHARS:
@@ -4537,8 +4672,9 @@ async def tribute_patch_api(name: str, request: Request,
     submitted = []
     for e in entries:
         # Reject path traversal
-        p = e.filename.replace("\\", "/")
-        if p.startswith("/") or ".." in p.split("/"):
+        try:
+            p = repo.normalize_repo_path(e.filename)
+        except repo.UnsafePathError:
             raise HTTPException(400, f"Unsafe path in archive: {e.filename}")
         if e.file_size > TRIBUTE_MAX_FILE_BYTES:
             raise HTTPException(413,

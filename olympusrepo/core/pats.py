@@ -88,11 +88,12 @@ def verify_pat(conn, raw_token: str) -> dict | None:
     # (token_prefix) WHERE revoked_at IS NULL, so this is a quick lookup.
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT pat_id, user_id, scopes, expires_at
-            FROM repo_pats
-            WHERE token_prefix = %s
-              AND revoked_at IS NULL
-              AND token_hash = crypt(%s, token_hash)
+            SELECT p.pat_id, p.user_id, p.scopes, p.expires_at
+            FROM repo_pats p
+            JOIN repo_users u ON u.user_id = p.user_id AND u.is_active
+            WHERE p.token_prefix = %s
+              AND p.revoked_at IS NULL
+              AND p.token_hash = crypt(%s, p.token_hash)
         """, (prefix, raw_token))
         row = cur.fetchone()
 

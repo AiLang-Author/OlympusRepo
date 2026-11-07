@@ -60,13 +60,7 @@ def check(conn, repo_id: int, objects_dir: str,
 
     # ── 3. Find orphaned blobs (on disk but not referenced by any commit) ──
     # Collect all referenced hashes across ALL repos (blobs are shared)
-    ref_rows = db.query(conn, """
-        SELECT DISTINCT blob_after AS h FROM repo_changesets
-         WHERE blob_after IS NOT NULL
-        UNION
-        SELECT DISTINCT tree_hash   AS h FROM repo_commits
-         WHERE tree_hash IS NOT NULL
-    """, ())
+    ref_rows = db.query(conn, _REFERENCED_SQL, ())
     referenced = {r["h"] for r in ref_rows}
 
     for blob_hash in obj_store.list_objects(objects_dir):
@@ -76,18 +70,25 @@ def check(conn, repo_id: int, objects_dir: str,
     return results
 
 
+# Every place a blob hash can be referenced. Pending staging realms and
+# federation offers (including anonymous offerings awaiting review) and
+# ticket attachments must count, or prune deletes them before review.
+_REFERENCED_SQL = """
+    SELECT blob_after  AS h FROM repo_changesets       WHERE blob_after  IS NOT NULL
+    UNION SELECT blob_before FROM repo_changesets       WHERE blob_before IS NOT NULL
+    UNION SELECT tree_hash   FROM repo_commits          WHERE tree_hash   IS NOT NULL
+    UNION SELECT blob_hash   FROM repo_staging_changes  WHERE blob_hash   IS NOT NULL
+    UNION SELECT blob_hash   FROM repo_offer_changes    WHERE blob_hash   IS NOT NULL
+    UNION SELECT blob_hash   FROM repo_issue_attachments
+"""
+
+
 def prune(conn, objects_dir: str, dry_run: bool = False) -> int:
     """
     Delete orphaned blobs from the object store.
     Returns count of objects deleted (or that would be deleted on dry_run).
     """
-    ref_rows = db.query(conn, """
-        SELECT DISTINCT blob_after AS h FROM repo_changesets
-         WHERE blob_after IS NOT NULL
-        UNION
-        SELECT DISTINCT tree_hash AS h FROM repo_commits
-         WHERE tree_hash IS NOT NULL
-    """, ())
+    ref_rows = db.query(conn, _REFERENCED_SQL, ())
     referenced = {r["h"] for r in ref_rows}
 
     if dry_run:

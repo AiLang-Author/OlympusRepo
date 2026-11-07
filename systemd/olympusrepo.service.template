@@ -16,7 +16,7 @@ WorkingDirectory=__INSTALL_DIR__
 EnvironmentFile=__INSTALL_DIR__/.env
 
 ExecStart=__INSTALL_DIR__/.venv/bin/uvicorn olympusrepo.web.app:app \
-    --host 0.0.0.0 \
+    --host __BIND_HOST__ --proxy-headers --forwarded-allow-ips=127.0.0.1 \
     --port __APP_PORT__
 
 Restart=on-failure
@@ -41,7 +41,18 @@ LockPersonality=true
 
 # The app needs to write to its own install dir (objects store, .olympusrepo,
 # potentially uploaded blobs). Grant exactly that and nothing more.
-ReadWritePaths=__INSTALL_DIR__
+ReadWritePaths=__INSTALL_DIR__/objects __INSTALL_DIR__/mirrors __INSTALL_DIR__/gateways __INSTALL_DIR__/.olympusrepo
+PrivateDevices=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
