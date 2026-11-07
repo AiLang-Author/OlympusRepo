@@ -75,6 +75,40 @@ def create_repo(conn, name: str, owner_id: int, visibility: str = "public",
         raise
 
 
+class UnsafePathError(ValueError):
+    """A repository path that could escape a checkout or confuse git."""
+
+
+def normalize_repo_path(path: str) -> str:
+    """Validate and normalise a path stored inside a repository.
+
+    Rejects absolute paths, '..' and '.' segments, NUL/control characters,
+    and any '.git' segment (git refuses those, and a client checkout of one
+    could plant hooks). Backslashes are treated as separators. Every route
+    that accepts a path from a user must pass it through here before it is
+    written to repo_changesets / repo_staging_changes.
+    """
+    if not isinstance(path, str):
+        raise UnsafePathError("Path must be a string.")
+    p = path.replace("\\", "/")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in p):
+        raise UnsafePathError("Path contains control characters.")
+    if p.startswith("/") or (len(p) > 1 and p[1] == ":"):
+        raise UnsafePathError("Absolute paths are not allowed.")
+    parts = [seg for seg in p.split("/") if seg != ""]
+    if not parts:
+        raise UnsafePathError("Empty path.")
+    for seg in parts:
+        if seg in (".", ".."):
+            raise UnsafePathError("Relative path segments are not allowed.")
+        if seg.lower() == ".git":
+            raise UnsafePathError("'.git' path segments are not allowed.")
+    norm = "/".join(parts)
+    if len(norm) > 4096:
+        raise UnsafePathError("Path too long.")
+    return norm
+
+
 def get_repo(conn, name: str) -> dict | None:
     """Get repository by name."""
     return db.query_one(conn,

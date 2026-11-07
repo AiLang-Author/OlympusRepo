@@ -71,15 +71,14 @@ def check(conn, repo_id: int, objects_dir: str,
 
 
 # Every place a blob hash can be referenced. Pending staging realms and
-# federation offers (including anonymous offerings awaiting review) and
-# ticket attachments must count, or prune deletes them before review.
+# federation offers (including anonymous offerings awaiting review) must
+# count, or prune deletes them before review.
 _REFERENCED_SQL = """
     SELECT blob_after  AS h FROM repo_changesets       WHERE blob_after  IS NOT NULL
     UNION SELECT blob_before FROM repo_changesets       WHERE blob_before IS NOT NULL
     UNION SELECT tree_hash   FROM repo_commits          WHERE tree_hash   IS NOT NULL
     UNION SELECT blob_hash   FROM repo_staging_changes  WHERE blob_hash   IS NOT NULL
     UNION SELECT blob_hash   FROM repo_offer_changes    WHERE blob_hash   IS NOT NULL
-    UNION SELECT blob_hash   FROM repo_issue_attachments
 """
 
 

@@ -1,4 +1,4 @@
--- sql/021_security.sql
+-- sql/020_security.sql
 -- RenkuOS security hardening (see docs/SECURITY_AUDIT.md).
 -- Idempotent. License: MIT
 

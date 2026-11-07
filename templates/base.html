@@ -343,13 +343,20 @@
                         var div = document.createElement('div');
                         div.style.cssText = 'padding:10px 14px; border-bottom:1px solid #21262d; cursor:pointer;' +
                             (n.is_read ? 'opacity:0.6;' : 'background:#0d1117;');
-                        div.innerHTML =
-                            '<div style="font-size:0.85em; color:#c9d1d9;">' + n.message + '</div>' +
-                            '<div style="font-size:0.75em; color:#8b949e; margin-top:2px;">' +
-                            new Date(n.created_at).toLocaleDateString() + '</div>';
+                        // Notification text contains user-supplied titles and
+                        // messages: build it with textContent, never innerHTML.
+                        var msg = document.createElement('div');
+                        msg.style.cssText = 'font-size:0.85em; color:#c9d1d9;';
+                        msg.textContent = n.message || '';
+                        var when = document.createElement('div');
+                        when.style.cssText = 'font-size:0.75em; color:#8b949e; margin-top:2px;';
+                        when.textContent = new Date(n.created_at).toLocaleDateString();
+                        div.appendChild(msg);
+                        div.appendChild(when);
                         div.addEventListener('click', async function() {
                             await fetch('/api/notifications/' + n.notif_id + '/read', {method:'POST'});
-                            if (n.link) window.location = n.link;
+                            // Only follow same-origin paths ("/x", not "//host" or "javascript:").
+                            if (n.link && /^\/(?!\/)/.test(n.link)) window.location = n.link;
                             else loadNotifications();
                         });
                         list.appendChild(div);

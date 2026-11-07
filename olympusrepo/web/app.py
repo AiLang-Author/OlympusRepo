@@ -3394,6 +3394,19 @@ def commit_diff_api(name: str, commit_hash: str,
 # ISSUE TRACKER
 # =========================================================================
 
+def _issue_can_view(conn, r, user) -> bool:
+    return repo.check_visibility(conn, r["repo_id"], user["user_id"] if user else None)
+
+
+def _issue_can_triage(conn, r, user) -> bool:
+    """Change status/priority/assignee: Zeus/Olympian, repo owner, or writers."""
+    if not user or not _issue_can_view(conn, r, user):
+        return False
+    if user["role"] in ("zeus", "olympian") or r["owner_id"] == user["user_id"]:
+        return True
+    return repo.check_can_write(conn, r["repo_id"], user["user_id"])
+
+
 def _get_next_issue_number(conn, repo_id: int) -> int:
     return db.query_scalar(conn,
         "SELECT COALESCE(MAX(number), 0) + 1 FROM repo_issues WHERE repo_id = %s",
@@ -3514,6 +3527,8 @@ def new_issue_page(name: str, request: Request,
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
+    if not _issue_can_view(conn, r, user):
+        raise HTTPException(404)
 
     all_users = db.query(conn, """
         SELECT user_id, username, role FROM repo_users
@@ -3545,6 +3560,24 @@ def create_issue(name: str, request: Request,
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
+    if not _issue_can_view(conn, r, user):
+        raise HTTPException(404)
+    title = (title or "").strip()
+    if not title or len(title) > 300:
+        raise HTTPException(400, "Title is required (max 300 characters).")
+    if issue_type not in ('bug','feature','task','question','security'):
+        raise HTTPException(400, "Invalid issue type.")
+    if priority not in ('critical','high','normal','low'):
+        raise HTTPException(400, "Invalid priority.")
+    if assigned_to and not _issue_can_triage(conn, r, user):
+        assigned_to = None   # only maintainers assign
+    if assigned_to and not repo.check_visibility(conn, r["repo_id"], assigned_to):
+        raise HTTPException(400, "That user cannot see this repository.")
+    if file_path:
+        try:
+            file_path = repo.normalize_repo_path(file_path)
+        except repo.UnsafePathError as e:
+            raise HTTPException(400, f"Unsafe path: {e}")
 
     try:
         number = _get_next_issue_number(conn, r["repo_id"])
@@ -3663,6 +3696,10 @@ def add_issue_comment(name: str, number: int,
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
+    if not _issue_can_view(conn, r, user):
+        raise HTTPException(404)
+    if not content.strip():
+        raise HTTPException(400, "Comment is empty.")
 
     issue = db.query_one(conn,
         "SELECT * FROM repo_issues WHERE repo_id = %s AND number = %s",
@@ -3717,6 +3754,15 @@ def update_issue(name: str, number: int,
     r = repo.get_repo(conn, name)
     if not r:
         raise HTTPException(404)
+    if not _issue_can_view(conn, r, user):
+        raise HTTPException(404)
+    # Previously any logged-in user could change any issue in any repo.
+    if not _issue_can_triage(conn, r, user):
+        raise HTTPException(403, "Only maintainers can change issue status, priority or assignee.")
+    if priority and priority not in ('critical','high','normal','low'):
+        raise HTTPException(400, "Invalid priority.")
+    if assigned_to and not repo.check_visibility(conn, r["repo_id"], assigned_to):
+        raise HTTPException(400, "That user cannot see this repository.")
 
     issue = db.query_one(conn,
         "SELECT * FROM repo_issues WHERE repo_id = %s AND number = %s",
