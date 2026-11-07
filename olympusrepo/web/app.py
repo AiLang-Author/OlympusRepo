@@ -109,6 +109,20 @@ async def lifespan(app):
     # ── Identity ──────────────────────────────────────────────────────────
     ident = identity_mod.load_or_create()
     app.state.identity = ident
+
+    # ── Credential key: move legacy pgcrypto credentials off the DB key ──
+    try:
+        from ..core import credbox
+        _c = db.connect()
+        try:
+            n = credbox.migrate_legacy(_c)
+            if n:
+                print(f"  Credentials: re-encrypted {n} remote credential(s) under the external key; "
+                      "removed git_creds_key from the database.")
+        finally:
+            _c.close()
+    except Exception as e:
+        print(f"  WARNING: credential migration not done: {e}  (run `olympusrepo creds status`)")
     print(f"  Instance: {ident['human_name']} ({ident['instance_id'][:16]}...)")
 
     # ── Relay heartbeat thread ────────────────────────────────────────────

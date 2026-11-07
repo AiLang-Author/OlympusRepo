@@ -8,6 +8,8 @@ MIT License
 import re
 from urllib.parse import urlparse, urlunparse, quote
 
+from . import credbox
+
 
 # Remote names match git's own rules: letters, digits, ., _, -, /
 # Starts with a letter or digit to avoid flag-lookalikes.
@@ -48,8 +50,8 @@ def add_remote(
 ) -> dict:
     """
     Register a git remote for a repo. `credential` is the raw token or
-    SSH private key bytes; it's encrypted via pgp_sym_encrypt with the
-    server's git_creds_key before storage.
+    SSH private key; it is sealed with AES-256-GCM under the key from
+    credbox.load_key() (env or key file, never the database).
     """
     _validate_remote_name(name)
     _validate_remote_url(url)
@@ -58,29 +60,16 @@ def add_remote(
     if auth_type != "none" and not credential:
         raise ValueError(f"auth_type={auth_type!r} requires a credential")
 
+    # Sealed in Python with the external key (core/credbox.py); the key and
+    # the plaintext never reach PostgreSQL.
+    enc = credbox.seal(credential, repo_id, name) if credential else None
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO repo_git_remotes
                 (repo_id, name, url, auth_type, auth_credential_enc, created_by)
-            VALUES (
-                %(repo_id)s, %(name)s, %(url)s, %(auth_type)s,
-                CASE WHEN %(cred)s IS NULL THEN NULL
-                     ELSE pgp_sym_encrypt(
-                         %(cred)s,
-                         (SELECT value FROM repo_server_config WHERE key='git_creds_key')
-                     )
-                END,
-                %(user_id)s
-            )
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING remote_id
-        """, {
-            "repo_id":   repo_id,
-            "name":      name,
-            "url":       url,
-            "auth_type": auth_type,
-            "cred":      credential,
-            "user_id":   user_id,
-        })
+        """, (repo_id, name, url, auth_type, enc, user_id))
         remote_id = cur.fetchone()[0]
     return {"remote_id": remote_id, "name": name, "url": url}
 
@@ -90,15 +79,8 @@ def get_remote(conn, repo_id: int, name: str) -> dict | None:
     _validate_remote_name(name)
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT
-                remote_id, repo_id, name, url, auth_type,
-                CASE WHEN auth_credential_enc IS NULL THEN NULL
-                     ELSE pgp_sym_decrypt(
-                         auth_credential_enc,
-                         (SELECT value FROM repo_server_config WHERE key='git_creds_key')
-                     )::TEXT
-                END AS credential,
-                mirror_path, last_push_at, last_pull_at, is_active
+            SELECT remote_id, repo_id, name, url, auth_type, auth_credential_enc,
+                   mirror_path, last_push_at, last_pull_at, is_active
             FROM repo_git_remotes
             WHERE repo_id = %s AND name = %s
         """, (repo_id, name))
@@ -108,7 +90,15 @@ def get_remote(conn, repo_id: int, name: str) -> dict | None:
     cols = ("remote_id", "repo_id", "name", "url", "auth_type",
             "credential", "mirror_path", "last_push_at", "last_pull_at",
             "is_active")
-    return dict(zip(cols, row))
+    out = dict(zip(cols, row))
+    enc = out["credential"]
+    if enc is not None:
+        if not credbox.is_sealed(enc):
+            # Legacy pgcrypto row not yet migrated (startup migration failed?).
+            credbox.migrate_legacy(conn)
+            return get_remote(conn, repo_id, name)
+        out["credential"] = credbox.open_(enc, out["repo_id"], out["name"])
+    return out
 
 
 def list_remotes(conn, repo_id: int) -> list[dict]:

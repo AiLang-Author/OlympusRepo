@@ -1034,6 +1034,39 @@ def cmd_fsck(args):
         conn.close()
 
 
+def cmd_creds(args):
+    """Inspect, migrate, or rotate the git-remote credential key."""
+    from .core import credbox
+    conn = db.connect()
+    try:
+        if args.action == "status":
+            st = credbox.status(conn)
+            print(f"  key source       : {st['key_source']}")
+            print(f"  key usable       : {'yes' if st['key_ok'] else 'NO — ' + st['key_error']}")
+            print(f"  sealed (OLY1)    : {st['sealed']}")
+            print(f"  legacy (pgcrypto): {st['legacy']}")
+            print(f"  DB-resident key  : {'PRESENT — run `olympusrepo creds migrate`' if st['db_key_present'] else 'absent'}")
+            return 0 if st["key_ok"] and not st["legacy"] and not st["db_key_present"] else 1
+        if args.action == "init":
+            credbox.load_key(create=True)
+            print(f"  Key ready at {credbox.key_file_path()} (back it up separately from the database).")
+            return 0
+        if args.action == "migrate":
+            n = credbox.migrate_legacy(conn)
+            print(f"  Re-encrypted {n} credential(s); git_creds_key removed from the database.")
+            return 0
+        if args.action == "rotate":
+            n = credbox.rotate(conn)
+            print(f"  Rotated key; re-sealed {n} credential(s). Old key kept at "
+                  f"{credbox.key_file_path()}.old — delete it once backups hold the new key.")
+            return 0
+    except credbox.CredentialKeyError as e:
+        print(f"ERROR: {e}")
+        return 1
+    finally:
+        conn.close()
+
+
 def cmd_prune(args):
     """Remove unreferenced blobs from the object store."""
     repo_root = worktree.find_repo_root()
@@ -1278,6 +1311,9 @@ def main():
                    help="Attempt to repair fixable issues (reserved)")
 
     # prune
+    p = sub.add_parser("creds", help="Credential key: status | init | migrate | rotate")
+    p.add_argument("action", choices=["status", "init", "migrate", "rotate"])
+
     p = sub.add_parser("prune", help="Remove unreferenced blobs from object store")
     p.add_argument("--force", action="store_true",
                    help="Actually delete (default is dry-run)")
@@ -1307,6 +1343,7 @@ def main():
         "user-create": cmd_user_create,
         "fsck": cmd_fsck,
         "prune": cmd_prune,
+        "creds": cmd_creds,
     }
 
     handler = commands.get(args.command)

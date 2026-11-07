@@ -43,8 +43,8 @@ CREATE TABLE IF NOT EXISTS repo_git_remotes (
     url             TEXT NOT NULL,            -- https://... or git@...
     auth_type       TEXT NOT NULL DEFAULT 'none'
                     CHECK (auth_type IN ('none','token','ssh_key')),
-    -- Credentials are encrypted server-side with pgp_sym_encrypt using
-    -- the master key stored in repo_server_config['git_creds_key'].
+    -- Credentials are sealed with AES-256-GCM in the application using a
+    -- key held outside the database (olympusrepo/core/credbox.py).
     -- Never write plaintext credentials here.
     auth_credential_enc  BYTEA,
     -- Cached bare mirror for pull/incremental push. Managed by the
@@ -142,11 +142,10 @@ CREATE INDEX IF NOT EXISTS idx_git_pull_log_repo
 -- The key lives in repo_server_config rather than in a file so that
 -- backups of the database are self-contained. Operators who want
 -- defense-in-depth should additionally encrypt the database at rest.
-INSERT INTO repo_server_config (key, value)
-SELECT 'git_creds_key', encode(gen_random_bytes(32), 'hex')
-WHERE NOT EXISTS (
-    SELECT 1 FROM repo_server_config WHERE key = 'git_creds_key'
-);
+-- RenkuOS fork: the credential key no longer lives in the database.
+-- See olympusrepo/core/credbox.py. (Upstream inserted git_creds_key here;
+-- existing values are migrated and deleted at app startup.)
+SELECT 1;
 
 -- -------------------------------------------------------------------------
 -- repo_insert_imported_commit, v2 — adds tz offset parameters
