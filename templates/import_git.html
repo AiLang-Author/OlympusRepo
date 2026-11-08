@@ -225,6 +225,11 @@ main {
             Imports the full commit history from a git repository — local path or remote URL.
             Large repos (e.g. Linux kernel) are supported — progress is streamed live.
         </p>
+        <p style="color:#8b949e; font-size:0.85em;">
+            <strong style="color:#ffd700;">Resumable downloads:</strong>
+            Remote repos are fetched into a persistent local mirror. If the connection
+            drops, just re-submit the same import — it picks up where it left off.
+        </p>
 
         <form method="post" action="/import" id="import-form">
 
@@ -351,9 +356,23 @@ Branch: develop</pre>
                 bar.classList.remove('indeterminate');
                 bar.style.width = '100%';
                 bar.style.background = '#f85149';
+
+                var errMsg = d.error || 'Unknown error';
+                var isNetworkErr = /clone|fetch|timeout|connection|resolve|SSL|reset/i.test(errMsg);
+
                 text.innerHTML = '<strong style="color:#f85149;">Error:</strong> ' +
-                    escapeHtml(d.error || 'Unknown error');
-                btn.textContent = 'Failed';
+                    escapeHtml(errMsg);
+
+                if (isNetworkErr) {
+                    text.innerHTML += '<br><span style="color:#ffd700; font-size:0.95em;">' +
+                        'Network error — the mirror is saved locally. ' +
+                        'Click <strong>Resume Import</strong> to continue where it left off.</span>';
+                    btn.textContent = 'Resume Import';
+                    btn.style.background = 'linear-gradient(180deg, #ffd700 0%, #e6b800 100%)';
+                } else {
+                    btn.textContent = 'Retry Import';
+                }
+
                 btn.disabled = false;
                 document.getElementById('input-url').disabled = false;
                 document.getElementById('input-name').disabled = false;
@@ -373,10 +392,17 @@ Branch: develop</pre>
         };
 
         es.onerror = function() {
-            // SSE connection lost — could be proxy timeout. Show reconnect info.
-            text.textContent = 'Connection lost. Import may still be running on the server. Refresh to check.';
-            bar.classList.remove('indeterminate');
+            // SSE connection lost — could be proxy timeout or network drop.
             es.close();
+            bar.classList.remove('indeterminate');
+            bar.style.background = '#9e6a03';
+            text.innerHTML = '<strong style="color:#ffd700;">Connection lost.</strong> ' +
+                'The import may still be running on the server. ' +
+                'If it failed, re-submit to resume — downloaded data is preserved.';
+            btn.textContent = 'Resume Import';
+            btn.disabled = false;
+            document.getElementById('input-url').disabled = false;
+            document.getElementById('input-name').disabled = false;
         };
     }
 

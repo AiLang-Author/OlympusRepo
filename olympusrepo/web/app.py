@@ -959,6 +959,10 @@ async def import_git_submit(
         "OLYMPUSREPO_OBJECTS_DIR",
         os.path.join(os.path.dirname(__file__), "..", "..", "objects")
     )
+    mirrors_dir = os.environ.get(
+        "OLYMPUSREPO_MIRRORS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "mirrors")
+    )
 
     # Create a job and kick off the import in a background thread.
     job_id = _uuid.uuid4().hex[:12]
@@ -992,6 +996,7 @@ async def import_git_submit(
                 objects_dir=objects_dir,
                 branch=branch or None,
                 progress_cb=_progress_cb,
+                mirrors_dir=mirrors_dir,
             )
             db.audit_log(import_conn, "git_import", user_id=user["user_id"],
                          target_type="repo", target_id=repo_name,

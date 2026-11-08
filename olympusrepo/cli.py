@@ -1117,6 +1117,8 @@ def cmd_import_git(args):
         print(f"Importing git repo: {args.source}")
         print(f"  → OlympusRepo name: {args.name}")
         
+        mirrors_dir = os.environ.get("OLYMPUSREPO_MIRRORS_DIR", "mirrors")
+
         result = ig.import_git_repo(
             conn=conn,
             git_source=args.source,
@@ -1124,6 +1126,7 @@ def cmd_import_git(args):
             user_id=user["user_id"],
             objects_dir=objects_dir,
             branch=args.branch,
+            mirrors_dir=mirrors_dir,
         )
         
         print(f"\n✓ Import complete!")
