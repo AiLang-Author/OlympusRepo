@@ -717,6 +717,7 @@ def import_git_repo(
             )
 
     batch = None
+    repo_id = None
     try:
         # Detect default branch if caller didn't specify one.
         if not branch:
@@ -867,6 +868,21 @@ def import_git_repo(
             "tip":              tip_sha,
         }
 
+    except BaseException:
+        # create_repo and each imported commit are committed as they go,
+        # so a failure here would leave a half-imported repo whose name
+        # blocks a retry. Remove it; the mirror keeps the downloaded data,
+        # so re-running the import only repeats the local work.
+        if repo_id is not None:
+            try:
+                conn.rollback()
+                db.execute(conn, "DELETE FROM repo_repositories WHERE repo_id = %s",
+                           (repo_id,))
+                print(f"  Import failed — removed partial repo '{repo_name}'.")
+            except Exception as cleanup_err:
+                print(f"  Import failed and partial repo '{repo_name}' "
+                      f"could not be removed: {cleanup_err}")
+        raise
     finally:
         if batch is not None:
             batch.close()
