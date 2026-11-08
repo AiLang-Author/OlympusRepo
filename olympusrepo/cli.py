@@ -1127,6 +1127,7 @@ def cmd_import_git(args):
             objects_dir=objects_dir,
             branch=args.branch,
             mirrors_dir=mirrors_dir,
+            depth=args.depth,
         )
         
         print(f"\n✓ Import complete!")
@@ -1292,6 +1293,8 @@ def main():
     p.add_argument("source", help="Git repo path or URL")
     p.add_argument("name", help="OlympusRepo repository name")
     p.add_argument("--branch", help="Git branch to import (default: HEAD)")
+    p.add_argument("--depth", type=int, default=None,
+                   help="Import only the newest N commits (shallow fetch for URLs)")
     p.add_argument("--user", help="Username to attribute commits to")
 
     # delete-repo

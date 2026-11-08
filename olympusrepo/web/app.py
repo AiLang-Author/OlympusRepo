@@ -918,6 +918,7 @@ async def import_git_submit(
     git_url: str = Form(...),
     repo_name: str = Form(...),
     branch: str = Form(""),
+    depth: str = Form(""),
     conn=Depends(get_db),
 ):
     user = get_current_user(request, conn)
@@ -954,6 +955,11 @@ async def import_git_submit(
 
     if branch and not re.match(r'^[A-Za-z0-9][A-Za-z0-9/_.\-]{0,199}$', branch):
         return _render("Invalid branch name.")
+
+    depth = depth.strip()
+    if depth and not (depth.isdigit() and 0 < int(depth) <= 10_000_000):
+        return _render("History depth must be a positive number of commits.")
+    depth_n = int(depth) if depth else None
 
     objects_dir = os.environ.get(
         "OLYMPUSREPO_OBJECTS_DIR",
@@ -997,6 +1003,7 @@ async def import_git_submit(
                 branch=branch or None,
                 progress_cb=_progress_cb,
                 mirrors_dir=mirrors_dir,
+                depth=depth_n,
             )
             db.audit_log(import_conn, "git_import", user_id=user["user_id"],
                          target_type="repo", target_id=repo_name,

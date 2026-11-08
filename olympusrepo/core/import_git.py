@@ -143,15 +143,18 @@ def _tz_from_iso(iso: str) -> str:
     return m.group(1) if m else "+0000"
 
 
-def _get_commits(git_dir: str, branch: str) -> list[dict]:
+def _get_commits(git_dir: str, branch: str, max_count: int = None) -> list[dict]:
     """
     Return commits in topological + chronological order (parents before
     children), with full metadata. Commit ordering matters for FK
     integrity: parent_hashes is not FK-enforced in the schema, but we
     want the import to make sense if someone later queries the graph.
     """
+    # -n is applied before --reverse, so this keeps the newest max_count
+    # commits and still emits them oldest-first.
+    limit = ["-n", str(max_count)] if max_count else []
     raw = _git(
-        ["log", "--reverse", "--topo-order",
+        ["log", "--reverse", "--topo-order", *limit,
          f"--format={_COMMIT_FMT}", branch],
         git_dir,
         timeout=GIT_LOG_TIMEOUT,
@@ -463,9 +466,14 @@ def import_git_repo(
     branch: str = None,
     progress_cb=None,
     mirrors_dir: str = None,
+    depth: int = None,
 ) -> dict:
     """
     Import a git repository into OlympusRepo with full metadata fidelity.
+
+    depth: import only the newest `depth` commits of the branch. Remote
+    sources are then fetched shallow, so older history is never
+    downloaded. The oldest imported commit is stored as a full snapshot.
 
     Preserves on each repo_commits row:
       * commit_hash    = original git commit SHA (PK)
@@ -629,7 +637,14 @@ def import_git_repo(
         FILTER = ["--filter=blob:none"]
         refs_exist = _has_refs()
 
-        if refs_exist and not _is_shallow():
+        if depth and not (refs_exist and not _is_shallow()):
+            # Shallow import: fetch only the newest `depth` commits (no
+            # blobs yet). Re-running with a larger depth extends it.
+            if progress_cb:
+                progress_cb(0, 0, f"Phase 1: fetching last {depth} commits (no blobs)...")
+            print(f"  Phase 1: shallow fetch --depth {depth} --filter=blob:none")
+            _run_fetch(["--depth", str(depth)] + FILTER, "shallow")
+        elif refs_exist and not _is_shallow():
             if progress_cb:
                 progress_cb(0, 0, "Updating existing mirror...")
             print(f"  Full history exists — quick update fetch...")
@@ -683,7 +698,10 @@ def import_git_repo(
                     print(f"  Re-run the same import command to resume.")
                     raise
 
-        print(f"  Phase 1 complete — full commit history is local (no blobs yet).")
+        if depth:
+            print(f"  Phase 1 complete — last {depth} commits are local (no blobs yet).")
+        else:
+            print(f"  Phase 1 complete — full commit history is local (no blobs yet).")
 
         # ---- Phase 2: configure the promisor remote ----------------------
         # Needed before Phase 3: fetching blobs by id goes through the
@@ -732,7 +750,7 @@ def import_git_repo(
             except Exception:
                 branch = "main"
 
-        commits = _get_commits(git_dir, branch)
+        commits = _get_commits(git_dir, branch, max_count=depth)
         total = len(commits)
         if total == 0:
             raise ValueError(f"No commits found on branch '{branch}'")
@@ -760,9 +778,16 @@ def import_git_repo(
         imported = 0
         total_files = 0
         total_bytes = 0
+        seen = set()
 
         for i, c in enumerate(commits):
             subject = c["message"].splitlines()[0] if c["message"] else ""
+            # In a partial-history import (depth, or a shallow mirror) a
+            # commit's parents may lie outside what we import. Keep only
+            # imported parents; a commit with none left becomes a root,
+            # stored as a full snapshot, the way git treats shallow commits.
+            c["parents"] = [p_ for p_ in c["parents"] if p_ in seen]
+            seen.add(c["sha"])
             is_root = not c["parents"]
 
             if progress_cb:
